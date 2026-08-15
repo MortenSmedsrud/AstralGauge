@@ -711,14 +711,17 @@ fn add_pin_graph(
             );
         }
 
-        // Y-scale labels
-        painter.text(
-            egui::Pos2::new(rect.left() + 2.0, rect.top() + 1.0),
-            egui::Align2::LEFT_TOP,
-            format!("{y_max:.0}"),
-            small.clone(),
-            dim,
-        );
+        // Top scale label: only when the range has grown beyond the base
+        // 11 A; the limit lines otherwise define the scale
+        if y_max > 11.0 {
+            painter.text(
+                egui::Pos2::new(rect.left() + 2.0, rect.top() + 1.0),
+                egui::Align2::LEFT_TOP,
+                format!("{y_max:.0}"),
+                small.clone(),
+                dim,
+            );
+        }
         painter.text(
             egui::Pos2::new(rect.left() + 2.0, rect.bottom() - 10.0),
             egui::Align2::LEFT_TOP,
