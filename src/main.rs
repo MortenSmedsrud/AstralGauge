@@ -616,11 +616,17 @@ impl eframe::App for App {
             if self.show_graphs {
                 ui.separator();
 
-                // Per-pin current graphs - 2 rows x 3, like the tables
+                // Per-pin current graphs - 2 rows x 3, like the tables.
+                // 70 px is the minimum height; extra vertical space is used.
                 ui.strong("Current (A) over time");
                 let spacing = 8.0;
                 let graph_w = (ui.available_width() - 2.0 * spacing) / 3.0;
-                let graph_size = egui::vec2(graph_w.max(60.0), 70.0);
+                let item_spacing_y = ui.spacing().item_spacing.y;
+                let label_h = ui.fonts(|f| f.row_height(&egui::FontId::default()));
+                let graph_h = ((ui.available_height() - 2.0 * label_h - 4.0 * item_spacing_y)
+                    / 2.0)
+                    .max(70.0);
+                let graph_size = egui::vec2(graph_w.max(60.0), graph_h);
                 for row in 0..2 {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = spacing;
