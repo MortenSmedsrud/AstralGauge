@@ -93,10 +93,26 @@ fn main() {
 
     println!("Using I2C bus: {bus_number}");
 
-    // Background thread polls I2C (per-pin) and NVML (total power).
-    let (tx, rx) = mpsc::channel::<Sample>();
+    // Pre-reserve history for the default 1 Hz sample rate so the common
+    // case never reallocates; a faster slider setting just grows the vecs.
+    let mut web_data = WebData::new();
+    let reserve = (HISTORY_SECS * 1000.0 / DEFAULT_POLL_MS as f64) as usize + 1024;
+    for h in &mut web_data.history {
+        h.reserve(reserve);
+    }
+    web_data.power_history.reserve(reserve);
+    web_data.temp_history.reserve(reserve);
+    web_data.mem_history.reserve(reserve);
+    let data = Arc::new(Mutex::new(web_data));
+
+    // Background thread polls I2C (per-pin) and NVML (total power). It
+    // records each sample straight into the shared data, so monitoring
+    // keeps working while the window is minimized (the web server never
+    // depends on the GUI drawing frames).
     let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
+    let poller_data = data.clone();
     thread::spawn(move || {
+        let data = poller_data;
         // I2C is best-effort: if the device is unavailable, the app keeps
         // running with zero pin readings.
         let mut file: Option<File> = None;
@@ -220,9 +236,7 @@ fn main() {
                 mem_used_gb,
                 mem_total_gb,
             };
-            if tx.send(sample).is_err() {
-                break;
-            }
+            data.lock().unwrap().record(sample);
             thread::sleep(Duration::from_millis(poll_ms));
         }
     });
@@ -234,20 +248,7 @@ fn main() {
         ..Default::default()
     };
 
-    // Pre-reserve history for the default 1 Hz sample rate so the common
-    // case never reallocates; a faster slider setting just grows the vecs.
-    let mut web_data = WebData::new();
-    let reserve = (HISTORY_SECS * 1000.0 / DEFAULT_POLL_MS as f64) as usize + 1024;
-    for h in &mut web_data.history {
-        h.reserve(reserve);
-    }
-    web_data.power_history.reserve(reserve);
-    web_data.temp_history.reserve(reserve);
-    web_data.mem_history.reserve(reserve);
-    let data = Arc::new(Mutex::new(web_data));
-
     let app = App {
-        rx,
         cmd_tx,
         pending_limit: None,
         poll_ms: DEFAULT_POLL_MS,
@@ -719,6 +720,62 @@ impl WebData {
             poll_ms: DEFAULT_POLL_MS,
             show_graphs: true,
         }
+    }
+
+    /// Fold one poller sample into the shared state: replace the latest
+    /// sample, append it to the histories (pruning what expired) and cache
+    /// the permanent NVML ranges. Called from the poller thread so data
+    /// keeps flowing while the GUI window is minimized or not drawing.
+    fn record(&mut self, sample: Sample) {
+        let now = self.start.elapsed().as_secs_f64();
+        for i in 0..NUM_PINS {
+            self.history[i].push((now, sample.pins[i].current));
+        }
+        // Power: prefer NVML, fall back to the estimated pin sum so the
+        // graph still has data when NVML is unavailable.
+        let power_val = sample.power_w.or_else(|| {
+            Some(
+                sample
+                    .pins
+                    .iter()
+                    .map(|p| p.voltage * p.current)
+                    .sum::<f64>(),
+            )
+        });
+        if let Some(p) = power_val {
+            self.power_history.push((now, p));
+        }
+        if let Some(t) = sample.temp_c {
+            self.temp_history.push((now, t));
+        }
+        if let Some(m) = sample.mem_used_gb {
+            self.mem_history.push((now, m));
+        }
+        // Cache the permanent y ranges reported by NVML. They are static
+        // per GPU, so the first successful poll fixes the graph scales.
+        if let Some(m) = sample.limit_max_w {
+            self.power_range_max = Some(m as f64);
+        }
+        if let Some(m) = sample.max_temp_c {
+            self.temp_range_max = Some(m);
+        }
+        if let Some(m) = sample.mem_total_gb {
+            self.mem_range_max = Some(m);
+        }
+        self.sample = sample;
+
+        // Prune what fell out of the largest horizon.
+        let t_min = now - HISTORY_SECS;
+        let prune = |hist: &mut Vec<(f64, f64)>| {
+            let k = hist.partition_point(|(t, _)| *t < t_min);
+            hist.drain(..k);
+        };
+        for hist in &mut self.history {
+            prune(hist);
+        }
+        prune(&mut self.power_history);
+        prune(&mut self.temp_history);
+        prune(&mut self.mem_history);
     }
 }
 
@@ -1351,7 +1408,6 @@ fn current_color(current: f64) -> egui::Color32 {
 }
 
 struct App {
-    rx: mpsc::Receiver<Sample>,
     cmd_tx: mpsc::Sender<Cmd>,
     pending_limit: Option<u32>,
     /// Sample interval in ms (sent to the poller when the slider changes).
@@ -1372,65 +1428,13 @@ struct App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Sample ingestion happens on the poller thread (WebData::record);
+        // here we only mirror the UI settings and render from the shared
+        // data, which keeps updating even while this window is minimized.
         let mut data = self.data.lock().unwrap();
         data.poll_ms = self.poll_ms;
         data.show_graphs = self.show_graphs;
         let now = data.start.elapsed().as_secs_f64();
-
-        // Append new samples to the history and prune what's expired.
-        let mut got_sample = false;
-        while let Ok(sample) = self.rx.try_recv() {
-            for i in 0..NUM_PINS {
-                data.history[i].push((now, sample.pins[i].current));
-            }
-            // Power: prefer NVML, fall back to the estimated pin sum so the
-            // graph still has data when NVML is unavailable.
-            let power_val = sample.power_w.or_else(|| {
-                Some(
-                    sample
-                        .pins
-                        .iter()
-                        .map(|p| p.voltage * p.current)
-                        .sum::<f64>(),
-                )
-            });
-            if let Some(p) = power_val {
-                data.power_history.push((now, p));
-            }
-            if let Some(t) = sample.temp_c {
-                data.temp_history.push((now, t));
-            }
-            if let Some(m) = sample.mem_used_gb {
-                data.mem_history.push((now, m));
-            }
-            // Cache the permanent y ranges reported by NVML. They are static
-            // per GPU, so the first successful poll fixes the graph scales.
-            if let Some(m) = sample.limit_max_w {
-                data.power_range_max = Some(m as f64);
-            }
-            if let Some(m) = sample.max_temp_c {
-                data.temp_range_max = Some(m);
-            }
-            if let Some(m) = sample.mem_total_gb {
-                data.mem_range_max = Some(m);
-            }
-            data.sample = sample;
-            got_sample = true;
-        }
-        if got_sample {
-            let t_min = now - HISTORY_SECS;
-            for hist in &mut data.history {
-                let k = hist.partition_point(|(t, _)| *t < t_min);
-                hist.drain(..k);
-            }
-            let prune = |hist: &mut Vec<(f64, f64)>| {
-                let k = hist.partition_point(|(t, _)| *t < t_min);
-                hist.drain(..k);
-            };
-            prune(&mut data.power_history);
-            prune(&mut data.temp_history);
-            prune(&mut data.mem_history);
-        }
 
         let window_secs = HORIZONS_MIN[self.window_idx as usize] as f64 * 60.0;
 
@@ -2161,6 +2165,40 @@ mod tests {
         // values use 2 decimals, so pin 0's ten 5.0 A samples read "5.00]"
         // (the sample pins use 3 decimals and cannot collide).
         assert_eq!(json.matches("5.00]").count(), 10);
+    }
+
+    #[test]
+    fn web_data_record_appends_and_caches_ranges() {
+        let mut d = WebData::new();
+        let s = Sample {
+            pins: vec![
+                PinReading {
+                    voltage: 12.0,
+                    current: 5.0,
+                };
+                NUM_PINS
+            ],
+            power_w: None,
+            limit_w: Some(575),
+            limit_min_w: Some(150),
+            limit_max_w: Some(600),
+            temp_c: Some(55.0),
+            max_temp_c: Some(108.0),
+            mem_used_gb: Some(20.5),
+            mem_total_gb: Some(32.0),
+        };
+        d.record(s.clone());
+        d.record(s);
+        assert_eq!(d.history[0].len(), 2);
+        assert_eq!(d.history[NUM_PINS - 1].len(), 2);
+        // power_w is None, so the estimated pin sum (6 x 12.0 x 5.0) is used
+        assert_eq!(d.power_history.last().map(|(_, v)| *v), Some(360.0));
+        assert_eq!(d.temp_history.len(), 2);
+        assert_eq!(d.mem_history.len(), 2);
+        assert_eq!(d.power_range_max, Some(600.0));
+        assert_eq!(d.temp_range_max, Some(108.0));
+        assert_eq!(d.mem_range_max, Some(32.0));
+        assert_eq!(d.sample.limit_w, Some(575));
     }
 
     #[test]
