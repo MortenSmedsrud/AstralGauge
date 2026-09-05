@@ -6,6 +6,8 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::raw::c_void;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -52,8 +54,115 @@ struct I2cSmbusIoctlData {
     data: *mut I2cSmbusData,
 }
 
-const CURRENT_GREEN: f64 = 9.2;
-const CURRENT_YELLOW: f64 = 10.0;
+/// Allowed range and defaults for the current limits (amperes).
+const MIN_LIMIT_A: f32 = 1.0;
+const MAX_LIMIT_A: f32 = 12.0;
+const DEFAULT_YELLOW_LIMIT_A: f32 = 9.2;
+const DEFAULT_RED_LIMIT_A: f32 = 10.0;
+
+/// Directory with the shipped alert sounds (relative to the working dir).
+const SOUND_DIR: &str = "sound";
+
+/// The alarm thresholds and sounds of the app. The green/yellow/red color
+/// ranges in the tables and graphs, and the warning sounds, follow the
+/// limits: below `yellow_limit_a` is green, from there up to (but not
+/// including) `red_limit_a` is yellow, and at `red_limit_a` or above is red.
+#[derive(Clone, Debug, PartialEq)]
+struct Settings {
+    /// Current (A) at which the yellow range starts.
+    yellow_limit_a: f32,
+    /// Current (A) at which the red range starts.
+    red_limit_a: f32,
+    /// Play `yellow_sound_path` when a pin's current enters the yellow range.
+    yellow_sound_enabled: bool,
+    yellow_sound_path: PathBuf,
+    /// Play `red_sound_path` when a pin's current enters the red range.
+    red_sound_enabled: bool,
+    red_sound_path: PathBuf,
+}
+
+/// Locate one of the shipped alert sounds by name prefix. The files in
+/// `sound/` carry generated hash suffixes, so match the prefix instead of
+/// hard-coding the full file names; falls back to `<prefix>.wav`.
+fn default_sound_path(prefix: &str) -> PathBuf {
+    if let Ok(entries) = std::fs::read_dir(SOUND_DIR) {
+        let mut names: Vec<String> = entries
+            .flatten()
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| n.starts_with(prefix) && n.to_lowercase().ends_with(".wav"))
+            .collect();
+        names.sort();
+        if let Some(name) = names.into_iter().next() {
+            return PathBuf::from(SOUND_DIR).join(name);
+        }
+    }
+    PathBuf::from(SOUND_DIR).join(format!("{prefix}.wav"))
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings {
+            yellow_limit_a: DEFAULT_YELLOW_LIMIT_A,
+            red_limit_a: DEFAULT_RED_LIMIT_A,
+            yellow_sound_enabled: false,
+            yellow_sound_path: default_sound_path("attention"),
+            red_sound_enabled: false,
+            red_sound_path: default_sound_path("critical"),
+        }
+    }
+}
+
+/// Play an alert sound with the first system player that starts; runs on a
+/// helper thread so the caller never blocks. Sound is best-effort: missing
+/// players or files are ignored.
+fn play_sound(path: &Path) {
+    let path = path.to_owned();
+    thread::spawn(move || {
+        for player in ["aplay", "pw-play", "paplay"] {
+            let mut cmd = Command::new(player);
+            if player == "aplay" {
+                cmd.arg("-q");
+            }
+            match cmd
+                .arg(&path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                Ok(mut child) => {
+                    let _ = child.wait();
+                    return;
+                }
+                Err(_) => continue,
+            }
+        }
+    });
+}
+
+/// Fold one sample's maximum pin current into the latched over-limit state
+/// and return the alert sound triggered by the rising edge, if any. Red
+/// takes priority over yellow, and no sound repeats while a limit stays
+/// surpassed.
+fn over_limit_sound(
+    latched_yellow: &mut bool,
+    latched_red: &mut bool,
+    max_current: f64,
+    s: &Settings,
+) -> Option<PathBuf> {
+    let over_yellow = max_current >= s.yellow_limit_a as f64;
+    let over_red = max_current >= s.red_limit_a as f64;
+    let sound = if over_red && !*latched_red && s.red_sound_enabled {
+        Some(s.red_sound_path.clone())
+    } else if over_yellow && !over_red && !*latched_yellow && s.yellow_sound_enabled {
+        Some(s.yellow_sound_path.clone())
+    } else {
+        None
+    };
+    *latched_yellow = over_yellow;
+    *latched_red = over_red;
+    sound
+}
 
 /// One poll sample: per-pin I2C readings plus NVML data.
 #[derive(Clone, Default)]
@@ -258,6 +367,9 @@ fn main() {
         web_port: DEFAULT_WEB_PORT.to_string(),
         web: WebState::Stopped,
         web_error: None,
+        settings: Settings::default(),
+        draft_settings: None,
+        file_dialog: None,
     };
 
     if let Err(e) = eframe::run_native("Power Monitor", options, Box::new(|_cc| Ok(Box::new(app))))
@@ -703,6 +815,12 @@ struct WebData {
     poll_ms: u64,
     /// The "Show graphs" toggle, mirrored so the web UI matches the GUI.
     show_graphs: bool,
+    /// The applied limits and sounds, mirrored so the poller (alert sounds)
+    /// and the web page (thresholds) follow the settings dialog.
+    settings: Settings,
+    /// Rising-edge latches for the alert sounds.
+    yellow_latched: bool,
+    red_latched: bool,
 }
 
 impl WebData {
@@ -719,6 +837,9 @@ impl WebData {
             mem_range_max: None,
             poll_ms: DEFAULT_POLL_MS,
             show_graphs: true,
+            settings: Settings::default(),
+            yellow_latched: false,
+            red_latched: false,
         }
     }
 
@@ -761,6 +882,21 @@ impl WebData {
         }
         if let Some(m) = sample.mem_total_gb {
             self.mem_range_max = Some(m);
+        }
+
+        // Alert sounds: play on the rising edge of the yellow/red limits.
+        let max_current = sample
+            .pins
+            .iter()
+            .map(|p| p.current)
+            .fold(f64::NEG_INFINITY, f64::max);
+        if let Some(path) = over_limit_sound(
+            &mut self.yellow_latched,
+            &mut self.red_latched,
+            max_current,
+            &self.settings,
+        ) {
+            play_sound(&path);
         }
         self.sample = sample;
 
@@ -952,6 +1088,12 @@ fn web_json(data: &WebData, window_secs: f64) -> String {
     out.push_str(&(window_secs as u64).to_string());
     out.push_str(",\"poll_ms\":");
     out.push_str(&data.poll_ms.to_string());
+    out.push_str(",\"limits\":[");
+    out.push_str(&format!(
+        "{:.1},{:.1}",
+        data.settings.yellow_limit_a, data.settings.red_limit_a
+    ));
+    out.push_str("]");
     out.push_str(",\"show_graphs\":");
     out.push_str(if data.show_graphs { "true" } else { "false" });
     out.push_str(",\"sample\":{\"pins\":[");
@@ -1105,7 +1247,7 @@ const INDEX_HTML: &str = r###"<!DOCTYPE html>
       <table id="curr"></table>
     </div>
   </div>
-  <div class="legend">
+  <div class="legend" id="legend">
     <span class="r">● &gt; 10A</span><span class="y">● 9.2–10A</span><span class="g">● &lt; 9.2A</span>
   </div>
   <div id="graphs">
@@ -1120,6 +1262,8 @@ const INDEX_HTML: &str = r###"<!DOCTYPE html>
 
 const HORIZONS = [1, 5, 10, 15, 30, 60];
 let windowMin = 1;
+// [yellow, red] current limits (A); updated from the settings dialog.
+let limits = [9.2, 10.0];
 
 const winsEl = document.getElementById('windows');
 HORIZONS.forEach(function (m) {
@@ -1170,8 +1314,8 @@ function redrawGraph(i) {
 }
 
 function currentColor(v) {
-  if (v < 9.2) return '#50dc50';
-  if (v < 10.0) return '#f0d228';
+  if (v < limits[0]) return '#50dc50';
+  if (v < limits[1]) return '#f0d228';
   return '#f03c3c';
 }
 
@@ -1195,8 +1339,8 @@ function drawGraph(cv, pts, now, win, fixedMax, idx) {
 
   let yMax;
   if (isPin) {
-    // keep the 9.2 / 10 A limit lines visible, grow the scale for spikes
-    yMax = 11.0;
+    // keep the limit lines visible, grow the scale for spikes
+    yMax = limits[1] * 1.1;
     for (let i = 0; i < n; i++) yMax = Math.max(yMax, vis[i][1] * 1.05);
   } else if (fixedMax && fixedMax > 0) {
     yMax = fixedMax;
@@ -1214,13 +1358,13 @@ function drawGraph(cv, pts, now, win, fixedMax, idx) {
 
   ctx.font = '9px monospace';
   ctx.fillStyle = '#8a8a8a';
-  if (!isPin || yMax > 11.0) ctx.fillText(yMax.toFixed(0), 2, 10);
+  if (!isPin || yMax > limits[1] * 1.1) ctx.fillText(yMax.toFixed(0), 2, 10);
   ctx.fillText('0', 2, h - 3);
 
   if (isPin) {
-    const limits = [[9.2, '#a5964b'], [10.0, '#af5555']];
-    for (let i = 0; i < limits.length; i++) {
-      const lim = limits[i][0], col = limits[i][1];
+    const lims = [[limits[0], '#a5964b'], [limits[1], '#af5555']];
+    for (let i = 0; i < lims.length; i++) {
+      const lim = lims[i][0], col = lims[i][1];
       const y = yOf(lim);
       ctx.strokeStyle = col;
       ctx.setLineDash([4, 3]);
@@ -1335,6 +1479,15 @@ function render(d) {
   }
   document.getElementById('interval').textContent = 'Sample interval: ' + d.poll_ms + ' ms';
 
+  // current limits (from the settings dialog) and matching legend
+  if (d.limits) {
+    limits = d.limits;
+    document.getElementById('legend').innerHTML =
+      '<span class="r">● ≥ ' + limits[1] + 'A</span>' +
+      '<span class="y">● ' + limits[0] + '–' + limits[1] + 'A</span>' +
+      '<span class="g">● < ' + limits[0] + 'A</span>';
+  }
+
   // tables (skip until the first sample with all pins has arrived)
   if (s.pins.length === 6) {
     const volt = document.getElementById('volt');
@@ -1350,7 +1503,7 @@ function render(d) {
         const cell = cr.insertCell();
         const cur = s.pins[pin][1];
         cell.textContent = pinLabel(pin, cur);
-        cell.className = cur < 9.2 ? 'g' : (cur < 10.0 ? 'y' : 'r');
+        cell.className = cur < limits[0] ? 'g' : (cur < limits[1] ? 'y' : 'r');
       }
     }
   }
@@ -1397,10 +1550,10 @@ const HORIZONS_MIN: [u32; 6] = [1, 5, 10, 15, 30, 60];
 /// Keep a little more history than the largest horizon
 const HISTORY_SECS: f64 = 60.0 * 60.0 + 120.0;
 
-fn current_color(current: f64) -> egui::Color32 {
-    if current < CURRENT_GREEN {
+fn current_color(current: f64, s: &Settings) -> egui::Color32 {
+    if current < s.yellow_limit_a as f64 {
         egui::Color32::from_rgb(80, 220, 80)
-    } else if current < CURRENT_YELLOW {
+    } else if current < s.red_limit_a as f64 {
         egui::Color32::from_rgb(240, 210, 40)
     } else {
         egui::Color32::from_rgb(240, 60, 60)
@@ -1424,6 +1577,67 @@ struct App {
     web: WebState,
     /// One-shot warning (e.g. port in use), shown in a small dialog.
     web_error: Option<String>,
+    /// The applied limits and sounds.
+    settings: Settings,
+    /// While set, the settings panel is open and editing this draft copy
+    /// of the settings (Accept commits it, Cancel discards it).
+    draft_settings: Option<Settings>,
+    /// While set, the sound file picker is open.
+    file_dialog: Option<FileDialog>,
+}
+
+/// Which sound path the file picker is choosing.
+#[derive(Clone, Copy)]
+enum SoundField {
+    Yellow,
+    Red,
+}
+
+/// A minimal built-in sound file picker: browses directories and lists the
+/// `.wav` files to choose from, keeping the app free of dialog dependencies.
+struct FileDialog {
+    field: SoundField,
+    dir: PathBuf,
+    /// Shown when the directory could not be read.
+    error: Option<String>,
+}
+
+impl FileDialog {
+    /// Open at the directory holding the current selection (or the current
+    /// directory when the stored path does not exist).
+    fn new(field: SoundField, current: &Path) -> Self {
+        let parent = current.parent().unwrap_or(Path::new(".")).to_path_buf();
+        let dir = parent.canonicalize().unwrap_or(parent);
+        FileDialog {
+            field,
+            dir,
+            error: None,
+        }
+    }
+}
+
+/// Path display plus browse button for one of the sound settings. Clicking
+/// the button records the request; the picker opens next to the panel.
+fn sound_file_row(
+    ui: &mut egui::Ui,
+    path: &mut PathBuf,
+    field: SoundField,
+    open_browser: &mut Option<(SoundField, PathBuf)>,
+) {
+    ui.horizontal(|ui| {
+        ui.label("Sound file:");
+        let label = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        if ui
+            .button(label)
+            .on_hover_text(path.display().to_string())
+            .clicked()
+        {
+            *open_browser = Some((field, path.clone()));
+        }
+    });
 }
 
 impl eframe::App for App {
@@ -1434,9 +1648,33 @@ impl eframe::App for App {
         let mut data = self.data.lock().unwrap();
         data.poll_ms = self.poll_ms;
         data.show_graphs = self.show_graphs;
+        if data.settings != self.settings {
+            // Mirrored so the poller plays alert sounds and the web page
+            // draws the same thresholds the GUI shows.
+            data.settings = self.settings.clone();
+        }
         let now = data.start.elapsed().as_secs_f64();
 
         let window_secs = HORIZONS_MIN[self.window_idx as usize] as f64 * 60.0;
+
+        // Top bar with the settings button (gear), top right.
+        egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(egui::RichText::new("\u{2699}").size(18.0))
+                                .frame(false),
+                        )
+                        .on_hover_text("Settings")
+                        .clicked()
+                        && self.draft_settings.is_none()
+                    {
+                        self.draft_settings = Some(self.settings.clone());
+                    }
+                });
+            });
+        });
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("ASUS 5090 ROG Astral");
@@ -1624,7 +1862,7 @@ impl eframe::App for App {
             for row in 0..2 {
                 ui.horizontal(|ui| {
                     for i in row * 3..row * 3 + 3 {
-                        let color = current_color(data.sample.pins[i].current);
+                        let color = current_color(data.sample.pins[i].current, &self.settings);
                         ui.label(
                             egui::RichText::new(format!(
                                 "Pin {:>2}: {:>7.3}",
@@ -1634,19 +1872,21 @@ impl eframe::App for App {
                         );
                     }
                     if row == 0 {
+                        let y = self.settings.yellow_limit_a;
+                        let r = self.settings.red_limit_a;
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.label(
-                                egui::RichText::new("● > 10A")
+                                egui::RichText::new(format!("● ≥ {r:.1}A"))
                                     .color(egui::Color32::from_rgb(240, 60, 60)),
                             );
                             ui.add_space(12.0);
                             ui.label(
-                                egui::RichText::new("● 9.2–10A")
+                                egui::RichText::new(format!("● {y:.1}–{r:.1}A"))
                                     .color(egui::Color32::from_rgb(240, 210, 40)),
                             );
                             ui.add_space(12.0);
                             ui.label(
-                                egui::RichText::new("● < 9.2A")
+                                egui::RichText::new(format!("● < {y:.1}A"))
                                     .color(egui::Color32::from_rgb(80, 220, 80)),
                             );
                         });
@@ -1683,6 +1923,7 @@ impl eframe::App for App {
                                     now,
                                     window_secs,
                                     graph_size,
+                                    &self.settings,
                                 );
                             } else {
                                 match col {
@@ -1743,6 +1984,179 @@ impl eframe::App for App {
                 });
         }
 
+        // Settings panel: edits a draft copy of the settings. Accept
+        // commits it and closes the panel, Cancel (or the window's X)
+        // discards it. Accept is only enabled while the draft actually
+        // differs from the applied settings.
+        let mut accept = false;
+        let mut cancel = false;
+        let mut open_browser: Option<(SoundField, PathBuf)> = None;
+        if let Some(draft) = &mut self.draft_settings {
+            let mut open = true;
+            egui::Window::new("Settings")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .default_pos([150.0, 90.0])
+                .show(ctx, |ui| {
+                    ui.set_min_width(400.0);
+
+                    ui.strong("Current limits");
+                    let mut yellow = draft.yellow_limit_a;
+                    ui.add(
+                        egui::Slider::new(&mut yellow, MIN_LIMIT_A..=draft.red_limit_a)
+                            .step_by(0.1)
+                            .suffix(" A")
+                            .text("Yellow starts"),
+                    );
+                    draft.yellow_limit_a = (yellow * 10.0).round() / 10.0;
+                    let mut red = draft.red_limit_a;
+                    ui.add(
+                        egui::Slider::new(&mut red, draft.yellow_limit_a..=MAX_LIMIT_A)
+                            .step_by(0.1)
+                            .suffix(" A")
+                            .text("Red starts"),
+                    );
+                    draft.red_limit_a = (red * 10.0).round() / 10.0;
+
+                    ui.add_space(6.0);
+                    ui.separator();
+                    ui.strong("Alert sounds");
+                    ui.checkbox(
+                        &mut draft.yellow_sound_enabled,
+                        "Play sound when the yellow limit is surpassed",
+                    );
+                    sound_file_row(
+                        ui,
+                        &mut draft.yellow_sound_path,
+                        SoundField::Yellow,
+                        &mut open_browser,
+                    );
+                    ui.checkbox(
+                        &mut draft.red_sound_enabled,
+                        "Play sound when the red limit is surpassed",
+                    );
+                    sound_file_row(
+                        ui,
+                        &mut draft.red_sound_path,
+                        SoundField::Red,
+                        &mut open_browser,
+                    );
+
+                    ui.add_space(6.0);
+                    ui.separator();
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        accept = ui
+                            .add_enabled(
+                                *draft != self.settings,
+                                egui::Button::new(egui::RichText::new("Accept").strong()),
+                            )
+                            .clicked();
+                        if ui.button("Cancel").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            if !open {
+                cancel = true;
+            }
+        }
+        if let Some((field, path)) = open_browser {
+            self.file_dialog = Some(FileDialog::new(field, &path));
+        }
+        if accept {
+            if let Some(draft) = self.draft_settings.take() {
+                self.settings = draft;
+            }
+        }
+        if accept || cancel {
+            self.file_dialog = None;
+        }
+
+        // Sound file picker, shown on top of the settings panel.
+        let mut dialog_close = false;
+        if let Some(fd) = &mut self.file_dialog {
+            let mut picked: Option<PathBuf> = None;
+            let mut open = true;
+            let mut dirs: Vec<String> = Vec::new();
+            let mut files: Vec<String> = Vec::new();
+            egui::Window::new("Select sound file")
+                .open(&mut open)
+                .collapsible(false)
+                .default_pos([260.0, 200.0])
+                .default_width(360.0)
+                .show(ctx, |ui| {
+                    ui.monospace(fd.dir.display().to_string());
+                    if let Some(err) = &fd.error {
+                        ui.colored_label(egui::Color32::from_rgb(240, 120, 120), err);
+                    }
+                    if ui.button("Up one level").clicked() {
+                        if let Some(parent) = fd.dir.parent() {
+                            fd.dir = parent.to_path_buf();
+                        }
+                    }
+                    match std::fs::read_dir(&fd.dir) {
+                        Ok(entries) => {
+                            fd.error = None;
+                            for entry in entries.flatten() {
+                                let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                                let name = entry.file_name().to_string_lossy().into_owned();
+                                if is_dir {
+                                    // Skip dot-directories; they only add noise.
+                                    if !name.starts_with('.') {
+                                        dirs.push(name);
+                                    }
+                                } else if name.to_lowercase().ends_with(".wav") {
+                                    files.push(name);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            fd.error = Some(format!("Cannot read {}: {e}", fd.dir.display()));
+                        }
+                    }
+                    dirs.sort();
+                    files.sort();
+                    if fd.error.is_none() && dirs.is_empty() && files.is_empty() {
+                        ui.weak("No folders or .wav files here.");
+                    }
+                    egui::ScrollArea::vertical()
+                        .max_height(260.0)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            for d in &dirs {
+                                if ui.selectable_label(false, format!("{d}/")).clicked() {
+                                    fd.dir = fd.dir.join(d);
+                                }
+                            }
+                            for f in &files {
+                                if ui.selectable_label(false, f).clicked() {
+                                    picked = Some(fd.dir.join(f));
+                                }
+                            }
+                        });
+                    ui.separator();
+                    if ui.button("Cancel").clicked() {
+                        dialog_close = true;
+                    }
+                });
+            if let Some(path) = picked {
+                if let Some(draft) = &mut self.draft_settings {
+                    match fd.field {
+                        SoundField::Yellow => draft.yellow_sound_path = path,
+                        SoundField::Red => draft.red_sound_path = path,
+                    }
+                }
+                dialog_close = true;
+            }
+            if !open {
+                dialog_close = true;
+            }
+        }
+        if dialog_close {
+            self.file_dialog = None;
+        }
+
         // Redraw about as fast as the data arrives when idle.
         // Input events (slider drags, checkbox, window moves) still trigger
         // immediate repaints, so the UI stays fully responsive.
@@ -1752,7 +2166,7 @@ impl eframe::App for App {
 
 /// Draw one small graph of a pin's current over the visible time window.
 /// The line is colored per segment by the current thresholds, and the
-/// 9.2 A / 10 A limits are drawn as horizontal reference lines.
+/// yellow/red limits are drawn as horizontal reference lines.
 /// Hover readout shared by all graphs: while the pointer is inside the
 /// graph rect, draw a faint vertical crosshair, a marker on the data line,
 /// and a label with the value of the nearest sample.
@@ -1845,6 +2259,7 @@ fn add_pin_graph(
     now: f64,
     window_secs: f64,
     size: egui::Vec2,
+    settings: &Settings,
 ) {
     ui.vertical(|ui| {
         ui.label(egui::RichText::new(format!("Pin {pin}")).strong());
@@ -1865,7 +2280,8 @@ fn add_pin_graph(
         let vis = &hist[k..];
 
         // Y range: always keep both limit lines visible, grow for spikes
-        let mut y_max: f64 = 11.0;
+        let base_max = settings.red_limit_a as f64 * 1.1;
+        let mut y_max: f64 = base_max;
         for (_, v) in vis {
             y_max = y_max.max(*v * 1.05);
         }
@@ -1877,8 +2293,14 @@ fn add_pin_graph(
         let small = egui::FontId::monospace(9.0);
         let dim = ui.visuals().weak_text_color();
         for (limit, color) in [
-            (9.2, egui::Color32::from_rgb(165, 150, 75)),
-            (10.0, egui::Color32::from_rgb(175, 85, 85)),
+            (
+                settings.yellow_limit_a as f64,
+                egui::Color32::from_rgb(165, 150, 75),
+            ),
+            (
+                settings.red_limit_a as f64,
+                egui::Color32::from_rgb(175, 85, 85),
+            ),
         ] {
             let y = y_of(limit) as f32;
             let mut x = rect.left();
@@ -1893,15 +2315,15 @@ fn add_pin_graph(
             painter.text(
                 egui::Pos2::new(rect.right() - 18.0, (y - 10.0).max(rect.top() + 1.0)),
                 egui::Align2::LEFT_TOP,
-                format!("{limit}"),
+                format!("{limit:.1}"),
                 small.clone(),
                 dim,
             );
         }
 
         // Top scale label: only when the range has grown beyond the base
-        // 11 A; the limit lines otherwise define the scale
-        if y_max > 11.0 {
+        // limit scale; the limit lines otherwise define the scale
+        if y_max > base_max {
             painter.text(
                 egui::Pos2::new(rect.left() + 2.0, rect.top() + 1.0),
                 egui::Align2::LEFT_TOP,
@@ -1930,7 +2352,7 @@ fn add_pin_graph(
                         egui::Pos2::new(x_of(vis[i].0) as f32, y_of(vis[i].1) as f32),
                         egui::Pos2::new(x_of(vis[j].0) as f32, y_of(vis[j].1) as f32),
                     ],
-                    egui::Stroke::new(1.0, current_color(vis[j].1)),
+                    egui::Stroke::new(1.0, current_color(vis[j].1, settings)),
                 );
             };
             let mut i = 0;
@@ -1955,7 +2377,7 @@ fn add_pin_graph(
             window_secs,
             &x_of,
             &y_of,
-            |v| current_color(v),
+            |v| current_color(v, settings),
             "A",
         );
     });
@@ -2159,6 +2581,7 @@ mod tests {
         assert!(json.contains("\"mem_total_gb\":32.0"));
         assert!(json.contains("\"show_graphs\":true"));
         assert!(json.contains("\"poll_ms\":1000"));
+        assert!(json.contains("\"limits\":[9.2,10.0]"));
         // Two \"pins\" arrays: the latest sample and the history data.
         assert_eq!(json.matches("\"pins\":[").count(), 2);
         // All 10 per-pin history points fit inside the 60 s window. History
@@ -2199,6 +2622,64 @@ mod tests {
         assert_eq!(d.temp_range_max, Some(108.0));
         assert_eq!(d.mem_range_max, Some(32.0));
         assert_eq!(d.sample.limit_w, Some(575));
+    }
+
+    #[test]
+    fn settings_defaults_are_valid() {
+        let s = Settings::default();
+        // The defaults match the thresholds this app shipped with.
+        assert_eq!(s.yellow_limit_a, DEFAULT_YELLOW_LIMIT_A);
+        assert_eq!(s.red_limit_a, DEFAULT_RED_LIMIT_A);
+        assert!(!s.yellow_sound_enabled && !s.red_sound_enabled);
+        assert!(s.yellow_limit_a >= MIN_LIMIT_A);
+        assert!(s.yellow_limit_a <= s.red_limit_a);
+        assert!(s.red_limit_a <= MAX_LIMIT_A);
+        // The shipped sounds are found by prefix inside the sound dir.
+        let a = default_sound_path("attention");
+        let c = default_sound_path("critical");
+        assert!(
+            a.to_string_lossy().starts_with("sound/attention")
+                && a.extension() == Some("wav".as_ref())
+        );
+        assert!(
+            c.to_string_lossy().starts_with("sound/critical")
+                && c.extension() == Some("wav".as_ref())
+        );
+        assert!(a != c);
+    }
+
+    #[test]
+    fn over_limit_sound_edge_triggers() {
+        let mut s = Settings::default();
+        s.yellow_sound_enabled = true;
+        s.red_sound_enabled = true;
+        let (mut ly, mut lr) = (false, false);
+        // Below yellow: nothing.
+        assert_eq!(over_limit_sound(&mut ly, &mut lr, 5.0, &s), None);
+        // Enter yellow: the sound fires once, then stays silent.
+        assert_eq!(
+            over_limit_sound(&mut ly, &mut lr, 9.5, &s),
+            Some(s.yellow_sound_path.clone())
+        );
+        assert_eq!(over_limit_sound(&mut ly, &mut lr, 9.8, &s), None);
+        // Enter red: the red sound fires once (yellow is suppressed).
+        assert_eq!(
+            over_limit_sound(&mut ly, &mut lr, 10.5, &s),
+            Some(s.red_sound_path.clone())
+        );
+        assert_eq!(over_limit_sound(&mut ly, &mut lr, 11.0, &s), None);
+        // Falling back into yellow: no repeat, yellow was already latched.
+        assert_eq!(over_limit_sound(&mut ly, &mut lr, 9.5, &s), None);
+        // Dropping below yellow resets the latches, so it can fire again.
+        assert_eq!(over_limit_sound(&mut ly, &mut lr, 1.0, &s), None);
+        assert_eq!(
+            over_limit_sound(&mut ly, &mut lr, 9.5, &s),
+            Some(s.yellow_sound_path.clone())
+        );
+        // A disabled sound never fires.
+        s.yellow_sound_enabled = false;
+        let (mut ly2, mut lr2) = (false, false);
+        assert_eq!(over_limit_sound(&mut ly2, &mut lr2, 9.5, &s), None);
     }
 
     #[test]
