@@ -394,8 +394,9 @@ mod nvml {
     use super::*;
 
     pub const NVML_SUCCESS: u32 = 0;
+    const NVML_ERROR_INVALID_ARGUMENT: u32 = 2;
     const NVML_ERROR_NOT_SUPPORTED: u32 = 3;
-    const NVML_ERROR_INSUFFICIENT_PERMISSIONS: u32 = 9;
+    const NVML_ERROR_NO_PERMISSION: u32 = 4;
     /// Sensor type for the main GPU temperature (NVML_TEMPERATURE_GPU).
     const NVML_TEMPERATURE_GPU: u32 = 0;
     /// Temperature thresholds (NVML_TEMPERATURE_THRESHOLD_t).
@@ -434,10 +435,11 @@ mod nvml {
     impl std::fmt::Display for Error {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             match self.0 {
-                NVML_ERROR_NOT_SUPPORTED => write!(f, "not supported by the driver"),
-                NVML_ERROR_INSUFFICIENT_PERMISSIONS => {
-                    write!(f, "insufficient permissions (run as root)")
+                NVML_ERROR_INVALID_ARGUMENT => {
+                    write!(f, "invalid argument (outside the allowed range?)")
                 }
+                NVML_ERROR_NOT_SUPPORTED => write!(f, "not supported by the driver"),
+                NVML_ERROR_NO_PERMISSION => write!(f, "insufficient permissions (run as root)"),
                 code => write!(f, "NVML error {code}"),
             }
         }
@@ -571,10 +573,12 @@ mod nvml {
             (power_w, limit_w, min_w, max_w)
         }
 
-        /// Set the power management limit. The v1 set function takes watts
-        /// (the same unit `nvidia-smi -pl` uses), unlike the get functions.
+        /// Set the power management limit (given in watts). Like the getters,
+        /// the v1 set function expects milliwatts on current drivers, so
+        /// convert first: sending plain watts gets rejected with
+        /// NVML_ERROR_INVALID_ARGUMENT (error 2).
         pub fn set_power_limit(&self, watts: u32) -> Result<(), Error> {
-            let code = unsafe { (self.set_limit)(self.device, watts) };
+            let code = unsafe { (self.set_limit)(self.device, watts.saturating_mul(1000)) };
             if code == NVML_SUCCESS {
                 Ok(())
             } else {

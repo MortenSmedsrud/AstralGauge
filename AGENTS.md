@@ -145,9 +145,11 @@ tests, remember `default_sound_path` resolves relative to the crate root
 
 ## Gotchas
 
-- `Nvml::power_info` mixes units: the v1 get functions report **milliwatts**
-  on modern drivers, but `set_power_limit` takes **watts** (like
-  `nvidia-smi -pl`). See `to_watts`.
+- All NVML power functions work in **milliwatts** (v1 getters *and* the v1
+  setter, per the API docs; the setters reject plain watts with NVML error 2).
+  The app keeps watts internally: `to_watts` converts the getter values and
+  `set_power_limit` multiplies by 1000. `nvidia-smi -pl` also takes watts but
+  does its own conversion. Setting a limit requires root.
 - `I2cSmbusData` must stay 34 bytes (`#[repr(C)]` union matching the kernel);
   shrinking it breaks the block read.
 - The poller measures and periodically logs I2C batch latency (every 500th
