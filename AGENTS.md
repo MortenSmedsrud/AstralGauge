@@ -25,6 +25,9 @@ Target platform is Linux only (i2c-dev ioctls, `/sys/bus/i2c`, NVML).
 cargo run -- [i2c-bus-number]   # e.g. cargo run -- 15
 cargo test                      # unit tests (no GPU/display required)
 cargo check
+sh licenses.sh                  # regenerate the embedded license text
+                                # (build.rs does this automatically when
+                                # Cargo.lock changes; --check = CI mode)
 ```
 
 - Without an argument the I2C bus is auto-detected (scans
@@ -108,7 +111,9 @@ src/persist.rs   SETTINGS PERSISTENCE. The applied `ui::Config` is stored as
                  it never touches) instead of silently resetting it.
 src/ui.rs        DESKTOP UI. `App` (eframe::App::update: main window with
                  the "Top GPU processes" list, the flashing critical-current
-                 banner next to the total power, settings dialog, graphs),
+                 banner next to the total power, settings dialog, the About
+                 dialog (scrollable embedded license text, `ABOUT_TEXT` from
+                 `licenses.txt`), graphs),
                  `Config` (everything the settings panel edits: limits,
                  sounds, sample interval, web server, critical-alert
                  safeguard — new app-wide settings go here; every field is
@@ -122,6 +127,23 @@ sound/           Shipped alert WAVs, embedded into the binary at compile
                  time (attention/critical = yellow/red alerts, each with a
                  -powering-down variant for the automatic power feature,
                  plus critical-terminating for the kill safeguard).
+build.rs         Keeps `licenses.txt` fresh: when a crate is added,
+                 removed or updated (Cargo.lock, about.toml or
+                 about-text.hbs become newer than it) it regenerates the
+                 file via `licenses.sh` before compiling; a failed
+                 regeneration only warns (the checked-in file stays in
+                 place, so a missing cargo-about never breaks a build).
+licenses.sh      (Re)generates `licenses.txt` with cargo-about;
+                 `sh licenses.sh --check` exits non-zero when the file is
+                 stale (used by build.rs; also usable in CI or a
+                 pre-commit hook).
+about.toml       cargo-about config: the accepted license set.
+about-text.hbs   cargo-about template → `licenses.txt`, the plain-text
+                 license list embedded into the binary and shown in the
+                 desktop About dialog.
+licenses.txt     Generated from about-text.hbs (automatically by build.rs,
+                 or manually with `sh licenses.sh`); embedded at compile
+                 time, so it is committed alongside Cargo.lock.
 src/bin/         Empty (no extra binaries).
 ```
 
@@ -303,7 +325,7 @@ Optional (`Settings::auto_min_power` = Off / On yellow / On red):
 
 ## Tests
 
-`cargo test` (24 tests, no GPU/display needed):
+`cargo test` (25 tests, no GPU/display needed):
 
 - `alerts::tests`: settings defaults; embedded WAVs decode; alert edge
   triggering; 15 s repeat-while-exceeded behavior; powering-down sound
@@ -317,6 +339,9 @@ Optional (`Settings::auto_min_power` = Off / On yellow / On red):
   user sound paths with escapes), a real save()/load() file round-trip in a
   throwaway HOME, unknown/missing-key tolerance, clamping and yellow/red
   order repair, rejection of invalid values, and corrupt-document detection.
+- `ui::tests`: embedded license-text sanity (the generated `licenses.txt` is
+  non-empty, lists one "Used by:" section per license, and has no template
+  leftovers or HTML escaping).
 - `web::tests`: JSON field content (incl. process entries, name escaping and
   the latching `critical_alert` flag), `record()` history append/prune/range
   caching, query-param parsing, HTTP server serve/404/busy-port/restart and
