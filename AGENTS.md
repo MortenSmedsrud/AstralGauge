@@ -45,18 +45,24 @@ cargo check
 
 ```
 src/main.rs      Entry point: resolve I2C bus, create the shared
-                 Arc<Mutex<WebData>>, spawn the sound player + poller,
-                 build ui::App and run eframe. Keep this file thin.
+                 Arc<Mutex<WebData>>, spawn the sound player + poller, build
+                 ui::App and run eframe. Also dispatches `--power-helper`
+                 (privileged helper mode) before anything else. Keep this
+                 file thin.
 src/hardware.rs  HARDWARE POLLING. IT8915 constants + raw i2c-dev/SMBus
                  ioctls (block read of all 24 registers, byte-read
                  fallback), bus auto-detection/probing, `PinReading`,
                  `Sample`, `Cmd`, and `spawn_poller()` (the background
                  poller thread). Contains `mod nvml` — the hand-rolled
-                 dlopen FFI bindings.
+                 dlopen FFI bindings. Also the privileged power helper:
+                 `PowerHelper` (spawns this same binary as root through
+                 pkexec) and `run_power_helper()` (the helper mode).
 src/alerts.rs    LIMIT CHECKING + SOUNDS. `Settings` (limits + sound
-                 config), `AlertState` + `over_limit_sound()` (edge +
-                 repeat decision logic), `SoundPlayer` (rodio playback
-                 thread) and the shipped-sound default paths.
+                 config + `auto_min_power` mode), `AlertState` +
+                 `over_limit_sound()` (edge + repeat decision logic),
+                 `AutoPowerState` + `auto_power_action()` (automatic
+                 minimum-power-limit state machine), `SoundPlayer` (rodio
+                 playback thread) and the shipped-sound default paths.
 src/web.rs       WEB SERVER + SHARED STATE. `WebData` (latest sample,
                  histories, mirrored UI settings), `WebData::record()`
                  (sample ingestion + history pruning), `WebServer` /
@@ -89,12 +95,23 @@ critical sections are short — keep them that way:
    logged once and sounds become no-ops). Plays **one sound at a time**;
    when a sound finishes it drops stale queued requests and plays the
    newest. Never blocks the caller.
-3. **Web server thread(s)** (`web::web_serve` + one thread per connection):
+3. **Privileged power helper** (`hardware::PowerHelper`): the app runs as a
+   normal user but NVML's limit setter needs root. On demand (manual Apply,
+   the automatic min-power feature, or the "Test privileged access"
+   button) the poller spawns `pkexec <own exe> --power-helper`, which asks
+   the desktop polkit agent for the password and runs `run_power_helper()`
+   as root. The helper stays alive, speaks `SET <watts>`/`PING` lines on
+   stdin and `OK`/`ERR …` lines on stdout; reader threads relay replies into
+   a status cell the poller mirrors as `WebData::power_note` (GUI-only, not
+   in the web JSON). Auth is asked once per app run; a denied/absent agent
+   degrades to an error note, never a crash.
+4. **Web server thread(s)** (`web::web_serve` + one thread per connection):
    `try_lock` with retry → 503 on contention so a GUI frame can never
    deadlock against the server-thread join at shutdown.
-4. **GUI thread** (`ui::App::update`): renders from `WebData`, mirrors the
+5. **GUI thread** (`ui::App::update`): renders from `WebData`, mirrors the
    UI-side settings into it (`poll_ms`, `show_graphs`, `settings`), sends
-   `Cmd`s to the poller. Redraws at the poll interval when idle.
+   `Cmd`s to the poller (`SetLimit`, `Interval`, `GrantPowerAccess`).
+   Redraws at the poll interval when idle.
 
 ## Alert sound rules (implemented in `alerts::over_limit_sound`)
 
@@ -105,6 +122,18 @@ critical sections are short — keep them that way:
   `ALERT_REPEAT_DELAY` (15 s). Red escalation from yellow is immediate.
 - Only one sound ever plays at a time (serialized on the audio thread);
   sounds are best-effort and must never block or crash the app.
+
+## Automatic minimum power limit (`alerts::auto_power_action`)
+
+Optional (`Settings::auto_min_power` = Off / On yellow / On red):
+
+- Rising edge to the configured level: save the current NVML limit and lower
+  it to the constraint minimum (once per excursion, via the pkexec helper).
+- Below the level for `AUTO_POWER_RESTORE_DELAY` (30 s): restore the saved
+  limit. Disabling the feature while lowered restores immediately.
+- A manual `Cmd::SetLimit` overrides the auto state (`overridden()`): no
+  restore happens over a user-set limit.
+- No-op when the limit already is at the minimum or NVML data is missing.
 
 ## Cross-cutting conventions
 
@@ -134,10 +163,11 @@ critical sections are short — keep them that way:
 
 ## Tests
 
-`cargo test` (7 tests, no GPU/display needed):
+`cargo test` (9 tests, no GPU/display needed):
 
 - `alerts::tests`: settings defaults + shipped-sound paths; alert edge
-  triggering; 15 s repeat-while-exceeded behavior.
+  triggering; 15 s repeat-while-exceeded behavior; auto-power lower/restore
+  edges and bounds.
 - `web::tests`: JSON field content, `record()` history append/prune/range
   caching, query-param parsing, HTTP server serve/404/busy-port/restart.
 
@@ -151,7 +181,10 @@ tests, remember `default_sound_path` resolves relative to the crate root
   setter, per the API docs; the setters reject plain watts with NVML error 2).
   The app keeps watts internally: `to_watts` converts the getter values and
   `set_power_limit` multiplies by 1000. `nvidia-smi -pl` also takes watts but
-  does its own conversion. Setting a limit requires root.
+  does its own conversion. Setting a limit requires root: an unprivileged
+  setter gets NVML error 4 and the poller then routes the write through the
+  pkexec helper, which re-executes the app binary with `--power-helper` as
+  root (polkit password prompt on first use).
 - `I2cSmbusData` must stay 34 bytes (`#[repr(C)]` union matching the kernel);
   shrinking it breaks the block read.
 - The poller measures and periodically logs I2C batch latency (every 500th

@@ -9,16 +9,17 @@
 
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
-use std::io;
+use std::io::{self, BufRead, BufReader, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::raw::c_void;
+use std::process::{Child, Command, Stdio};
 use std::ptr;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use crate::alerts::{over_limit_sound, AlertState, SoundPlayer};
+use crate::alerts::{auto_power_action, over_limit_sound, AlertState, AutoPowerState, SoundPlayer};
 use crate::web::WebData;
 
 // ITE IT8915FN constants
@@ -79,6 +80,193 @@ pub(crate) struct Sample {
 pub(crate) enum Cmd {
     SetLimit(u32),
     Interval(u64),
+    /// Spawn/verify the privileged power helper (prompts for the password).
+    GrantPowerAccess,
+}
+
+/// Command-line flag that turns this binary into the privileged power-limit
+/// helper instead of the app itself (see [`PowerHelper`], [`run_power_helper`]).
+pub(crate) const POWER_HELPER_ARG: &str = "--power-helper";
+
+/// Applies GPU power limits with elevated privileges.
+///
+/// NVML's power-limit setter requires root, while the app runs as a normal
+/// user. When a limit change is needed (manually or by the automatic
+/// minimum-power feature), the app runs *itself* through polkit's `pkexec`,
+/// which prompts for a password via the desktop's polkit agent and execs the
+/// helper mode ([`run_power_helper`]) as root. The helper stays alive for the
+/// app's lifetime, so the password is asked once; it speaks a one-line
+/// protocol over stdin/stdout and nothing else.
+pub(crate) struct PowerHelper {
+    child: Option<Child>,
+    /// Short human-readable status (latest helper result or failure), kept by
+    /// the reader thread and mirrored into [`WebData::power_note`] by the
+    /// poller.
+    status: Arc<Mutex<Option<String>>>,
+}
+
+impl PowerHelper {
+    pub(crate) fn new() -> PowerHelper {
+        PowerHelper {
+            child: None,
+            status: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn set_status(&self, msg: String) {
+        *self.status.lock().unwrap() = Some(msg);
+    }
+
+    /// Spawn the helper through pkexec unless it is still running. Returns
+    /// false when it could not be started (pkexec missing, auth denied).
+    fn ensure_running(&mut self) -> bool {
+        if let Some(child) = self.child.as_mut() {
+            match child.try_wait() {
+                // Still running (or between polls): reuse it.
+                Ok(None) => return true,
+                // Exited (auth denied earlier, crash): respawn on next use.
+                _ => self.child = None,
+            }
+        }
+
+        let exe = match std::env::current_exe() {
+            Ok(exe) => exe,
+            Err(e) => {
+                self.set_status(format!("Cannot locate own executable: {e}"));
+                return false;
+            }
+        };
+        let spawned = Command::new("pkexec")
+            .arg(&exe)
+            .arg(POWER_HELPER_ARG)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn();
+        let mut child = match spawned {
+            Ok(child) => child,
+            Err(e) => {
+                self.set_status(format!(
+                    "Could not start pkexec ({e}). Is polkit installed?"
+                ));
+                return false;
+            }
+        };
+
+        // Relay helper replies into the status cell; helper diagnostics
+        // (pkexec's own errors) go to our stderr.
+        if let Some(out) = child.stdout.take() {
+            let status = self.status.clone();
+            thread::spawn(move || {
+                for line in BufReader::new(out).lines().map_while(Result::ok) {
+                    match line.strip_prefix("ERR ") {
+                        Some(msg) => *status.lock().unwrap() = Some(format!("Power helper: {msg}")),
+                        None => {
+                            *status.lock().unwrap() = Some("Privileged power helper active.".into())
+                        }
+                    }
+                }
+                *status.lock().unwrap() = Some(
+                    "Privileged power helper not running (authentication denied or unavailable)."
+                        .into(),
+                );
+            });
+        }
+        if let Some(err) = child.stderr.take() {
+            thread::spawn(move || {
+                for line in BufReader::new(err).lines().map_while(Result::ok) {
+                    eprintln!("power helper: {line}");
+                }
+            });
+        }
+        self.child = Some(child);
+        true
+    }
+
+    /// Send one command to the helper, starting it if needed.
+    fn request(&mut self, line: &str) {
+        if !self.ensure_running() {
+            return;
+        }
+        let child = self.child.as_mut().unwrap();
+        let sent = child
+            .stdin
+            .as_mut()
+            .map(|stdin| writeln!(stdin, "{line}").and_then(|()| stdin.flush()));
+        if !matches!(sent, Some(Ok(()))) {
+            // The helper died between the wait check and now: drop it so the
+            // next request respawns (and re-prompts) it.
+            self.child = None;
+            self.set_status("Privileged power helper exited.".into());
+        }
+    }
+
+    /// Set the power management limit to `watts` (asks for the password on
+    /// first use). Results are reported through the status cell.
+    pub(crate) fn set(&mut self, watts: u32) {
+        self.request(&format!("SET {watts}"));
+    }
+
+    /// Authenticate without changing anything (lets the user grant access up
+    /// front instead of at the first limit excursion).
+    pub(crate) fn ping(&mut self) {
+        self.request("PING");
+    }
+}
+
+impl Drop for PowerHelper {
+    fn drop(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// Privileged helper mode (`--power-helper`, normally only started through
+/// pkexec by [`PowerHelper`]): read one-line commands from stdin and apply
+/// power limits via NVML with the elevated privileges.
+///
+/// Protocol: `SET <watts>` answers `OK` or `ERR <msg>`, `PING` answers `OK`,
+/// `EXIT` ends. Only wattages in a sane range are accepted; the helper never
+/// touches I2C, sounds or any configuration.
+pub(crate) fn run_power_helper() -> i32 {
+    let stdin = io::stdin();
+    let mut out = io::stdout();
+    let mut nvml: Option<nvml::Nvml> = None;
+
+    for line in stdin.lock().lines().map_while(Result::ok) {
+        let line = line.trim().to_owned();
+        if line.is_empty() {
+            continue;
+        }
+        let reply = if line == "PING" {
+            "OK".to_owned()
+        } else if line == "EXIT" {
+            break;
+        } else if let Some(rest) = line.strip_prefix("SET ") {
+            match rest.trim().parse::<u32>() {
+                Ok(watts) if (100..=1000).contains(&watts) => {
+                    if nvml.is_none() {
+                        nvml = nvml::Nvml::new();
+                    }
+                    match nvml.as_ref().map(|n| n.set_power_limit(watts)) {
+                        Some(Ok(())) => format!("Power limit set to {watts} W"),
+                        Some(Err(e)) => format!("ERR setting {watts} W failed: {e}"),
+                        None => "ERR NVML unavailable (libnvidia-ml.so.1?)".to_owned(),
+                    }
+                }
+                Ok(_) => "ERR watts out of range".to_owned(),
+                Err(_) => "ERR watts is not a number".to_owned(),
+            }
+        } else {
+            "ERR unknown command".to_owned()
+        };
+        if writeln!(out, "{reply}").and_then(|()| out.flush()).is_err() {
+            break;
+        }
+    }
+    0
 }
 
 #[derive(Debug, Clone, Default)]
@@ -139,21 +327,35 @@ pub(crate) fn spawn_poller(
         let mut poll_max_ms: u64 = 0;
         let mut poll_ms = DEFAULT_POLL_MS;
         let mut alert_state = AlertState::default();
+        let mut power_helper = PowerHelper::new();
+        let mut auto_power = AutoPowerState::default();
 
         loop {
             // Handle UI commands
             while let Ok(cmd) = cmd_rx.try_recv() {
                 match cmd {
                     Cmd::SetLimit(watts) => {
-                        if let Some(nvml) = nvml.as_ref() {
-                            match nvml.set_power_limit(watts) {
-                                Ok(()) => println!("Power limit set to {watts} W"),
-                                Err(e) => {
-                                    eprintln!("Failed to set power limit to {watts} W: {e}")
-                                }
+                        // A manual set takes precedence over the automatic
+                        // lowering: never restore over it later.
+                        auto_power.overridden();
+                        match nvml.as_ref().map(|n| n.set_power_limit(watts)) {
+                            Some(Ok(())) => println!("Power limit set to {watts} W"),
+                            // Running unprivileged: NVML rejects the setter,
+                            // so route it through the pkexec helper (asks for
+                            // the password on first use).
+                            Some(Err(e)) if e.is_permission() => {
+                                println!(
+                                    "Setting the power limit needs root; using the pkexec helper."
+                                );
+                                power_helper.set(watts);
                             }
+                            Some(Err(e)) => {
+                                eprintln!("Failed to set power limit to {watts} W: {e}")
+                            }
+                            None => eprintln!("NVML unavailable: cannot set the power limit."),
                         }
                     }
+                    Cmd::GrantPowerAccess => power_helper.ping(),
                     Cmd::Interval(ms) => poll_ms = ms,
                 }
             }
@@ -231,14 +433,30 @@ pub(crate) fn spawn_poller(
                 .iter()
                 .map(|p| p.current)
                 .fold(f64::NEG_INFINITY, f64::max);
+            // Mirror the helper's status so the GUI can show what happened
+            // with privileged limit changes.
+            let power_note = power_helper.status.lock().unwrap().clone();
             let settings = {
                 let mut d = data.lock().unwrap();
                 let settings = d.settings.clone();
                 d.record(sample);
+                d.power_note = power_note;
                 settings
             };
             if let Some(path) = over_limit_sound(&mut alert_state, max_current, &settings) {
                 player.play(path);
+            }
+            // Automatic minimum power limit (see alerts::auto_power_action);
+            // applying it goes through the privileged helper.
+            if let Some(watts) = auto_power_action(
+                &mut auto_power,
+                max_current,
+                limit_w,
+                limit_min_w,
+                &settings,
+            ) {
+                println!("Automatic power limit: applying {watts} W");
+                power_helper.set(watts);
             }
             thread::sleep(Duration::from_millis(poll_ms));
         }
@@ -431,6 +649,14 @@ mod nvml {
 
     #[derive(Clone, Copy, Debug)]
     pub struct Error(pub u32);
+
+    impl Error {
+        /// Whether the call was rejected for lack of privileges (the setter
+        /// needs root; fall back to the pkexec helper in that case).
+        pub fn is_permission(&self) -> bool {
+            self.0 == NVML_ERROR_NO_PERMISSION
+        }
+    }
 
     impl std::fmt::Display for Error {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

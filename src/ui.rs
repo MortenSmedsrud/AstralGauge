@@ -12,7 +12,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::alerts::{Settings, MAX_LIMIT_A, MIN_LIMIT_A};
+use crate::alerts::{AutoMinPower, Settings, MAX_LIMIT_A, MIN_LIMIT_A};
 use crate::hardware::{Cmd, DEFAULT_POLL_MS};
 use crate::web::{WebData, WebServer, WebState, DEFAULT_WEB_PORT};
 
@@ -31,6 +31,11 @@ fn current_color(current: f64, s: &Settings) -> egui::Color32 {
 pub(crate) struct App {
     cmd_tx: mpsc::Sender<Cmd>,
     pending_limit: Option<u32>,
+    /// Last NVML-reported power limit. A change here that the UI did not
+    /// produce (automatic minimum power, a helper-set Apply landing, another
+    /// tool like nvidia-smi) re-syncs [`App::pending_limit`] so the power
+    /// limit control never displays a stale value.
+    shown_limit: Option<u32>,
     /// Latest sample, histories and NVML ranges, shared with the web server.
     data: Arc<Mutex<WebData>>,
     /// Index into HORIZONS_MIN for the visible time window.
@@ -75,6 +80,7 @@ impl App {
         App {
             cmd_tx,
             pending_limit: None,
+            shown_limit: None,
             data,
             window_idx: 0,
             show_graphs: true,
@@ -223,9 +229,12 @@ impl eframe::App for App {
                 data.sample.limit_max_w,
                 data.sample.limit_w,
             ) {
-                if self.pending_limit.is_none() {
+                // Follow limit changes made outside this control; keep an
+                // unapplied drag edit as long as the real limit is unchanged.
+                if self.shown_limit != Some(current) || self.pending_limit.is_none() {
                     self.pending_limit = Some(current);
                 }
+                self.shown_limit = Some(current);
                 let mut pending = self.pending_limit.unwrap_or(current);
                 ui.horizontal(|ui| {
                     ui.label("Power limit:");
@@ -243,6 +252,11 @@ impl eframe::App for App {
                         let _ = self.cmd_tx.send(Cmd::SetLimit(pending));
                     }
                 });
+            }
+            // Privileged power helper status (only while it has something to
+            // report: activation, or why a limit change failed).
+            if let Some(note) = data.power_note.clone() {
+                ui.label(egui::RichText::new(note).weak().size(12.0));
             }
 
             ui.separator();
@@ -479,6 +493,41 @@ impl eframe::App for App {
                         SoundField::Red,
                         &mut open_browser,
                     );
+
+                    ui.add_space(6.0);
+                    ui.separator();
+                    // Lower the GPU power limit to its minimum when a pin
+                    // reaches the selected limit. Applying it needs root, so
+                    // the first change asks polkit (pkexec) for a password.
+                    ui.strong("Automatic power limit");
+                    let auto_labels = ["Never", "On yellow limit", "On red limit"];
+                    let mut auto_idx = draft.alerts.auto_min_power.index();
+                    ui.horizontal(|ui| {
+                        ui.label("Lower the power limit to its minimum:");
+                        egui::ComboBox::from_label("")
+                            .selected_text(auto_labels[auto_idx])
+                            .show_ui(ui, |ui| {
+                                for (i, label) in auto_labels.iter().enumerate() {
+                                    ui.selectable_value(&mut auto_idx, i, *label);
+                                }
+                            });
+                    });
+                    draft.alerts.auto_min_power = AutoMinPower::from_index(auto_idx);
+                    ui.label(
+                        egui::RichText::new(
+                            "When a pin reaches the selected limit, the power management limit is \
+set to the card's minimum and restored once the current has been back below it for 30 \
+seconds. Applying limits needs administrator rights: the first change opens an \
+authentication dialog.",
+                        )
+                        .weak()
+                        .size(12.0),
+                    );
+                    if ui.button("Test privileged access").clicked() {
+                        // Spawn the helper now, so the password prompt shows
+                        // here instead of on the first limit excursion.
+                        let _ = self.cmd_tx.send(Cmd::GrantPowerAccess);
+                    }
 
                     ui.add_space(6.0);
                     ui.separator();

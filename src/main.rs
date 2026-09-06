@@ -17,10 +17,17 @@ use std::sync::{Arc, Mutex};
 
 use eframe::egui;
 
-use crate::hardware::find_i2c_bus;
+use crate::hardware::{find_i2c_bus, POWER_HELPER_ARG};
 use crate::web::WebData;
 
 fn main() {
+    // Privileged power-limit helper mode: this binary, re-executed as root
+    // through pkexec (see hardware::PowerHelper). It only answers limit
+    // commands on stdin/stdout and never opens the UI.
+    if std::env::args().any(|a| a == POWER_HELPER_ARG) {
+        std::process::exit(hardware::run_power_helper());
+    }
+
     let bus_arg: Option<String> = std::env::args().nth(1);
 
     let bus_number = match bus_arg
@@ -58,8 +65,7 @@ fn main() {
 
     let app = ui::App::new(cmd_tx, data);
 
-    if let Err(e) = eframe::run_native("AstralGauge", options, Box::new(|_cc| Ok(Box::new(app))))
-    {
+    if let Err(e) = eframe::run_native("AstralGauge", options, Box::new(|_cc| Ok(Box::new(app)))) {
         eprintln!("eframe error: {e}");
         std::process::exit(1);
     }

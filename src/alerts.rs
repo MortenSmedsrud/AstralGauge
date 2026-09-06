@@ -29,6 +29,44 @@ const SOUND_DIR: &str = "sound";
 /// surpassed; dropping below the yellow limit resets the alert state).
 pub(crate) const ALERT_REPEAT_DELAY: Duration = Duration::from_secs(15);
 
+/// How long the pin current must stay below the automatic power-limit trigger
+/// level before the previously saved power limit is restored (hysteresis
+/// against flapping right at the threshold).
+pub(crate) const AUTO_POWER_RESTORE_DELAY: Duration = Duration::from_secs(30);
+
+/// When the power management limit should be automatically lowered to its
+/// hardware minimum (requires the privileged power helper, see
+/// [`crate::hardware::PowerHelper`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub(crate) enum AutoMinPower {
+    /// Feature disabled.
+    #[default]
+    Off,
+    /// Lower the limit when a pin reaches the yellow limit.
+    OnYellow,
+    /// Lower the limit when a pin reaches the red limit.
+    OnRed,
+}
+
+impl AutoMinPower {
+    /// Position in the settings combo box.
+    pub(crate) fn index(self) -> usize {
+        match self {
+            AutoMinPower::Off => 0,
+            AutoMinPower::OnYellow => 1,
+            AutoMinPower::OnRed => 2,
+        }
+    }
+
+    pub(crate) fn from_index(i: usize) -> AutoMinPower {
+        match i {
+            1 => AutoMinPower::OnYellow,
+            2 => AutoMinPower::OnRed,
+            _ => AutoMinPower::Off,
+        }
+    }
+}
+
 /// The alarm thresholds and sounds of the app. The green/yellow/red color
 /// ranges in the tables and graphs, and the warning sounds, follow the
 /// limits: below `yellow_limit_a` is green, from there up to (but not
@@ -45,6 +83,9 @@ pub(crate) struct Settings {
     /// Play `red_sound_path` while a pin's current is in the red range.
     pub(crate) red_sound_enabled: bool,
     pub(crate) red_sound_path: PathBuf,
+    /// Automatically lower the GPU power management limit to its minimum
+    /// when a pin current reaches the selected limit level.
+    pub(crate) auto_min_power: AutoMinPower,
 }
 
 /// Path of one of the shipped alert sounds: `sound/<prefix>.wav`, resolved
@@ -62,6 +103,7 @@ impl Default for Settings {
             yellow_sound_path: default_sound_path("attention"),
             red_sound_enabled: false,
             red_sound_path: default_sound_path("critical"),
+            auto_min_power: AutoMinPower::default(),
         }
     }
 }
@@ -125,6 +167,80 @@ pub(crate) fn over_limit_sound(
             s.yellow_sound_path.clone()
         })
     } else {
+        None
+    }
+}
+
+/// Automatic-power-limit state carried across poll samples: the limit to
+/// restore once the trigger condition clears (set while the limit is lowered)
+/// and when the pin current first dropped below the trigger level.
+#[derive(Default)]
+pub(crate) struct AutoPowerState {
+    saved_limit_w: Option<u32>,
+    below_since: Option<Instant>,
+}
+
+impl AutoPowerState {
+    /// Forget the auto-lowered state without restoring: used when the user
+    /// applies a power limit manually, which takes precedence.
+    pub(crate) fn overridden(&mut self) {
+        self.saved_limit_w = None;
+        self.below_since = None;
+    }
+}
+
+/// Fold one sample into the automatic power-limit state machine and return
+/// the power limit (watts) to apply now, if any.
+///
+/// When enabled, reaching the trigger level lowers the limit to its minimum
+/// (saving the current limit), once per excursion. The saved limit is
+/// restored after the current stays below the trigger level for
+/// [`AUTO_POWER_RESTORE_DELAY`], or immediately when the feature gets
+/// disabled. Does nothing when the limit is already at (or below) the
+/// minimum or the NVML values are unavailable.
+pub(crate) fn auto_power_action(
+    state: &mut AutoPowerState,
+    max_current: f64,
+    limit_w: Option<u32>,
+    limit_min_w: Option<u32>,
+    s: &Settings,
+) -> Option<u32> {
+    let trigger_a = match s.auto_min_power {
+        AutoMinPower::Off => {
+            // Disabled: if we lowered the limit earlier, put it back.
+            let saved = state.saved_limit_w.take();
+            state.below_since = None;
+            return saved;
+        }
+        AutoMinPower::OnYellow => s.yellow_limit_a as f64,
+        AutoMinPower::OnRed => s.red_limit_a as f64,
+    };
+
+    if max_current >= trigger_a {
+        state.below_since = None;
+        // One lowering per excursion; re-arm only after a restore.
+        if state.saved_limit_w.is_some() {
+            return None;
+        }
+        match (limit_w, limit_min_w) {
+            (Some(current), Some(min)) if current > min => {
+                state.saved_limit_w = Some(current);
+                Some(min)
+            }
+            _ => None,
+        }
+    } else if let Some(saved) = state.saved_limit_w {
+        // Hysteresis: restore only once the current has been below the
+        // trigger level for the full delay.
+        let since = state.below_since.get_or_insert_with(Instant::now);
+        if since.elapsed() >= AUTO_POWER_RESTORE_DELAY {
+            state.saved_limit_w = None;
+            state.below_since = None;
+            return Some(saved);
+        }
+        None
+    } else {
+        state.below_since = None;
         None
     }
 }
@@ -221,6 +337,7 @@ mod tests {
         assert_eq!(s.yellow_limit_a, DEFAULT_YELLOW_LIMIT_A);
         assert_eq!(s.red_limit_a, DEFAULT_RED_LIMIT_A);
         assert!(!s.yellow_sound_enabled && !s.red_sound_enabled);
+        assert_eq!(s.auto_min_power, AutoMinPower::Off);
         assert!(s.yellow_limit_a >= MIN_LIMIT_A);
         assert!(s.yellow_limit_a <= s.red_limit_a);
         assert!(s.red_limit_a <= MAX_LIMIT_A);
@@ -268,6 +385,77 @@ mod tests {
         s.yellow_sound_enabled = false;
         let mut st2 = AlertState::default();
         assert_eq!(over_limit_sound(&mut st2, 9.5, &s), None);
+    }
+
+    #[test]
+    fn auto_power_lowers_on_yellow_and_restores() {
+        let mut s = Settings::default();
+        s.auto_min_power = AutoMinPower::OnYellow;
+        let mut st = AutoPowerState::default();
+        // Below yellow: nothing. Yellow triggers a lowering to the minimum.
+        assert_eq!(
+            auto_power_action(&mut st, 5.0, Some(580), Some(300), &s),
+            None
+        );
+        assert_eq!(
+            auto_power_action(&mut st, 9.5, Some(580), Some(300), &s),
+            Some(300)
+        );
+        // Still lowered: no repeat while the excursion lasts.
+        assert_eq!(
+            auto_power_action(&mut st, 9.7, Some(300), Some(300), &s),
+            None
+        );
+        // Below yellow again: restore waits for the delay...
+        assert_eq!(
+            auto_power_action(&mut st, 5.0, Some(300), Some(300), &s),
+            None
+        );
+        st.below_since = Some(Instant::now() - AUTO_POWER_RESTORE_DELAY);
+        // ... then the saved limit comes back.
+        assert_eq!(
+            auto_power_action(&mut st, 5.0, Some(300), Some(300), &s),
+            Some(580)
+        );
+        // A new excursion lowers again.
+        assert_eq!(
+            auto_power_action(&mut st, 9.5, Some(580), Some(300), &s),
+            Some(300)
+        );
+        // Disabling the feature while lowered restores immediately.
+        s.auto_min_power = AutoMinPower::Off;
+        assert_eq!(
+            auto_power_action(&mut st, 9.5, Some(300), Some(300), &s),
+            Some(580)
+        );
+        assert_eq!(
+            auto_power_action(&mut st, 9.5, Some(300), Some(300), &s),
+            None
+        );
+    }
+
+    #[test]
+    fn auto_power_red_trigger_and_bounds() {
+        let mut s = Settings::default();
+        s.auto_min_power = AutoMinPower::OnRed;
+        let mut st = AutoPowerState::default();
+        // OnRed does not react to yellow currents.
+        assert_eq!(
+            auto_power_action(&mut st, 9.5, Some(580), Some(300), &s),
+            None
+        );
+        assert_eq!(
+            auto_power_action(&mut st, 10.5, Some(580), Some(300), &s),
+            Some(300)
+        );
+        // Already at the minimum, or NVML constraints unknown: no-op.
+        let mut st2 = AutoPowerState::default();
+        assert_eq!(
+            auto_power_action(&mut st2, 10.5, Some(300), Some(300), &s),
+            None
+        );
+        assert_eq!(auto_power_action(&mut st2, 10.5, Some(580), None, &s), None);
+        assert_eq!(auto_power_action(&mut st2, 10.5, None, Some(300), &s), None);
     }
 
     #[test]

@@ -53,6 +53,9 @@ pub(crate) struct WebData {
     /// The applied limits and sounds, mirrored so the poller (alert sounds)
     /// and the web page (thresholds) follow the settings dialog.
     pub(crate) settings: Settings,
+    /// Latest status of the privileged power helper, set by the poller after
+    /// each sample. Desktop-UI display only; deliberately not in the web JSON.
+    pub(crate) power_note: Option<String>,
 }
 
 impl WebData {
@@ -70,6 +73,7 @@ impl WebData {
             poll_ms: DEFAULT_POLL_MS,
             show_graphs: true,
             settings: Settings::default(),
+            power_note: None,
         };
         // Pre-reserve history for the default 1 Hz sample rate so the common
         // case never reallocates; a faster slider setting just grows the vecs.
