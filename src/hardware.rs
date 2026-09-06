@@ -88,6 +88,22 @@ pub(crate) enum Cmd {
 /// helper instead of the app itself (see [`PowerHelper`], [`run_power_helper`]).
 pub(crate) const POWER_HELPER_ARG: &str = "--power-helper";
 
+/// State of the privileged power helper as the app sees it. Mirrored into
+/// [`WebData::power_auth`](crate::web::WebData::power_auth) by the poller so
+/// the GUI can confirm authentication up front (or revert options that need
+/// it when authentication fails).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub(crate) enum AuthState {
+    /// The helper has never run, or was (re)spawned and has not replied yet.
+    #[default]
+    Idle,
+    /// The helper is running as root: privileged changes can be applied.
+    Active,
+    /// The last attempt failed (authentication denied, polkit missing or
+    /// the helper died); the next request spawns and prompts again.
+    Failed,
+}
+
 /// Applies GPU power limits with elevated privileges.
 ///
 /// NVML's power-limit setter requires root, while the app runs as a normal
@@ -103,6 +119,9 @@ pub(crate) struct PowerHelper {
     /// the reader thread and mirrored into [`WebData::power_note`] by the
     /// poller.
     status: Arc<Mutex<Option<String>>>,
+    /// Authentication state, written by the reader thread (and on spawn
+    /// failures) and mirrored into [`WebData::power_auth`] by the poller.
+    auth: Arc<Mutex<AuthState>>,
 }
 
 impl PowerHelper {
@@ -110,11 +129,17 @@ impl PowerHelper {
         PowerHelper {
             child: None,
             status: Arc::new(Mutex::new(None)),
+            auth: Arc::new(Mutex::new(AuthState::Idle)),
         }
     }
 
     fn set_status(&self, msg: String) {
         *self.status.lock().unwrap() = Some(msg);
+    }
+
+    /// Whether privileged changes can currently be applied (helper replied).
+    pub(crate) fn auth_state(&self) -> AuthState {
+        *self.auth.lock().unwrap()
     }
 
     /// Spawn the helper through pkexec unless it is still running. Returns
@@ -132,10 +157,14 @@ impl PowerHelper {
         let exe = match std::env::current_exe() {
             Ok(exe) => exe,
             Err(e) => {
+                *self.auth.lock().unwrap() = AuthState::Failed;
                 self.set_status(format!("Cannot locate own executable: {e}"));
                 return false;
             }
         };
+        // A fresh attempt: any earlier failure is no longer the last word
+        // until this helper replies or dies.
+        *self.auth.lock().unwrap() = AuthState::Idle;
         let spawned = Command::new("pkexec")
             .arg(&exe)
             .arg(POWER_HELPER_ARG)
@@ -146,6 +175,7 @@ impl PowerHelper {
         let mut child = match spawned {
             Ok(child) => child,
             Err(e) => {
+                *self.auth.lock().unwrap() = AuthState::Failed;
                 self.set_status(format!(
                     "Could not start pkexec ({e}). Is polkit installed?"
                 ));
@@ -157,8 +187,12 @@ impl PowerHelper {
         // (pkexec's own errors) go to our stderr.
         if let Some(out) = child.stdout.take() {
             let status = self.status.clone();
+            let auth = self.auth.clone();
             thread::spawn(move || {
                 for line in BufReader::new(out).lines().map_while(Result::ok) {
+                    // Any reply proves the helper is up as root (an ERR is a
+                    // helper/NVML failure, not an authentication one).
+                    *auth.lock().unwrap() = AuthState::Active;
                     match line.strip_prefix("ERR ") {
                         Some(msg) => *status.lock().unwrap() = Some(format!("Power helper: {msg}")),
                         None => {
@@ -166,6 +200,8 @@ impl PowerHelper {
                         }
                     }
                 }
+                // The helper is gone: without it privileged changes fail.
+                *auth.lock().unwrap() = AuthState::Failed;
                 *status.lock().unwrap() = Some(
                     "Privileged power helper not running (authentication denied or unavailable)."
                         .into(),
@@ -434,17 +470,20 @@ pub(crate) fn spawn_poller(
                 .map(|p| p.current)
                 .fold(f64::NEG_INFINITY, f64::max);
             // Mirror the helper's status so the GUI can show what happened
-            // with privileged limit changes.
+            // with privileged limit changes (and revert auto power if the
+            // authentication it needs was not granted).
             let power_note = power_helper.status.lock().unwrap().clone();
+            let power_auth = power_helper.auth_state();
             let settings = {
                 let mut d = data.lock().unwrap();
                 let settings = d.settings.clone();
                 d.record(sample);
                 d.power_note = power_note;
+                d.power_auth = power_auth;
                 settings
             };
-            if let Some(path) = over_limit_sound(&mut alert_state, max_current, &settings) {
-                player.play(path);
+            if let Some(sound) = over_limit_sound(&mut alert_state, max_current, &settings) {
+                player.play(sound);
             }
             // Automatic minimum power limit (see alerts::auto_power_action);
             // applying it goes through the privileged helper.

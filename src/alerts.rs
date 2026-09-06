@@ -7,7 +7,7 @@
 //! output thread that plays the queued sounds, one at a time.
 
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, Cursor};
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
@@ -20,9 +20,6 @@ pub(crate) const MIN_LIMIT_A: f32 = 1.0;
 pub(crate) const MAX_LIMIT_A: f32 = 12.0;
 pub(crate) const DEFAULT_YELLOW_LIMIT_A: f32 = 9.2;
 pub(crate) const DEFAULT_RED_LIMIT_A: f32 = 10.0;
-
-/// Directory with the shipped alert sounds (relative to the working dir).
-const SOUND_DIR: &str = "sound";
 
 /// Minimum time between two alert sounds while a limit stays exceeded: after
 /// a sound plays, the next one waits this long (only if the limit is still
@@ -67,6 +64,56 @@ impl AutoMinPower {
     }
 }
 
+/// One of the alert sounds compiled into the executable, so a single binary
+/// is all that needs to be distributed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EmbeddedSound {
+    /// Yellow-range alert.
+    Attention,
+    /// Red-range alert.
+    Critical,
+    /// Yellow-range alert while the automatic power limit is lowering the GPU.
+    AttentionPoweringDown,
+    /// Red-range alert while the automatic power limit is lowering the GPU.
+    CriticalPoweringDown,
+}
+
+impl EmbeddedSound {
+    /// The WAV bytes embedded in the executable.
+    pub(crate) fn bytes(self) -> &'static [u8] {
+        match self {
+            EmbeddedSound::Attention => include_bytes!("../sound/attention.wav"),
+            EmbeddedSound::Critical => include_bytes!("../sound/critical.wav"),
+            EmbeddedSound::AttentionPoweringDown => {
+                include_bytes!("../sound/attention-powering-down.wav")
+            }
+            EmbeddedSound::CriticalPoweringDown => {
+                include_bytes!("../sound/critical-powering-down.wav")
+            }
+        }
+    }
+
+    /// Short name shown in the settings dialog.
+    pub(crate) fn display_name(self) -> &'static str {
+        match self {
+            EmbeddedSound::Attention => "attention",
+            EmbeddedSound::Critical => "critical",
+            EmbeddedSound::AttentionPoweringDown => "attention (powering down)",
+            EmbeddedSound::CriticalPoweringDown => "critical (powering down)",
+        }
+    }
+}
+
+/// An alert sound: one of the sounds embedded in the executable (the
+/// default) or a `.wav` file the user selected in the settings dialog.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum Sound {
+    /// A sound shipped inside the executable.
+    Embedded(EmbeddedSound),
+    /// A sound file chosen by the user.
+    File(PathBuf),
+}
+
 /// The alarm thresholds and sounds of the app. The green/yellow/red color
 /// ranges in the tables and graphs, and the warning sounds, follow the
 /// limits: below `yellow_limit_a` is green, from there up to (but not
@@ -77,21 +124,15 @@ pub(crate) struct Settings {
     pub(crate) yellow_limit_a: f32,
     /// Current (A) at which the red range starts.
     pub(crate) red_limit_a: f32,
-    /// Play `yellow_sound_path` while a pin's current is in the yellow range.
+    /// Play `yellow_sound` while a pin's current is in the yellow range.
     pub(crate) yellow_sound_enabled: bool,
-    pub(crate) yellow_sound_path: PathBuf,
-    /// Play `red_sound_path` while a pin's current is in the red range.
+    pub(crate) yellow_sound: Sound,
+    /// Play `red_sound` while a pin's current is in the red range.
     pub(crate) red_sound_enabled: bool,
-    pub(crate) red_sound_path: PathBuf,
+    pub(crate) red_sound: Sound,
     /// Automatically lower the GPU power management limit to its minimum
     /// when a pin current reaches the selected limit level.
     pub(crate) auto_min_power: AutoMinPower,
-}
-
-/// Path of one of the shipped alert sounds: `sound/<prefix>.wav`, resolved
-/// relative to the working directory.
-fn default_sound_path(prefix: &str) -> PathBuf {
-    PathBuf::from(SOUND_DIR).join(format!("{prefix}.wav"))
 }
 
 impl Default for Settings {
@@ -100,9 +141,9 @@ impl Default for Settings {
             yellow_limit_a: DEFAULT_YELLOW_LIMIT_A,
             red_limit_a: DEFAULT_RED_LIMIT_A,
             yellow_sound_enabled: false,
-            yellow_sound_path: default_sound_path("attention"),
+            yellow_sound: Sound::Embedded(EmbeddedSound::Attention),
             red_sound_enabled: false,
-            red_sound_path: default_sound_path("critical"),
+            red_sound: Sound::Embedded(EmbeddedSound::Critical),
             auto_min_power: AutoMinPower::default(),
         }
     }
@@ -125,11 +166,16 @@ pub(crate) struct AlertState {
 /// range, and repeats at most once per [`ALERT_REPEAT_DELAY`] while the limit
 /// stays surpassed. Dropping below the yellow limit resets the state, so the
 /// next excursion alerts immediately again.
+///
+/// While the automatic minimum power limit is enabled at (or below) the
+/// reached level, the embedded default sounds play their "powering down"
+/// variants instead, since reaching that level lowers the GPU power limit
+/// (see [`active_sound`]).
 pub(crate) fn over_limit_sound(
     state: &mut AlertState,
     max_current: f64,
     s: &Settings,
-) -> Option<PathBuf> {
+) -> Option<Sound> {
     let over_yellow = max_current >= s.yellow_limit_a as f64;
     let over_red = max_current >= s.red_limit_a as f64;
 
@@ -161,13 +207,41 @@ pub(crate) fn over_limit_sound(
 
     if enabled && (rising || due) {
         state.last_play = Some(Instant::now());
-        Some(if over_red {
-            s.red_sound_path.clone()
-        } else {
-            s.yellow_sound_path.clone()
-        })
+        Some(active_sound(
+            if over_red {
+                &s.red_sound
+            } else {
+                &s.yellow_sound
+            },
+            s,
+            over_red,
+        ))
     } else {
         None
+    }
+}
+
+/// The sound to actually play for a reached range. With the automatic power
+/// lowering active at the reached level, the embedded defaults become their
+/// "powering down" variants; a user-selected sound file is always kept as-is.
+///
+/// `over_red` says which range was reached (this is only consulted for
+/// sounds triggered by a yellow-or-higher current).
+fn active_sound(sound: &Sound, s: &Settings, over_red: bool) -> Sound {
+    let powering_down = match s.auto_min_power {
+        AutoMinPower::Off => false,
+        // Any caller is over yellow already, so OnYellow always triggers.
+        AutoMinPower::OnYellow => true,
+        AutoMinPower::OnRed => over_red,
+    };
+    match (sound, powering_down) {
+        (Sound::Embedded(EmbeddedSound::Attention), true) => {
+            Sound::Embedded(EmbeddedSound::AttentionPoweringDown)
+        }
+        (Sound::Embedded(EmbeddedSound::Critical), true) => {
+            Sound::Embedded(EmbeddedSound::CriticalPoweringDown)
+        }
+        (other, _) => other.clone(),
     }
 }
 
@@ -245,11 +319,19 @@ pub(crate) fn auto_power_action(
     }
 }
 
+/// Readable, seekable and sendable input for rodio's decoder, so the
+/// `Cursor` over an embedded WAV and the `BufReader` over a file on disk can
+/// share one playback code path through a single boxed trait object.
+trait ReadSeekSend: std::io::Read + std::io::Seek + Send + Sync {}
+impl<T: std::io::Read + std::io::Seek + Send + Sync + ?Sized> ReadSeekSend for T {}
+
+type SoundReader = Box<dyn ReadSeekSend>;
+
 /// Handle to the alert-sound playback thread. Sound is best-effort: `play`
 /// never blocks, and requests are dropped when no audio output exists
 /// (headless session, missing device, undecodable file).
 pub(crate) struct SoundPlayer {
-    tx: mpsc::Sender<PathBuf>,
+    tx: mpsc::Sender<Sound>,
 }
 
 impl SoundPlayer {
@@ -262,24 +344,24 @@ impl SoundPlayer {
         SoundPlayer { tx }
     }
 
-    /// Queue a sound file for playback. Sounds play one at a time; while one
-    /// is playing, at most the most recently queued file is kept.
-    pub(crate) fn play(&self, path: PathBuf) {
-        let _ = self.tx.send(path);
+    /// Queue a sound for playback. Sounds play one at a time; while one is
+    /// playing, at most the most recently queued sound is kept.
+    pub(crate) fn play(&self, sound: Sound) {
+        let _ = self.tx.send(sound);
     }
 }
 
-fn audio_loop(rx: mpsc::Receiver<PathBuf>) {
+fn audio_loop(rx: mpsc::Receiver<Sound>) {
     // rodio stops playback when the output stream is dropped, so the session
     // lives for the whole thread; it is None until the first successful try.
     let mut session: Option<(OutputStream, Sink)> = None;
     let mut init_warned = false;
 
-    while let Some(mut path) = rx.recv().ok() {
+    while let Some(mut sound) = rx.recv().ok() {
         // Play only the newest request: while a sound was playing, older
         // queued alerts are already redundant.
         while let Ok(newer) = rx.try_recv() {
-            path = newer;
+            sound = newer;
         }
 
         if session.is_none() {
@@ -308,11 +390,19 @@ fn audio_loop(rx: mpsc::Receiver<PathBuf>) {
         }
 
         if let Some((_, sink)) = &session {
-            let source = File::open(&path)
-                .map_err(|e| format!("{}: {e}", path.display()))
-                .and_then(|f| {
-                    Decoder::new(BufReader::new(f)).map_err(|e| format!("{}: {e}", path.display()))
-                });
+            let source = match &sound {
+                // Embedded WAVs decode straight from the bytes in the binary.
+                Sound::Embedded(embedded) => {
+                    Decoder::new(Box::new(Cursor::new(embedded.bytes())) as SoundReader)
+                        .map_err(|e| format!("built-in sound: {e}"))
+                }
+                Sound::File(path) => File::open(path)
+                    .map_err(|e| format!("{}: {e}", path.display()))
+                    .and_then(|f| {
+                        Decoder::new(Box::new(BufReader::new(f)) as SoundReader)
+                            .map_err(|e| format!("{}: {e}", path.display()))
+                    }),
+            };
             match source {
                 // Blocks until this sound finished, so only one plays at a
                 // time; the next queued file is picked up by the loop above.
@@ -341,15 +431,27 @@ mod tests {
         assert!(s.yellow_limit_a >= MIN_LIMIT_A);
         assert!(s.yellow_limit_a <= s.red_limit_a);
         assert!(s.red_limit_a <= MAX_LIMIT_A);
-        // The shipped sounds are `sound/<prefix>.wav`.
-        assert_eq!(
-            default_sound_path("attention"),
-            PathBuf::from("sound/attention.wav")
-        );
-        assert_eq!(
-            default_sound_path("critical"),
-            PathBuf::from("sound/critical.wav")
-        );
+        // The default sounds are the ones embedded in the executable.
+        assert_eq!(s.yellow_sound, Sound::Embedded(EmbeddedSound::Attention));
+        assert_eq!(s.red_sound, Sound::Embedded(EmbeddedSound::Critical));
+    }
+
+    #[test]
+    fn embedded_sounds_are_decodable() {
+        // The bytes compiled into the binary must play through the same
+        // decoder path the audio thread uses.
+        for sound in [
+            EmbeddedSound::Attention,
+            EmbeddedSound::Critical,
+            EmbeddedSound::AttentionPoweringDown,
+            EmbeddedSound::CriticalPoweringDown,
+        ] {
+            let bytes = sound.bytes();
+            assert!(bytes.len() > 44, "{sound:?} looks empty");
+            assert_eq!(&bytes[0..4], b"RIFF", "{sound:?} is not a WAV");
+            let reader: SoundReader = Box::new(Cursor::new(bytes));
+            Decoder::new(reader).unwrap_or_else(|e| panic!("{sound:?} undecodable: {e}"));
+        }
     }
 
     #[test]
@@ -364,13 +466,13 @@ mod tests {
         // within the repeat delay.
         assert_eq!(
             over_limit_sound(&mut st, 9.5, &s),
-            Some(s.yellow_sound_path.clone())
+            Some(s.yellow_sound.clone())
         );
         assert_eq!(over_limit_sound(&mut st, 9.8, &s), None);
         // Enter red: the red sound fires right away (escalation).
         assert_eq!(
             over_limit_sound(&mut st, 10.5, &s),
-            Some(s.red_sound_path.clone())
+            Some(s.red_sound.clone())
         );
         assert_eq!(over_limit_sound(&mut st, 11.0, &s), None);
         // Falling back into yellow: no repeat, yellow was already latched.
@@ -379,7 +481,7 @@ mod tests {
         assert_eq!(over_limit_sound(&mut st, 1.0, &s), None);
         assert_eq!(
             over_limit_sound(&mut st, 9.5, &s),
-            Some(s.yellow_sound_path.clone())
+            Some(s.yellow_sound.clone())
         );
         // A disabled sound never fires.
         s.yellow_sound_enabled = false;
@@ -465,15 +567,61 @@ mod tests {
         let mut st = AlertState::default();
         assert_eq!(
             over_limit_sound(&mut st, 9.5, &s),
-            Some(s.yellow_sound_path.clone())
+            Some(s.yellow_sound.clone())
         );
         // Simulate the repeat delay having passed while still over the limit.
         st.last_play = Some(Instant::now() - ALERT_REPEAT_DELAY);
         assert_eq!(
             over_limit_sound(&mut st, 9.5, &s),
-            Some(s.yellow_sound_path.clone())
+            Some(s.yellow_sound.clone())
         );
         // ... and it goes quiet again until the delay passes once more.
         assert_eq!(over_limit_sound(&mut st, 9.6, &s), None);
+    }
+
+    #[test]
+    fn auto_power_switches_to_powering_down_sounds() {
+        let mut s = Settings::default();
+        s.yellow_sound_enabled = true;
+        s.red_sound_enabled = true;
+        let mine = Sound::File(PathBuf::from("/tmp/mine.wav"));
+
+        // Feature off: the plain embedded sounds.
+        let mut st = AlertState::default();
+        assert_eq!(
+            over_limit_sound(&mut st, 9.5, &s),
+            Some(Sound::Embedded(EmbeddedSound::Attention))
+        );
+
+        // On yellow: both ranges play their powering-down variant (the red
+        // escalation happens while the GPU is being powered down too).
+        s.auto_min_power = AutoMinPower::OnYellow;
+        let mut st = AlertState::default();
+        assert_eq!(
+            over_limit_sound(&mut st, 9.5, &s),
+            Some(Sound::Embedded(EmbeddedSound::AttentionPoweringDown))
+        );
+        assert_eq!(
+            over_limit_sound(&mut st, 10.5, &s),
+            Some(Sound::Embedded(EmbeddedSound::CriticalPoweringDown))
+        );
+
+        // On red: yellow excursions keep the plain sound; red switches.
+        s.auto_min_power = AutoMinPower::OnRed;
+        let mut st = AlertState::default();
+        assert_eq!(
+            over_limit_sound(&mut st, 9.5, &s),
+            Some(Sound::Embedded(EmbeddedSound::Attention))
+        );
+        assert_eq!(
+            over_limit_sound(&mut st, 10.5, &s),
+            Some(Sound::Embedded(EmbeddedSound::CriticalPoweringDown))
+        );
+
+        // A user-selected file is never replaced.
+        s.yellow_sound = mine.clone();
+        s.auto_min_power = AutoMinPower::OnYellow;
+        let mut st = AlertState::default();
+        assert_eq!(over_limit_sound(&mut st, 9.5, &s), Some(mine));
     }
 }

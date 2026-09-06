@@ -33,11 +33,13 @@ cargo check
 - Reading the chip needs permission on `/dev/i2c-N` (root or `i2c` group).
   Everything degrades gracefully: no I2C → zero pin readings; no NVML →
   power estimated as Σ(V·A) of the pins.
-- The `sound/` directory holds the shipped alert WAVs: `attention.wav`
-  (yellow) and `critical.wav` (red). The defaults
-  (`alerts::default_sound_path("attention")`) resolve relative to the
-  working directory — run from the repo root or the default alert sounds
-  won't be found.
+- The shipped alert WAVs are **embedded into the executable** with
+  `include_bytes!` (see `alerts::EmbeddedSound`): `attention.wav` /
+  `critical.wav` (yellow/red alerts) and their `-powering-down.wav`
+  variants. The `sound/` directory is therefore only needed at build time;
+  a single binary is all that gets distributed. Users can still pick their
+  own `.wav` per threshold in the settings dialog (and revert to the
+  built-in with its Reset button).
 - rodio pulls in cpal/ALSA: building needs the ALSA dev headers
   (`libasound2-dev` and `pkg-config` on Debian/Ubuntu).
 
@@ -58,7 +60,8 @@ src/hardware.rs  HARDWARE POLLING. IT8915 constants + raw i2c-dev/SMBus
                  `PowerHelper` (spawns this same binary as root through
                  pkexec) and `run_power_helper()` (the helper mode).
 src/alerts.rs    LIMIT CHECKING + SOUNDS. `Settings` (limits + sound
-                 config + `auto_min_power` mode), `AlertState` +
+                 config + `auto_min_power` mode), `Sound` (embedded WAV via
+                 `include_bytes!` or a user-selected file), `AlertState` +
                  `over_limit_sound()` (edge + repeat decision logic),
                  `AutoPowerState` + `auto_power_action()` (automatic
                  minimum-power-limit state machine), `SoundPlayer` (rodio
@@ -76,7 +79,9 @@ src/ui.rs        DESKTOP UI. `App` (eframe::App::update: main window, settings
                  app-wide settings go here), `FileDialog`
                  (built-in .wav picker), `add_pin_graph`,
                  `add_metric_graph`, `draw_hover_readout`, colors.
-sound/           Shipped alert WAVs (attention.wav = yellow, critical.wav = red).
+sound/           Shipped alert WAVs, embedded into the binary at compile
+                 time (attention/critical = yellow/red alerts, each with a
+                 -powering-down variant for the automatic power feature).
 src/bin/         Empty (no extra binaries).
 ```
 
@@ -103,7 +108,12 @@ critical sections are short — keep them that way:
    as root. The helper stays alive, speaks `SET <watts>`/`PING` lines on
    stdin and `OK`/`ERR …` lines on stdout; reader threads relay replies into
    a status cell the poller mirrors as `WebData::power_note` (GUI-only, not
-   in the web JSON). Auth is asked once per app run; a denied/absent agent
+   in the web JSON) **and** a `hardware::AuthState` (Idle / Active / Failed)
+   mirrored as `WebData::power_auth`. Enabling automatic min-power in the
+   settings dialog immediately pings the helper (so the password prompt shows
+   while the user is at the dialog) and watches `power_auth`: a `Failed`
+   state turns the option back off (it cannot work without privileges),
+   `Active` keeps it. Auth is asked once per app run; a denied/absent agent
    degrades to an error note, never a crash.
 4. **Web server thread(s)** (`web::web_serve` + one thread per connection):
    `try_lock` with retry → 503 on contention so a GUI frame can never
@@ -118,6 +128,10 @@ critical sections are short — keep them that way:
 - Below yellow limit: state resets, silence.
 - Entering yellow / red (rising edge): that range's sound plays once
   immediately, if enabled (red has priority over yellow).
+- While the automatic minimum-power feature is enabled at (or below) the
+  reached level, the built-in default sounds play their `*-powering-down.wav`
+  variants instead (`alerts::active_sound`); a user-selected file is never
+  replaced. At a red excursion both OnYellow and OnRed count as active.
 - While a limit **stays** exceeded, the sound repeats at most once per
   `ALERT_REPEAT_DELAY` (15 s). Red escalation from yellow is immediate.
 - Only one sound ever plays at a time (serialized on the audio thread);
@@ -134,6 +148,11 @@ Optional (`Settings::auto_min_power` = Off / On yellow / On red):
 - A manual `Cmd::SetLimit` overrides the auto state (`overridden()`): no
   restore happens over a user-set limit.
 - No-op when the limit already is at the minimum or NVML data is missing.
+- Privileges are required: accepting this option in the settings dialog
+  immediately authenticates the power helper and **reverts the option if
+  authentication fails** (`ui::App::auto_power_pending_auth` watching
+  `WebData::power_auth`), so enabling it never silently fails at the first
+  excursion.
 
 ## Cross-cutting conventions
 
@@ -163,17 +182,15 @@ Optional (`Settings::auto_min_power` = Off / On yellow / On red):
 
 ## Tests
 
-`cargo test` (9 tests, no GPU/display needed):
+`cargo test` (11 tests, no GPU/display needed):
 
-- `alerts::tests`: settings defaults + shipped-sound paths; alert edge
-  triggering; 15 s repeat-while-exceeded behavior; auto-power lower/restore
-  edges and bounds.
+- `alerts::tests`: settings defaults; embedded WAVs decode; alert edge
+  triggering; 15 s repeat-while-exceeded behavior; powering-down sound
+  switch with auto power; auto-power lower/restore edges and bounds.
 - `web::tests`: JSON field content, `record()` history append/prune/range
   caching, query-param parsing, HTTP server serve/404/busy-port/restart.
 
-Tests that bind ports use `free_port()` (bind :0, drop, reuse). When adding
-tests, remember `default_sound_path` resolves relative to the crate root
-(CWD of `cargo test`).
+Tests that bind ports use `free_port()` (bind :0, drop, reuse).
 
 ## Gotchas
 

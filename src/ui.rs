@@ -12,8 +12,8 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::alerts::{AutoMinPower, Settings, MAX_LIMIT_A, MIN_LIMIT_A};
-use crate::hardware::{Cmd, DEFAULT_POLL_MS};
+use crate::alerts::{AutoMinPower, EmbeddedSound, Settings, Sound, MAX_LIMIT_A, MIN_LIMIT_A};
+use crate::hardware::{AuthState, Cmd, DEFAULT_POLL_MS};
 use crate::web::{WebData, WebServer, WebState, DEFAULT_WEB_PORT};
 
 pub(crate) const HORIZONS_MIN: [u32; 6] = [1, 5, 10, 15, 30, 60];
@@ -47,8 +47,15 @@ pub(crate) struct App {
     /// Web server state; `Stopped` by default. Runtime state, deliberately
     /// kept out of [`Config`] (which only holds the applied intent).
     web: WebState,
-    /// One-shot warning (e.g. port in use), shown in a small dialog.
-    web_error: Option<String>,
+    /// One-shot warning (port in use, denied power authentication, ...),
+    /// shown in a small dialog.
+    warning: Option<String>,
+    /// Set between accepting an enabled automatic power limit and the power
+    /// helper's authentication result: while set, a failed authentication
+    /// reverts the option, so it can never stay on without the privileges it
+    /// needs (the prompt must be answered when enabling, not at the first
+    /// limit excursion).
+    auto_power_pending_auth: bool,
     /// While set, the settings panel is open and editing this draft copy
     /// of [`Config`] (Accept commits it, Cancel discards it).
     draft: Option<Config>,
@@ -91,18 +98,30 @@ impl App {
                 web_port: DEFAULT_WEB_PORT.to_string(),
             },
             web: WebState::Stopped,
-            web_error: None,
+            warning: None,
+            auto_power_pending_auth: false,
             draft: None,
             file_dialog: None,
         }
     }
 }
 
-/// Which sound path the file picker is choosing.
+/// Which sound the file picker is choosing.
 #[derive(Clone, Copy)]
 enum SoundField {
     Yellow,
     Red,
+}
+
+impl SoundField {
+    /// The sound embedded in the executable for this field: the default and
+    /// what "Reset" restores.
+    fn default_sound(self) -> Sound {
+        match self {
+            SoundField::Yellow => Sound::Embedded(EmbeddedSound::Attention),
+            SoundField::Red => Sound::Embedded(EmbeddedSound::Critical),
+        }
+    }
 }
 
 /// A minimal built-in sound file picker: browses directories and lists the
@@ -115,11 +134,16 @@ struct FileDialog {
 }
 
 impl FileDialog {
-    /// Open at the directory holding the current selection (or the current
-    /// directory when the stored path does not exist).
-    fn new(field: SoundField, current: &Path) -> Self {
-        let parent = current.parent().unwrap_or(Path::new(".")).to_path_buf();
-        let dir = parent.canonicalize().unwrap_or(parent);
+    /// Open at the directory holding the currently selected file, or — while
+    /// a sound embedded in the executable is selected — at the user's home
+    /// directory (falling back to the current one).
+    fn new(field: SoundField, current: Option<&Path>) -> Self {
+        let start = current
+            .and_then(|p| p.parent())
+            .map(Path::to_path_buf)
+            .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+            .unwrap_or_else(|| PathBuf::from("."));
+        let dir = start.canonicalize().unwrap_or(start);
         FileDialog {
             field,
             dir,
@@ -128,26 +152,50 @@ impl FileDialog {
     }
 }
 
-/// Path display plus browse button for one of the sound settings. Clicking
-/// the button records the request; the picker opens next to the panel.
+/// Sound display plus browse button for one of the sound settings. Clicking
+/// the button records the request; the picker opens next to the panel. A
+/// user-selected file can be reset back to the embedded sound.
 fn sound_file_row(
     ui: &mut egui::Ui,
-    path: &mut PathBuf,
+    sound: &mut Sound,
     field: SoundField,
-    open_browser: &mut Option<(SoundField, PathBuf)>,
+    open_browser: &mut Option<(SoundField, Option<PathBuf>)>,
 ) {
     ui.horizontal(|ui| {
-        ui.label("Sound file:");
-        let label = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.display().to_string());
-        if ui
-            .button(label)
-            .on_hover_text(path.display().to_string())
-            .clicked()
-        {
-            *open_browser = Some((field, path.clone()));
+        ui.label("Sound:");
+        match sound {
+            Sound::Embedded(embedded) => {
+                if ui
+                    .button(format!("Built-in ({})", embedded.display_name()))
+                    .on_hover_text(
+                        "Sound embedded in the executable.\
+Click to choose your own .wav file instead.",
+                    )
+                    .clicked()
+                {
+                    *open_browser = Some((field, None));
+                }
+            }
+            Sound::File(path) => {
+                let label = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string());
+                if ui
+                    .button(label)
+                    .on_hover_text(path.display().to_string())
+                    .clicked()
+                {
+                    *open_browser = Some((field, Some(path.clone())));
+                }
+                if ui
+                    .button("Reset")
+                    .on_hover_text("Use the built-in sound again")
+                    .clicked()
+                {
+                    *sound = field.default_sound();
+                }
+            }
         }
     });
 }
@@ -158,6 +206,27 @@ impl eframe::App for App {
         // here we only mirror the UI settings and render from the shared
         // data, which keeps updating even while this window is minimized.
         let mut data = self.data.lock().unwrap();
+        // Automatic power limit waiting for its authentication prompt, ahead
+        // of the settings mirror below: the option is only good to have while
+        // the privileged helper is up, so a denied authentication turns it
+        // back off before it is ever mirrored to the poller.
+        if self.auto_power_pending_auth {
+            match data.power_auth {
+                AuthState::Active => self.auto_power_pending_auth = false,
+                AuthState::Failed => {
+                    self.auto_power_pending_auth = false;
+                    if self.config.alerts.auto_min_power != AutoMinPower::Off {
+                        self.config.alerts.auto_min_power = AutoMinPower::Off;
+                        self.warning = Some(
+                            "Authentication was not granted, so the automatic power limit was turned back off.\n\nEnable it again and accept the authentication prompt to use this feature."
+                                .to_owned(),
+                        );
+                    }
+                }
+                // Prompt still open (or helper just spawned): keep waiting.
+                AuthState::Idle => {}
+            }
+        }
         data.poll_ms = self.config.poll_ms;
         data.show_graphs = self.show_graphs;
         if data.settings != self.config.alerts {
@@ -418,10 +487,10 @@ impl eframe::App for App {
             }
         });
 
-        // One-shot warning (e.g. the port is already in use) as a small
-        // dialog; OK clears it.
-        if let Some(msg) = self.web_error.clone() {
-            egui::Window::new("Web interface")
+        // One-shot warning (port in use, denied power authentication, ...) as
+        // a small dialog; OK clears it.
+        if let Some(msg) = self.warning.clone() {
+            egui::Window::new("Warning")
                 .resizable(false)
                 .collapsible(false)
                 .default_pos([300.0, 350.0])
@@ -429,7 +498,7 @@ impl eframe::App for App {
                     ui.label(msg.as_str());
                     ui.add_space(8.0);
                     if ui.button("OK").clicked() {
-                        self.web_error = None;
+                        self.warning = None;
                     }
                 });
         }
@@ -440,7 +509,7 @@ impl eframe::App for App {
         // enabled while the draft actually differs from the applied config.
         let mut accept = false;
         let mut cancel = false;
-        let mut open_browser: Option<(SoundField, PathBuf)> = None;
+        let mut open_browser: Option<(SoundField, Option<PathBuf>)> = None;
         let current = self.config.clone();
         if let Some(draft) = &mut self.draft {
             let mut open = true;
@@ -479,7 +548,7 @@ impl eframe::App for App {
                     );
                     sound_file_row(
                         ui,
-                        &mut draft.alerts.yellow_sound_path,
+                        &mut draft.alerts.yellow_sound,
                         SoundField::Yellow,
                         &mut open_browser,
                     );
@@ -489,7 +558,7 @@ impl eframe::App for App {
                     );
                     sound_file_row(
                         ui,
-                        &mut draft.alerts.red_sound_path,
+                        &mut draft.alerts.red_sound,
                         SoundField::Red,
                         &mut open_browser,
                     );
@@ -517,8 +586,10 @@ impl eframe::App for App {
                         egui::RichText::new(
                             "When a pin reaches the selected limit, the power management limit is \
 set to the card's minimum and restored once the current has been back below it for 30 \
-seconds. Applying limits needs administrator rights: the first change opens an \
-authentication dialog.",
+seconds. Applying limits needs administrator rights: enabling this opens an \
+authentication dialog right away, and turns the option back off if it is not \
+accepted. While enabled, the built-in alert sounds play their powering-down \
+variants instead.",
                         )
                         .weak()
                         .size(12.0),
@@ -595,7 +666,7 @@ authentication dialog.",
             }
         }
         if let Some((field, path)) = open_browser {
-            self.file_dialog = Some(FileDialog::new(field, &path));
+            self.file_dialog = Some(FileDialog::new(field, path.as_deref()));
         }
         if accept {
             if let Some(mut draft) = self.draft.take() {
@@ -620,7 +691,7 @@ authentication dialog.",
                             match WebServer::start(port, self.data.clone()) {
                                 Ok(server) => self.web = WebState::Running(server),
                                 Err(e) => {
-                                    self.web_error = Some(format!(
+                                    self.warning = Some(format!(
                                         "Port {port} is not available: {e}\n\nThe web interface was not started.",
                                     ));
                                 }
@@ -628,7 +699,7 @@ authentication dialog.",
                         }
                     }
                     (true, _) => {
-                        self.web_error =
+                        self.warning =
                             Some("Port must be a number between 1 and 65535.".to_owned());
                     }
                 }
@@ -640,6 +711,17 @@ authentication dialog.",
                     draft.web_port = server.port.to_string();
                 }
                 self.config = draft;
+                // Newly enabled automatic power limit: authenticate the
+                // privileged helper right now. The prompt appears while the
+                // user is here (instead of possibly going unnoticed at the
+                // first excursion), and a denied authentication turns the
+                // option back off via the pending-auth check in `update`.
+                let auto = self.config.alerts.auto_min_power;
+                if auto != AutoMinPower::Off && auto != current.alerts.auto_min_power {
+                    self.auto_power_pending_auth =
+                        current.alerts.auto_min_power == AutoMinPower::Off;
+                    let _ = self.cmd_tx.send(Cmd::GrantPowerAccess);
+                }
             }
         }
         if cancel {
@@ -719,9 +801,10 @@ authentication dialog.",
                 });
             if let Some(path) = picked {
                 if let Some(draft) = &mut self.draft {
+                    let sound = Sound::File(path);
                     match fd.field {
-                        SoundField::Yellow => draft.alerts.yellow_sound_path = path,
-                        SoundField::Red => draft.alerts.red_sound_path = path,
+                        SoundField::Yellow => draft.alerts.yellow_sound = sound,
+                        SoundField::Red => draft.alerts.red_sound = sound,
                     }
                 }
                 dialog_close = true;

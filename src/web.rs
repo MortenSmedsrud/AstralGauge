@@ -15,7 +15,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::alerts::Settings;
-use crate::hardware::{Sample, DEFAULT_POLL_MS, NUM_PINS};
+use crate::hardware::{AuthState, Sample, DEFAULT_POLL_MS, NUM_PINS};
 
 /// Default port for the web interface (editable in the UI).
 pub(crate) const DEFAULT_WEB_PORT: u16 = 8666;
@@ -56,6 +56,9 @@ pub(crate) struct WebData {
     /// Latest status of the privileged power helper, set by the poller after
     /// each sample. Desktop-UI display only; deliberately not in the web JSON.
     pub(crate) power_note: Option<String>,
+    /// Authentication state of the privileged power helper, set by the poller
+    /// after each sample. Desktop-UI only; deliberately not in the web JSON.
+    pub(crate) power_auth: AuthState,
 }
 
 impl WebData {
@@ -74,6 +77,7 @@ impl WebData {
             show_graphs: true,
             settings: Settings::default(),
             power_note: None,
+            power_auth: AuthState::Idle,
         };
         // Pre-reserve history for the default 1 Hz sample rate so the common
         // case never reallocates; a faster slider setting just grows the vecs.
