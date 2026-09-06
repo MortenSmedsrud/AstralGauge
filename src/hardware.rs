@@ -190,6 +190,14 @@ impl PowerHelper {
         // A fresh attempt: any earlier failure is no longer the last word
         // until this helper replies or dies.
         *self.auth.lock().unwrap() = AuthState::Idle;
+        // This is the single place an authentication prompt can appear, so
+        // announce here (in the user's own UI, not only in polkit's dialog)
+        // what the root credentials are for: the GPU power limiting.
+        self.set_status(
+            "Administrator authentication for the GPU power limiting requested — \
+             please confirm in the authentication dialog."
+                .into(),
+        );
         let spawned = Command::new("pkexec")
             .arg(&exe)
             .arg(POWER_HELPER_ARG)
@@ -228,7 +236,8 @@ impl PowerHelper {
                 // The helper is gone: without it privileged changes fail.
                 *auth.lock().unwrap() = AuthState::Failed;
                 *status.lock().unwrap() = Some(
-                    "Privileged power helper not running (authentication denied or unavailable)."
+                    "Privileged power helper not running (the administrator authentication for \
+                     the GPU power limiting was denied or unavailable.)"
                         .into(),
                 );
             });

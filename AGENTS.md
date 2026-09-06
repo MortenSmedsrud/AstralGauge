@@ -92,12 +92,28 @@ src/web.rs       WEB SERVER + SHARED STATE. `WebData` (latest sample —
                  `POST /ack` → acknowledge the critical alert),
                  hand-rolled JSON serialization, and `INDEX_HTML`
                  (the whole single-page web UI, JS included).
+src/persist.rs   SETTINGS PERSISTENCE. The applied `ui::Config` is stored as
+                 a small hand-written JSON document at
+                 `$XDG_CONFIG_HOME/astral-gauge/settings.json` (falling back
+                 to `~/.config/astral-gauge/settings.json`). Written
+                 atomically (temp file + rename) whenever the settings panel
+                 accepts a change (or a denied power authentication rolls a
+                 saved option back) and loaded at startup by `ui::App::new`,
+                 which also re-applies the sample interval, restarts the
+                 saved web server, and — when the automatic minimum power was
+                 saved enabled — authenticates the power helper immediately.
+                 Like `web`'s JSON the format is hand-rolled: the loader
+                 ignores unknown keys, defaults missing ones, clamps numbers
+                 into the panel's ranges, and reports a corrupt file (which
+                 it never touches) instead of silently resetting it.
 src/ui.rs        DESKTOP UI. `App` (eframe::App::update: main window with
                  the "Top GPU processes" list, the flashing critical-current
                  banner next to the total power, settings dialog, graphs),
                  `Config` (everything the settings panel edits: limits,
                  sounds, sample interval, web server, critical-alert
-                 safeguard — new app-wide settings go here), `FileDialog`
+                 safeguard — new app-wide settings go here; every field is
+                 persisted by `persist` — loaded in `App::new`, saved on
+                 Accept), `FileDialog`
                  (built-in .wav picker), `add_pin_graph`,
                  `add_metric_graph`, `draw_hover_readout`, colors.
 sound/           Shipped alert WAVs, embedded into the binary at compile
@@ -132,10 +148,14 @@ critical sections are short — keep them that way:
    newest. Never blocks the caller.
 3. **Privileged power helper** (`hardware::PowerHelper`): the app runs as a
    normal user but NVML's limit setter needs root. On demand (manual Apply,
-   the automatic min-power feature, or the "Test privileged access"
-   button) the poller spawns `pkexec <own exe> --power-helper`, which asks
+   the automatic min-power feature, the "Test privileged access" button,
+   or at startup when the saved settings have the automatic min-power
+   enabled) the poller spawns `pkexec <own exe> --power-helper`, which asks
    the desktop polkit agent for the password and runs `run_power_helper()`
-   as root. The helper stays alive, speaks `SET <watts>`/`PING` lines on
+   as root. Every prompt's purpose is announced to the user: spawning the
+   helper sets a `power_note` saying the administrator authentication is
+   for the GPU power limiting, and the settings panel shows the pending /
+   granted / denied state next to the option. The helper stays alive, speaks `SET <watts>`/`PING` lines on
    stdin and `OK`/`ERR …` lines on stdout; reader threads relay replies into
    a status cell the poller mirrors as `WebData::power_note` (GUI-only, not
    in the web JSON) **and** a `hardware::AuthState` (Idle / Active / Failed)
@@ -152,7 +172,11 @@ critical sections are short — keep them that way:
 5. **GUI thread** (`ui::App::update`): renders from `WebData`, mirrors the
    UI-side settings into it (`poll_ms`, `show_graphs`, `settings`), sends
    `Cmd`s to the poller (`SetLimit`, `Interval`, `GrantPowerAccess`).
-   Redraws at the poll interval when idle.
+   `App::new` loads the saved settings (see `persist`); if the automatic
+   min-power was saved enabled it sends `GrantPowerAccess` right away — the
+   root prompt shows at startup — and a denial turns the option back off
+   (`auto_power_pending_auth`), persisting the rollback. Redraws at the
+   poll interval when idle.
 
 ## Alert sound rules (implemented in `alerts::over_limit_sound`)
 
@@ -234,15 +258,19 @@ Optional (`Settings::auto_min_power` = Off / On yellow / On red):
   immediately authenticates the power helper and **reverts the option if
   authentication fails** (`ui::App::auto_power_pending_auth` watching
   `WebData::power_auth`), so enabling it never silently fails at the first
-  excursion.
+  excursion. The same happens at startup when the persisted settings have
+  it enabled: `App::new` authenticates the helper then (the prompt is
+  announced as being for the power limiting) and reverts — and re-saves —
+  the option when the credentials are not given.
 
 ## Cross-cutting conventions
 
 - Module visibility uses `pub(crate)` liberally (binary crate; the modules
   are one cohesive app, not a public API).
 - Module dependency direction: `main → {hardware, alerts, web, ui}`,
-  `hardware → {alerts, web}`, `ui → {alerts, hardware, web}`. No cycles;
-  `alerts` depends on nothing else in the crate.
+  `hardware → {alerts, web}`, `ui → {alerts, hardware, web, persist}`,
+  `persist → alerts`. No cycles; `alerts` depends on nothing else in the
+  crate.
 - Hand-rolled JSON (`web_json`) and the embedded `INDEX_HTML` must stay in
   sync: field names in the JSON are consumed by the JS in `web.rs`.
 - Web page (`INDEX_HTML`) and `ui.rs` deliberately mirror each other (same
@@ -273,7 +301,7 @@ Optional (`Settings::auto_min_power` = Off / On yellow / On red):
 
 ## Tests
 
-`cargo test` (18 tests, no GPU/display needed):
+`cargo test` (24 tests, no GPU/display needed):
 
 - `alerts::tests`: settings defaults; embedded WAVs decode; alert edge
   triggering; 15 s repeat-while-exceeded behavior; powering-down sound
@@ -283,6 +311,10 @@ Optional (`Settings::auto_min_power` = Off / On yellow / On red):
   outranking normal playback requests.
 - `hardware::tests`: process ranking (utilization/memory/pid order,
   truncation, own + zero pid exclusion) and `/proc` name fallback.
+- `persist::tests`: settings JSON round-trips (defaults, custom values,
+  user sound paths with escapes), a real save()/load() file round-trip in a
+  throwaway HOME, unknown/missing-key tolerance, clamping and yellow/red
+  order repair, rejection of invalid values, and corrupt-document detection.
 - `web::tests`: JSON field content (incl. process entries, name escaping and
   the latching `critical_alert` flag), `record()` history append/prune/range
   caching, query-param parsing, HTTP server serve/404/busy-port/restart and

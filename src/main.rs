@@ -10,6 +10,7 @@
 
 mod alerts;
 mod hardware;
+mod persist;
 mod ui;
 mod web;
 
@@ -63,6 +64,9 @@ fn main() {
         ..Default::default()
     };
 
+    // The app loads the settings saved on the previous run (see
+    // `persist`), re-applies them, and authenticates the privileged power
+    // helper when the saved automatic power limit needs it.
     let app = ui::App::new(cmd_tx, data);
 
     if let Err(e) = eframe::run_native("AstralGauge", options, Box::new(|_cc| Ok(Box::new(app)))) {

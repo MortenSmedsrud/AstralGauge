@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use crate::alerts::{AutoMinPower, EmbeddedSound, Settings, Sound, MAX_LIMIT_A, MIN_LIMIT_A};
 use crate::hardware::{AuthState, Cmd, DEFAULT_POLL_MS};
+use crate::persist;
 use crate::web::{WebData, WebServer, WebState, DEFAULT_WEB_PORT};
 
 pub(crate) const HORIZONS_MIN: [u32; 6] = [1, 5, 10, 15, 30, 60];
@@ -58,8 +59,8 @@ pub(crate) struct App {
     /// Web server state; `Stopped` by default. Runtime state, deliberately
     /// kept out of [`Config`] (which only holds the applied intent).
     web: WebState,
-    /// One-shot warning (port in use, denied power authentication, ...),
-    /// shown in a small dialog.
+    /// One-shot warning (port in use, denied power authentication, settings
+    /// file problems, ...), shown in a small dialog.
     warning: Option<String>,
     /// Set between accepting an enabled automatic power limit and the power
     /// helper's authentication result: while set, a failed authentication
@@ -79,6 +80,10 @@ pub(crate) struct App {
 /// draft, Cancel discards it. New app-wide settings belong here — add the
 /// field, a control in the settings panel, and (when the poller or the web
 /// page needs it) mirror it to [`WebData`] at the top of `update`.
+/// Every field is persisted to the settings file (see [`crate::persist`]):
+/// loaded by [`App::new`] on startup and written again whenever the panel
+/// accepts a change (or a denied power authentication rolls a saved option
+/// back).
 #[derive(Clone, PartialEq)]
 struct Config {
     /// Per-pin current limits and alert sounds.
@@ -93,8 +98,94 @@ struct Config {
     web_port: String,
 }
 
+/// Append to the one-shot warning rather than replacing it, so several
+/// startup problems (corrupt settings file, dead web-server port, ...) all
+/// reach the user in one dialog.
+fn add_warning(warning: &mut Option<String>, msg: String) {
+    match warning {
+        Some(existing) => {
+            existing.push_str("\n\n");
+            existing.push_str(&msg);
+        }
+        None => *warning = Some(msg),
+    }
+}
+
 impl App {
     pub(crate) fn new(cmd_tx: mpsc::Sender<Cmd>, data: Arc<Mutex<WebData>>) -> App {
+        // Load the settings saved by the previous run (see `persist`);
+        // a corrupt file is reported and the defaults take over.
+        let defaults = persist::StoredSettings {
+            alerts: Settings::default(),
+            poll_ms: DEFAULT_POLL_MS,
+            web_enabled: false,
+            web_port: DEFAULT_WEB_PORT.to_string(),
+        };
+        let to_config = |stored: persist::StoredSettings| Config {
+            alerts: stored.alerts,
+            poll_ms: stored.poll_ms,
+            web_enabled: stored.web_enabled,
+            web_port: stored.web_port,
+        };
+        let mut warning = None;
+        let mut config = match persist::load(&defaults) {
+            Ok(Some(stored)) => to_config(stored),
+            Ok(None) => to_config(defaults),
+            Err(e) => {
+                eprintln!("Settings file problem: {e}");
+                add_warning(
+                    &mut warning,
+                    format!(
+                        "Your saved settings could not be read:\n\n{e}\n\nDefaults are in \
+                         use. Accepting settings will replace the file."
+                    ),
+                );
+                to_config(defaults)
+            }
+        };
+        if config.poll_ms != DEFAULT_POLL_MS {
+            let _ = cmd_tx.send(Cmd::Interval(config.poll_ms));
+        }
+        // A saved "web server enabled" starts the server right away, exactly
+        // like accepting it in the panel would (a dead port is reported and
+        // the option stays off).
+        let mut web = WebState::Stopped;
+        if config.web_enabled {
+            let port = config.web_port.trim().parse::<u16>().ok();
+            match port {
+                Some(port) if port != 0 => match WebServer::start(port, data.clone()) {
+                    Ok(server) => web = WebState::Running(server),
+                    Err(e) => {
+                        add_warning(
+                            &mut warning,
+                            format!(
+                                "Port {port} is not available: {e}\n\nThe web interface was \
+                                 not started."
+                            ),
+                        );
+                        config.web_enabled = false;
+                    }
+                },
+                _ => {
+                    add_warning(
+                        &mut warning,
+                        "The saved web-server port is invalid; the web interface was not \
+                         started."
+                            .to_owned(),
+                    );
+                    config.web_enabled = false;
+                }
+            }
+        }
+        // A saved automatic power limit needs root: ask for the credentials
+        // now, at startup. The authentication dialog is announced as being
+        // for the power limiting (see `hardware::PowerHelper` and the note
+        // in the settings panel), and a denial turns the option back off
+        // through `auto_power_pending_auth` in `update`.
+        let auto_power_pending_auth = config.alerts.auto_min_power != AutoMinPower::Off;
+        if auto_power_pending_auth {
+            let _ = cmd_tx.send(Cmd::GrantPowerAccess);
+        }
         App {
             cmd_tx,
             pending_limit: None,
@@ -102,15 +193,10 @@ impl App {
             data,
             window_idx: 0,
             show_graphs: true,
-            config: Config {
-                alerts: Settings::default(),
-                poll_ms: DEFAULT_POLL_MS,
-                web_enabled: false,
-                web_port: DEFAULT_WEB_PORT.to_string(),
-            },
-            web: WebState::Stopped,
-            warning: None,
-            auto_power_pending_auth: false,
+            config,
+            web,
+            warning,
+            auto_power_pending_auth,
             draft: None,
             file_dialog: None,
         }
@@ -230,6 +316,17 @@ impl eframe::App for App {
                     self.auto_power_pending_auth = false;
                     if self.config.alerts.auto_min_power != AutoMinPower::Off {
                         self.config.alerts.auto_min_power = AutoMinPower::Off;
+                        // Persist the rollback: the option is off now (it was
+                        // denied at startup or when enabled), and it must not
+                        // silently ask for root again on the next run.
+                        if let Err(e) = persist::save(&persist::StoredSettings {
+                            alerts: self.config.alerts.clone(),
+                            poll_ms: self.config.poll_ms,
+                            web_enabled: self.config.web_enabled,
+                            web_port: self.config.web_port.clone(),
+                        }) {
+                            eprintln!("Could not save the rolled-back settings: {e}");
+                        }
                         self.warning = Some(
                             "Authentication was not granted, so the automatic power limit was turned back off.\n\nEnable it again and accept the authentication prompt to use this feature."
                                 .to_owned(),
@@ -248,6 +345,8 @@ impl eframe::App for App {
             data.settings = self.config.alerts.clone();
         }
         let now = data.start.elapsed().as_secs_f64();
+        // Captured for the settings panel (the data lock is held here).
+        let power_auth = data.power_auth;
 
         let window_secs = HORIZONS_MIN[self.window_idx as usize] as f64 * 60.0;
 
@@ -658,11 +757,50 @@ set to the card's minimum and restored once the current has been back below it f
 seconds. Applying limits needs administrator rights: enabling this opens an \
 authentication dialog right away, and turns the option back off if it is not \
 accepted. While enabled, the built-in alert sounds play their powering-down \
-variants instead.",
+variants instead. Settings are remembered: when the app starts with this option on, \
+it asks for the administrator password right away (again for this power-limiting \
+feature) and disables the option if the prompt is not granted.",
                         )
                         .weak()
                         .size(12.0),
                     );
+                    // Make the purpose of every authentication prompt
+                    // explicit here too, and keep the user posted on the
+                    // outcome (also feedback for the Test button below).
+                    if self.auto_power_pending_auth {
+                        ui.label(
+                            egui::RichText::new(
+                                "An administrator authentication for the GPU power limiting is \
+open — please answer the authentication dialog. Without it this option turns \
+back off.",
+                            )
+                            .color(egui::Color32::from_rgb(240, 210, 40)),
+                        );
+                    } else {
+                        match power_auth {
+                            AuthState::Active => {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Privileged power access: granted (administrator \
+credentials were given for the GPU power limiting).",
+                                    )
+                                    .weak()
+                                    .size(12.0),
+                                );
+                            }
+                            AuthState::Failed => {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Privileged power access: not granted. \"Test privileged \
+access\" asks for the administrator password for the GPU power limiting again.",
+                                    )
+                                    .weak()
+                                    .size(12.0),
+                                );
+                            }
+                            AuthState::Idle => {}
+                        }
+                    }
                     if ui.button("Test privileged access").clicked() {
                         // Spawn the helper now, so the password prompt shows
                         // here instead of on the first limit excursion.
@@ -809,6 +947,20 @@ replaces the critical alert sound of that same excursion.",
                     draft.web_port = server.port.to_string();
                 }
                 self.config = draft;
+                // Persist the accepted settings (the applied state, after
+                // any web start/stop rollback above). Save errors surface in
+                // the same warning dialog as other Accept failures.
+                if let Err(e) = persist::save(&persist::StoredSettings {
+                    alerts: self.config.alerts.clone(),
+                    poll_ms: self.config.poll_ms,
+                    web_enabled: self.config.web_enabled,
+                    web_port: self.config.web_port.clone(),
+                }) {
+                    add_warning(
+                        &mut self.warning,
+                        format!("Settings were applied, but could not be saved: {e}"),
+                    );
+                }
                 // Newly enabled automatic power limit: authenticate the
                 // privileged helper right now. The prompt appears while the
                 // user is here (instead of possibly going unnoticed at the
