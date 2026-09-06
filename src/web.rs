@@ -59,6 +59,10 @@ pub(crate) struct WebData {
     /// Authentication state of the privileged power helper, set by the poller
     /// after each sample. Desktop-UI only; deliberately not in the web JSON.
     pub(crate) power_auth: AuthState,
+    /// Last critical-alert safeguard action (killed/could-not-kill note)
+    /// with its age reference (seconds since `start`). Desktop-UI only (and
+    /// deliberately not in the web JSON); the UI shows it only while fresh.
+    pub(crate) kill_note: Option<(f64, String)>,
 }
 
 impl WebData {
@@ -78,6 +82,7 @@ impl WebData {
             settings: Settings::default(),
             power_note: None,
             power_auth: AuthState::Idle,
+            kill_note: None,
         };
         // Pre-reserve history for the default 1 Hz sample rate so the common
         // case never reallocates; a faster slider setting just grows the vecs.
@@ -352,7 +357,25 @@ fn web_json(data: &WebData, window_secs: f64) -> String {
     json_opt_f(&mut out, s.mem_used_gb, 2);
     out.push_str(",\"mem_total_gb\":");
     json_opt_f(&mut out, s.mem_total_gb, 1);
-    out.push_str("},\"range_max\":{\"power\":");
+    // Top GPU processes as [pid, name, mem GB, util %], highest first.
+    out.push_str("},\"processes\":[");
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    for (i, p) in s.processes.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('[');
+        out.push_str(&p.pid.to_string());
+        out.push(',');
+        json_string(&mut out, &p.name);
+        out.push_str(&format!(
+            ",{:.2},{}",
+            p.mem_bytes as f64 / GIB,
+            p.util_percent
+        ));
+        out.push(']');
+    }
+    out.push_str("],\"range_max\":{\"power\":");
     json_opt_f(&mut out, data.power_range_max, 1);
     out.push_str(",\"temp\":");
     json_opt_f(&mut out, data.temp_range_max, 1);
@@ -419,6 +442,24 @@ fn json_opt_u32(out: &mut String, v: Option<u32>) {
     }
 }
 
+/// Append a JSON string literal, escaping what JSON requires (process names
+/// come from `/proc` and may contain anything except NUL).
+fn json_string(out: &mut String, s: &str) {
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
 /// The single-page web UI. It polls /data and mirrors the graphical UI:
 /// the same metrics, tables, color coding and graphs, with a variable
 /// 1..60 minute time window.
@@ -482,6 +523,12 @@ const INDEX_HTML: &str = r###"<!DOCTYPE html>
   </div>
   <div class="legend" id="legend">
     <span class="r">● &gt; 10A</span><span class="y">● 9.2–10A</span><span class="g">● &lt; 9.2A</span>
+  </div>
+  <div class="tables" id="procs">
+    <div>
+      <h2>Top GPU processes</h2>
+      <table id="proctab"></table>
+    </div>
   </div>
   <div id="graphs">
     <div class="graph-title">Current and GPU metrics over time</div>
@@ -712,6 +759,23 @@ function render(d) {
   }
   document.getElementById('interval').textContent = 'Sample interval: ' + d.poll_ms + ' ms';
 
+  // Top GPU-using processes (NVML): [pid, name, mem GB, util %], highest first.
+  const pt = document.getElementById('proctab');
+  pt.innerHTML = '';
+  const procs = d.processes || [];
+  if (procs.length === 0) {
+    const cell = pt.insertRow().insertCell();
+    cell.textContent = 'No GPU-using processes';
+    cell.className = 'dim';
+  } else {
+    for (const p of procs) {
+      const row = pt.insertRow();
+      row.insertCell().textContent = String(p[1]).padEnd(24).slice(0, 24);
+      row.insertCell().textContent = String(p[3]).padStart(4) + ' %';
+      row.insertCell().textContent = p[2].toFixed(2).padStart(6) + ' GB';
+    }
+  }
+
   // current limits (from the settings dialog) and matching legend
   if (d.limits) {
     limits = d.limits;
@@ -782,7 +846,7 @@ tick();
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hardware::{PinReading, Sample, NUM_PINS};
+    use crate::hardware::{GpuProcess, PinReading, Sample, NUM_PINS};
     use std::net::TcpListener;
 
     fn test_data() -> Arc<Mutex<WebData>> {
@@ -822,6 +886,12 @@ mod tests {
             max_temp_c: Some(108.0),
             mem_used_gb: Some(20.5),
             mem_total_gb: Some(32.0),
+            processes: vec![GpuProcess {
+                pid: 4242,
+                name: "game \"named\".exe".to_owned(),
+                mem_bytes: (8.5 * 1024.0 * 1024.0 * 1024.0) as u64,
+                util_percent: 97,
+            }],
         };
         d.power_range_max = Some(600.0);
         d.temp_range_max = Some(108.0);
@@ -867,6 +937,8 @@ mod tests {
         assert!(json.contains("\"show_graphs\":true"));
         assert!(json.contains("\"poll_ms\":1000"));
         assert!(json.contains("\"limits\":[9.2,10.0]"));
+        // Top process entry, with the process name JSON-escaped.
+        assert!(json.contains(r#""processes":[[4242,"game \"named\".exe",8.50,97]]"#));
         // Two \"pins\" arrays: the latest sample and the history data.
         assert_eq!(json.matches("\"pins\":[").count(), 2);
         // All 10 per-pin history points fit inside the 60 s window. History
@@ -894,6 +966,7 @@ mod tests {
             max_temp_c: Some(108.0),
             mem_used_gb: Some(20.5),
             mem_total_gb: Some(32.0),
+            processes: vec![],
         };
         d.record(s.clone());
         d.record(s);

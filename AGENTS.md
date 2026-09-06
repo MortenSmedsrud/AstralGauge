@@ -35,11 +35,12 @@ cargo check
   power estimated as Σ(V·A) of the pins.
 - The shipped alert WAVs are **embedded into the executable** with
   `include_bytes!` (see `alerts::EmbeddedSound`): `attention.wav` /
-  `critical.wav` (yellow/red alerts) and their `-powering-down.wav`
-  variants. The `sound/` directory is therefore only needed at build time;
-  a single binary is all that gets distributed. Users can still pick their
-  own `.wav` per threshold in the settings dialog (and revert to the
-  built-in with its Reset button).
+  `critical.wav` (yellow/red alerts), their `-powering-down.wav` variants,
+  and `critical-terminating.wav` (the safeguard killed a process). The
+  `sound/` directory is therefore only needed at build time; a single
+  binary is all that gets distributed. Users can still pick their own `.wav`
+  per sound (thresholds and the terminating one) in the settings dialog
+  (and revert to the built-in with its Reset button).
 - rodio pulls in cpal/ALSA: building needs the ALSA dev headers
   (`libasound2-dev` and `pkg-config` on Debian/Ubuntu).
 
@@ -54,34 +55,48 @@ src/main.rs      Entry point: resolve I2C bus, create the shared
 src/hardware.rs  HARDWARE POLLING. IT8915 constants + raw i2c-dev/SMBus
                  ioctls (block read of all 24 registers, byte-read
                  fallback), bus auto-detection/probing, `PinReading`,
-                 `Sample`, `Cmd`, and `spawn_poller()` (the background
-                 poller thread). Contains `mod nvml` — the hand-rolled
-                 dlopen FFI bindings. Also the privileged power helper:
-                 `PowerHelper` (spawns this same binary as root through
-                 pkexec) and `run_power_helper()` (the helper mode).
+                 `Sample`, `GpuProcess`, `Cmd`, and `spawn_poller()` (the
+                 background poller thread). Contains `mod nvml` — the
+                 hand-rolled dlopen FFI bindings, including the top GPU-
+                 process list (compute + graphics per-process VRAM, and
+                 per-process SM utilization from `nvmlDeviceGetProcessUtilization`;
+                 names come from `/proc/<pid>/comm`) and `rank_processes`
+                 (utilization, then VRAM, then pid; own and pid 0 excluded).
+                 Also the privileged power helper: `PowerHelper` (spawns
+                 this same binary as root through pkexec) and
+                 `run_power_helper()` (the helper mode), plus `kill_process`
+                 (the safeguard's SIGKILL, unprivileged on purpose).
 src/alerts.rs    LIMIT CHECKING + SOUNDS. `Settings` (limits + sound
-                 config + `auto_min_power` mode), `Sound` (embedded WAV via
-                 `include_bytes!` or a user-selected file), `AlertState` +
+                 config + `auto_min_power` mode + `kill_top_process_on_red`
+                 safeguard flag), `Sound` (embedded WAV via `include_bytes!`
+                 or a user-selected file), `AlertState` +
                  `over_limit_sound()` (edge + repeat decision logic),
-                 `AutoPowerState` + `auto_power_action()` (automatic
-                 minimum-power-limit state machine), `SoundPlayer` (rodio
-                 playback thread) and the shipped-sound default paths.
-src/web.rs       WEB SERVER + SHARED STATE. `WebData` (latest sample,
-                 histories, mirrored UI settings), `WebData::record()`
+                 `KillGuardState` + `kill_guard_action()` (once-per-red-
+                 excursion kill edge, opt-in), `AutoPowerState` +
+                 `auto_power_action()` (automatic minimum-power-limit state
+                 machine), `SoundPlayer` (rodio playback thread, priority-
+                 aware for the critical-terminating sound) and the
+                 shipped-sound default paths.
+src/web.rs       WEB SERVER + SHARED STATE. `WebData` (latest sample —
+                 including the top GPU processes, served as the JSON
+                 `processes` array — histories, mirrored UI settings),
+                 `WebData::record()`
                  (sample ingestion + history pruning), `WebServer` /
                  `WebState` lifecycle, the tiny HTTP server
                  (`GET /` → page, `GET /data?window=SECS` → JSON),
                  hand-rolled JSON serialization, and `INDEX_HTML`
                  (the whole single-page web UI, JS included).
-src/ui.rs        DESKTOP UI. `App` (eframe::App::update: main window, settings
-                 dialog, graphs), `Config` (everything the settings panel
-                 edits: limits, sounds, sample interval, web server — new
-                 app-wide settings go here), `FileDialog`
+src/ui.rs        DESKTOP UI. `App` (eframe::App::update: main window with
+                 the "Top GPU processes" list, settings dialog, graphs),
+                 `Config` (everything the settings panel edits: limits,
+                 sounds, sample interval, web server, critical-alert
+                 safeguard — new app-wide settings go here), `FileDialog`
                  (built-in .wav picker), `add_pin_graph`,
                  `add_metric_graph`, `draw_hover_readout`, colors.
 sound/           Shipped alert WAVs, embedded into the binary at compile
                  time (attention/critical = yellow/red alerts, each with a
-                 -powering-down variant for the automatic power feature).
+                 -powering-down variant for the automatic power feature,
+                 plus critical-terminating for the kill safeguard).
 src/bin/         Empty (no extra binaries).
 ```
 
@@ -91,9 +106,15 @@ One `Arc<Mutex<WebData>>` (created in `main`) is the single sync point; all
 critical sections are short — keep them that way:
 
 1. **Poller thread** (`hardware::spawn_poller`): opens I2C + NVML once,
-   loops: drain `Cmd` channel (`SetLimit`/`Interval`) → read NVML + pins →
-   lock the data, read `settings`, `record(sample)` → run
-   `alerts::over_limit_sound` outside the lock → `SoundPlayer::play`.
+   loops: drain `Cmd` channel (`SetLimit`/`Interval`) → read NVML + pins +
+   top GPU processes → lock the data, read `settings`, `record(sample)` →
+   run `alerts::over_limit_sound` outside the lock (evaluated, not played
+   yet) → on a red rising edge with the kill safeguard on,
+   `alerts::kill_guard_action` SIGKILLs the top-ranked process (the outcome
+   lands in `WebData::kill_note`, GUI-only) → play: a successful termination
+   sends the critical-terminating sound via `SoundPlayer::play_priority`
+   (replacing that excursion's red alert); otherwise the pending alert
+   sound plays.
    Monitored data keeps flowing while the window is minimized.
 2. **Audio thread** (`alerts::SoundPlayer`): owns the rodio
    `OutputStream`/`Sink` (created lazily on first play; absence of audio is
@@ -136,6 +157,37 @@ critical sections are short — keep them that way:
   `ALERT_REPEAT_DELAY` (15 s). Red escalation from yellow is immediate.
 - Only one sound ever plays at a time (serialized on the audio thread);
   sounds are best-effort and must never block or crash the app.
+- The critical-terminating sound (see the safeguard below) is a **priority**
+  sound (`SoundPlayer::play_priority`): while one is playing nothing
+  interrupts it, and when requests pile up it outranks every normal alert
+  request (`alerts::next_request`).
+
+## Top GPU processes & critical-alert kill safeguard
+
+Every sample carries NVML's `top 3 GPU-using processes` (`TOP_PROCESSES`),
+ranked by SM utilization, then VRAM usage, then pid; the app's own pid and
+pid 0 are never listed (the eframe window itself holds a small GPU
+context). Shown in the main window and the web page.
+
+Optional (`Settings::kill_top_process_on_red`, default off, settings dialog
+"Critical-alert safeguard"):
+
+- Rising edge into the red range: SIGKILL the **first entry of that list**
+  (once per excursion — never repeated while the limit stays exceeded;
+  re-entering red fires again; enabling it mid-excursion does not kill
+  retroactively).
+- Needs **no privileges**: `kill()` only reaches processes of the app's own
+  user (others answer EPERM — logged, not fatal), which deliberately bounds
+  the blast radius; the root power helper is never reachable by it either.
+- Result (killed / could-not-kill) goes to stderr and into
+  `WebData::kill_note`, shown in the main window for a minute (GUI-only,
+  not in the web JSON).
+- An actual kill plays `Settings::terminating_sound` (default: the embedded
+  `critical-terminating.wav`, user-replaceable in the safeguard settings
+  like the alert sounds) as a priority sound: it is never dropped for other
+  requests, nothing interrupts it, and it **replaces** the red alert sound
+  of the same excursion (a failed kill plays the regular red alert
+  instead).
 
 ## Automatic minimum power limit (`alerts::auto_power_action`)
 
@@ -169,10 +221,19 @@ Optional (`Settings::auto_min_power` = Off / On yellow / On red):
 - History timestamps are seconds since `WebData::start` (`Instant`);
   retention is `web::HISTORY_SECS` (62 min); the web page offers 1–60 min
   windows (`ui::HORIZONS_MIN`, duplicated as `HORIZONS` in the JS).
+- History timestamps (pin/power/temp/mem series) are seconds since
+  `WebData::start`; the process list is snapshot-only (no history).
 - Colors: green `< yellow`, yellow `[yellow, red)`, red `>= red`
   (`ui::current_color` ↔ JS `currentColor`); tables/graphs use the applied
   `Settings`, never hard-coded thresholds (the JS fetches live `limits`
   from `/data`).
+- The NVML process-list getters take `nvmlProcessInfo_v2_t` (24 bytes: the
+  `_v3` functions reuse the v2 struct) and are sized with the documented
+  two-call protocol (NULL buffer + count 0 → `NVML_ERROR_INSUFFICIENT_SIZE`
+  with the count). `usedGpuMemory == u64::MAX` means "not reported".
+  `nvmlDeviceGetProcessUtilization` fills 32-byte samples; a timestamp
+  cursor (the newest `timeStamp` seen) advances each poll so samples are
+  consumed once, and a process missing from the newest batch shows 0 %.
 - The 24 power registers must be read with **one I2C block read**
   (byte-reads take the GPU's I2C bus lock and can stutter games); the
   byte-read fallback exists for kernels without block support and for
@@ -182,13 +243,18 @@ Optional (`Settings::auto_min_power` = Off / On yellow / On red):
 
 ## Tests
 
-`cargo test` (11 tests, no GPU/display needed):
+`cargo test` (17 tests, no GPU/display needed):
 
 - `alerts::tests`: settings defaults; embedded WAVs decode; alert edge
   triggering; 15 s repeat-while-exceeded behavior; powering-down sound
-  switch with auto power; auto-power lower/restore edges and bounds.
-- `web::tests`: JSON field content, `record()` history append/prune/range
-  caching, query-param parsing, HTTP server serve/404/busy-port/restart.
+  switch with auto power; auto-power lower/restore edges and bounds;
+  kill-guard once-per-excursion behavior; priority requests outranking
+  normal playback requests.
+- `hardware::tests`: process ranking (utilization/memory/pid order,
+  truncation, own + zero pid exclusion) and `/proc` name fallback.
+- `web::tests`: JSON field content (incl. process entries and name
+  escaping), `record()` history append/prune/range caching, query-param
+  parsing, HTTP server serve/404/busy-port/restart.
 
 Tests that bind ports use `free_port()` (bind :0, drop, reuse).
 

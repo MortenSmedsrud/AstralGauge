@@ -18,6 +18,11 @@ use crate::web::{WebData, WebServer, WebState, DEFAULT_WEB_PORT};
 
 pub(crate) const HORIZONS_MIN: [u32; 6] = [1, 5, 10, 15, 30, 60];
 
+/// Seconds a critical-alert safeguard note stays visible in the main window.
+const KILL_NOTE_TTL_SECS: f64 = 60.0;
+
+const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+
 fn current_color(current: f64, s: &Settings) -> egui::Color32 {
     if current < s.yellow_limit_a as f64 {
         egui::Color32::from_rgb(80, 220, 80)
@@ -111,6 +116,7 @@ impl App {
 enum SoundField {
     Yellow,
     Red,
+    Terminating,
 }
 
 impl SoundField {
@@ -120,6 +126,7 @@ impl SoundField {
         match self {
             SoundField::Yellow => Sound::Embedded(EmbeddedSound::Attention),
             SoundField::Red => Sound::Embedded(EmbeddedSound::Critical),
+            SoundField::Terminating => Sound::Embedded(EmbeddedSound::CriticalTerminating),
         }
     }
 }
@@ -327,6 +334,12 @@ impl eframe::App for App {
             if let Some(note) = data.power_note.clone() {
                 ui.label(egui::RichText::new(note).weak().size(12.0));
             }
+            // Critical-alert safeguard result, shown only while fresh.
+            if let Some((secs, note)) = data.kill_note.clone() {
+                if now - secs < KILL_NOTE_TTL_SECS {
+                    ui.label(egui::RichText::new(note).weak().size(12.0));
+                }
+            }
 
             ui.separator();
 
@@ -411,6 +424,28 @@ impl eframe::App for App {
                         });
                     }
                 });
+            }
+
+            ui.separator();
+
+            // Top GPU-using processes (NVML), highest first; the critical
+            // alert safeguard (when enabled) kills the first entry.
+            ui.strong("Top GPU processes");
+            if data.sample.processes.is_empty() {
+                ui.label(
+                    egui::RichText::new("No GPU-using processes")
+                        .weak()
+                        .size(12.0),
+                );
+            } else {
+                for p in &data.sample.processes {
+                    let name: String = p.name.chars().take(26).collect();
+                    ui.horizontal(|ui| {
+                        ui.monospace(format!("{name:<26}"));
+                        ui.monospace(format!("{:>4} %", p.util_percent));
+                        ui.monospace(format!("{:>6.2} GB", p.mem_bytes as f64 / GIB));
+                    });
+                }
             }
 
             if self.show_graphs {
@@ -599,6 +634,35 @@ variants instead.",
                         // here instead of on the first limit excursion.
                         let _ = self.cmd_tx.send(Cmd::GrantPowerAccess);
                     }
+
+                    ui.add_space(6.0);
+                    ui.separator();
+                    // Last-resort protection: SIGKILL the top GPU-using
+                    // process on the rising edge into the red range.
+                    ui.strong("Critical-alert safeguard");
+                    ui.checkbox(
+                        &mut draft.alerts.kill_top_process_on_red,
+                        "Kill the top GPU-using process when the red limit is reached",
+                    );
+                    ui.label(
+                        egui::RichText::new(
+                            "As a last resort, the first process of the \"Top GPU processes\" list \
+(is ranked by utilization, then VRAM usage) is killed with SIGKILL the moment a pin current \
+first reaches the red limit. It fires once per excursion, never while the limit merely stays \
+exceeded, and only processes of your own user can be killed (the app itself is never a \
+target). The killed process gets no chance to save its work. Disabled by default. When a \
+process is terminated, the terminating sound below plays: it cannot be interrupted and it \
+replaces the critical alert sound of that same excursion.",
+                        )
+                        .weak()
+                        .size(12.0),
+                    );
+                    sound_file_row(
+                        ui,
+                        &mut draft.alerts.terminating_sound,
+                        SoundField::Terminating,
+                        &mut open_browser,
+                    );
 
                     ui.add_space(6.0);
                     ui.separator();
@@ -805,6 +869,7 @@ variants instead.",
                     match fd.field {
                         SoundField::Yellow => draft.alerts.yellow_sound = sound,
                         SoundField::Red => draft.alerts.red_sound = sound,
+                        SoundField::Terminating => draft.alerts.terminating_sound = sound,
                     }
                 }
                 dialog_close = true;

@@ -76,6 +76,8 @@ pub(crate) enum EmbeddedSound {
     AttentionPoweringDown,
     /// Red-range alert while the automatic power limit is lowering the GPU.
     CriticalPoweringDown,
+    /// A process was terminated by the critical-alert safeguard.
+    CriticalTerminating,
 }
 
 impl EmbeddedSound {
@@ -90,6 +92,9 @@ impl EmbeddedSound {
             EmbeddedSound::CriticalPoweringDown => {
                 include_bytes!("../sound/critical-powering-down.wav")
             }
+            EmbeddedSound::CriticalTerminating => {
+                include_bytes!("../sound/critical-terminating.wav")
+            }
         }
     }
 
@@ -100,6 +105,7 @@ impl EmbeddedSound {
             EmbeddedSound::Critical => "critical",
             EmbeddedSound::AttentionPoweringDown => "attention (powering down)",
             EmbeddedSound::CriticalPoweringDown => "critical (powering down)",
+            EmbeddedSound::CriticalTerminating => "critical-terminating",
         }
     }
 }
@@ -133,6 +139,14 @@ pub(crate) struct Settings {
     /// Automatically lower the GPU power management limit to its minimum
     /// when a pin current reaches the selected limit level.
     pub(crate) auto_min_power: AutoMinPower,
+    /// Critical-alert safeguard: kill (SIGKILL) the top GPU-using process
+    /// when a pin current enters the red range. Disabled by default; see
+    /// [`kill_guard_action`].
+    pub(crate) kill_top_process_on_red: bool,
+    /// Sound played when the safeguard actually terminates a process. It is
+    /// a priority sound: nothing interrupts it, and it replaces the red
+    /// alert of the same excursion.
+    pub(crate) terminating_sound: Sound,
 }
 
 impl Default for Settings {
@@ -145,6 +159,8 @@ impl Default for Settings {
             red_sound_enabled: false,
             red_sound: Sound::Embedded(EmbeddedSound::Critical),
             auto_min_power: AutoMinPower::default(),
+            kill_top_process_on_red: false,
+            terminating_sound: Sound::Embedded(EmbeddedSound::CriticalTerminating),
         }
     }
 }
@@ -245,6 +261,33 @@ fn active_sound(sound: &Sound, s: &Settings, over_red: bool) -> Sound {
     }
 }
 
+/// Critical-alert safeguard state carried across poll samples: whether the
+/// red range is currently latched (so entering it counts as a rising edge).
+#[derive(Default)]
+pub(crate) struct KillGuardState {
+    latched_red: bool,
+}
+
+/// Fold one sample's maximum pin current into the critical-alert safeguard
+/// state and return whether the top GPU-using process should be killed now.
+///
+/// Only fires while [`Settings::kill_top_process_on_red`] is enabled, and
+/// once per red excursion: on the rising edge into the red range. Staying
+/// in the range never repeats the kill (a runaway kill loop is worse than
+/// the excursion), and re-entering it fires again. The latch follows the
+/// red range continuously, so enabling the option mid-excursion does not
+/// kill retroactively either — only a fresh excursion does.
+pub(crate) fn kill_guard_action(
+    state: &mut KillGuardState,
+    max_current: f64,
+    s: &Settings,
+) -> bool {
+    let over_red = max_current >= s.red_limit_a as f64;
+    let fire = over_red && !state.latched_red && s.kill_top_process_on_red;
+    state.latched_red = over_red;
+    fire
+}
+
 /// Automatic-power-limit state carried across poll samples: the limit to
 /// restore once the trigger condition clears (set while the limit is lowered)
 /// and when the pin current first dropped below the trigger level.
@@ -327,11 +370,32 @@ impl<T: std::io::Read + std::io::Seek + Send + Sync + ?Sized> ReadSeekSend for T
 
 type SoundReader = Box<dyn ReadSeekSend>;
 
+/// One playback request: a sound plus whether it is a priority sound. The
+/// critical-terminating sound is the only priority one: it must never be
+/// dropped in favor of other requests and nothing interrupts it.
+struct SoundRequest {
+    sound: Sound,
+    priority: bool,
+}
+
+/// Decide which of two requests collected in one batch plays next: priority
+/// requests win over normal ones (older alerts are redundant anyway), and
+/// within a priority class the newest wins.
+fn next_request(current: SoundRequest, next: SoundRequest) -> SoundRequest {
+    if next.priority && !current.priority {
+        next
+    } else if current.priority && !next.priority {
+        current
+    } else {
+        next
+    }
+}
+
 /// Handle to the alert-sound playback thread. Sound is best-effort: `play`
 /// never blocks, and requests are dropped when no audio output exists
 /// (headless session, missing device, undecodable file).
 pub(crate) struct SoundPlayer {
-    tx: mpsc::Sender<Sound>,
+    tx: mpsc::Sender<SoundRequest>,
 }
 
 impl SoundPlayer {
@@ -345,23 +409,37 @@ impl SoundPlayer {
     }
 
     /// Queue a sound for playback. Sounds play one at a time; while one is
-    /// playing, at most the most recently queued sound is kept.
+    /// playing, at most the most recently queued normal sound is kept (and
+    /// never at the expense of a queued priority sound).
     pub(crate) fn play(&self, sound: Sound) {
-        let _ = self.tx.send(sound);
+        let _ = self.tx.send(SoundRequest {
+            sound,
+            priority: false,
+        });
+    }
+
+    /// Queue a priority sound: it outranks every pending normal request and
+    /// the sound it waits behind is never cut in on once it is playing.
+    pub(crate) fn play_priority(&self, sound: Sound) {
+        let _ = self.tx.send(SoundRequest {
+            sound,
+            priority: true,
+        });
     }
 }
 
-fn audio_loop(rx: mpsc::Receiver<Sound>) {
+fn audio_loop(rx: mpsc::Receiver<SoundRequest>) {
     // rodio stops playback when the output stream is dropped, so the session
     // lives for the whole thread; it is None until the first successful try.
     let mut session: Option<(OutputStream, Sink)> = None;
     let mut init_warned = false;
 
-    while let Some(mut sound) = rx.recv().ok() {
-        // Play only the newest request: while a sound was playing, older
-        // queued alerts are already redundant.
+    while let Ok(mut request) = rx.recv() {
+        // Play only the one remaining request: while a sound was playing,
+        // older queued alerts are redundant, and priority ones (the
+        // critical-terminating sound) outrank everything else.
         while let Ok(newer) = rx.try_recv() {
-            sound = newer;
+            request = next_request(request, newer);
         }
 
         if session.is_none() {
@@ -390,7 +468,7 @@ fn audio_loop(rx: mpsc::Receiver<Sound>) {
         }
 
         if let Some((_, sink)) = &session {
-            let source = match &sound {
+            let source = match &request.sound {
                 // Embedded WAVs decode straight from the bytes in the binary.
                 Sound::Embedded(embedded) => {
                     Decoder::new(Box::new(Cursor::new(embedded.bytes())) as SoundReader)
@@ -434,6 +512,32 @@ mod tests {
         // The default sounds are the ones embedded in the executable.
         assert_eq!(s.yellow_sound, Sound::Embedded(EmbeddedSound::Attention));
         assert_eq!(s.red_sound, Sound::Embedded(EmbeddedSound::Critical));
+        assert_eq!(
+            s.terminating_sound,
+            Sound::Embedded(EmbeddedSound::CriticalTerminating)
+        );
+    }
+
+    #[test]
+    fn priority_requests_beat_normal_ones() {
+        let normal = |s: u8| SoundRequest {
+            sound: Sound::File(PathBuf::from(format!("n{s}.wav"))),
+            priority: false,
+        };
+        let priority = || SoundRequest {
+            sound: Sound::Embedded(EmbeddedSound::CriticalTerminating),
+            priority: true,
+        };
+        // The critical-terminating sound outranks anything queued around it,
+        // in both arrival orders, and is never replaced by a newer alert.
+        assert!(next_request(normal(1), priority()).priority);
+        assert!(next_request(priority(), normal(2)).priority);
+        // Within one class the newest request still wins.
+        assert_eq!(
+            next_request(normal(1), normal(2)).sound,
+            Sound::File(PathBuf::from("n2.wav"))
+        );
+        assert!(next_request(priority(), priority()).priority);
     }
 
     #[test]
@@ -445,6 +549,7 @@ mod tests {
             EmbeddedSound::Critical,
             EmbeddedSound::AttentionPoweringDown,
             EmbeddedSound::CriticalPoweringDown,
+            EmbeddedSound::CriticalTerminating,
         ] {
             let bytes = sound.bytes();
             assert!(bytes.len() > 44, "{sound:?} looks empty");
@@ -558,6 +663,37 @@ mod tests {
         );
         assert_eq!(auto_power_action(&mut st2, 10.5, Some(580), None, &s), None);
         assert_eq!(auto_power_action(&mut st2, 10.5, None, Some(300), &s), None);
+    }
+
+    #[test]
+    fn kill_guard_fires_once_per_red_excursion() {
+        let mut s = Settings::default();
+        let mut state = KillGuardState::default();
+        s.red_sound_enabled = true;
+        let red = s.red_limit_a as f64 + 0.5;
+        let yellow = (s.yellow_limit_a + s.red_limit_a) as f64 / 2.0;
+        let green = s.yellow_limit_a as f64 - 1.0;
+
+        // Disabled: entering and staying in red never kills.
+        assert!(!kill_guard_action(&mut state, red, &s));
+        assert!(!kill_guard_action(&mut state, red, &s));
+
+        // Enabled mid-excursion: the red range is already latched, so no
+        // retroactive kill; the next fresh excursion is what fires.
+        s.kill_top_process_on_red = true;
+        assert!(!kill_guard_action(&mut state, red, &s));
+
+        // Leave red (yellow does not fire, it is not the trigger range),
+        // then a new red excursion kills once and never repeats.
+        assert!(!kill_guard_action(&mut state, yellow, &s));
+        assert!(kill_guard_action(&mut state, red, &s));
+        assert!(!kill_guard_action(&mut state, red, &s));
+        assert!(!kill_guard_action(&mut state, yellow, &s));
+
+        // Re-entering red fires again; the green range keeps state reset.
+        assert!(kill_guard_action(&mut state, red, &s));
+        assert!(!kill_guard_action(&mut state, green, &s));
+        assert!(kill_guard_action(&mut state, red, &s));
     }
 
     #[test]

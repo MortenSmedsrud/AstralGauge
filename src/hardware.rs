@@ -7,6 +7,7 @@
 //! [`WebData`], and drives the limit checking / alert sounds through the
 //! [`alerts`] module.
 
+use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
@@ -14,12 +15,16 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::os::raw::c_void;
 use std::process::{Child, Command, Stdio};
 use std::ptr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use crate::alerts::{auto_power_action, over_limit_sound, AlertState, AutoPowerState, SoundPlayer};
+use crate::alerts::{
+    auto_power_action, kill_guard_action, over_limit_sound, AlertState, AutoPowerState,
+    KillGuardState, SoundPlayer,
+};
 use crate::web::WebData;
 
 // ITE IT8915FN constants
@@ -43,6 +48,10 @@ const I2C_RETRIES: libc::c_ulong = 0x0701;
 
 /// Default poll interval in ms (adjustable in the UI, 100 ms..=10 s).
 pub(crate) const DEFAULT_POLL_MS: u64 = 1000;
+
+/// How many top GPU-using processes to keep per sample (main window list,
+/// web page, and the critical-alert kill safeguard's victim).
+pub(crate) const TOP_PROCESSES: usize = 3;
 
 // Matches kernel's union i2c_smbus_data { __u8 byte; __u16 word; __u8 block[34]; }.
 // Must keep the full 34 bytes: the driver may write more than the byte we use.
@@ -74,6 +83,22 @@ pub(crate) struct Sample {
     pub(crate) max_temp_c: Option<f64>,   // max supported temperature from NVML
     pub(crate) mem_used_gb: Option<f64>,  // VRAM used (GB) from NVML
     pub(crate) mem_total_gb: Option<f64>, // VRAM total (GB) from NVML
+    /// Top GPU-using processes (NVML), highest first; empty when NVML is
+    /// unavailable or nothing uses the GPU. See [`TOP_PROCESSES`].
+    pub(crate) processes: Vec<GpuProcess>,
+}
+
+/// One process using the GPU, as reported by NVML.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct GpuProcess {
+    pub(crate) pid: u32,
+    /// Process name (from `/proc/<pid>/comm`), `"pid N"` as a fallback.
+    pub(crate) name: String,
+    /// GPU memory used, in bytes (0 when the driver does not report it).
+    pub(crate) mem_bytes: u64,
+    /// SM utilization percent over the last poll interval (0 when the
+    /// driver reported no utilization sample for this process).
+    pub(crate) util_percent: u32,
 }
 
 /// Commands from the UI to the poller thread.
@@ -365,6 +390,7 @@ pub(crate) fn spawn_poller(
         let mut alert_state = AlertState::default();
         let mut power_helper = PowerHelper::new();
         let mut auto_power = AutoPowerState::default();
+        let mut kill_guard = KillGuardState::default();
 
         loop {
             // Handle UI commands
@@ -422,6 +448,12 @@ pub(crate) fn spawn_poller(
                     )
                 });
 
+            // Top GPU-using processes (NVML): drives the main window list,
+            // the web page and the critical-alert kill safeguard's target.
+            let processes = nvml
+                .as_ref()
+                .map_or_else(Vec::new, |n| n.processes(TOP_PROCESSES));
+
             let pins =
                 match file.as_ref() {
                     Some(f) => {
@@ -460,7 +492,11 @@ pub(crate) fn spawn_poller(
                 max_temp_c,
                 mem_used_gb,
                 mem_total_gb,
+                processes,
             };
+            // The kill safeguard's victim is always the top-ranked process of
+            // the sample just recorded; grab it before `record` consumes it.
+            let top_process = sample.processes.first().cloned();
 
             // Limit checking runs here, on the poller's cadence: the newest
             // settings are mirrored into the shared data by the UI.
@@ -482,11 +518,63 @@ pub(crate) fn spawn_poller(
                 d.power_auth = power_auth;
                 settings
             };
-            if let Some(sound) = over_limit_sound(&mut alert_state, max_current, &settings) {
+            // Limit checking decides which alert sound this sample earns, but
+            // it is only played below: a termination on this same red edge
+            // replaces the critical alert (see the priority sound below).
+            let alert_sound = over_limit_sound(&mut alert_state, max_current, &settings);
+
+            // Critical-alert safeguard (opt-in, see alerts::kill_guard_action):
+            // on the rising edge into the red range, SIGKILL the top GPU-using
+            // process. Kills need no privileges (same-user processes only);
+            // the outcome goes to stderr and (freshly) into the desktop UI.
+            let mut terminated = false;
+            if kill_guard_action(&mut kill_guard, max_current, &settings) {
+                match top_process {
+                    Some(p) => {
+                        let note = match kill_process(p.pid) {
+                            Ok(()) => {
+                                terminated = true;
+                                println!(
+                                    "Critical-alert safeguard: killed {} (pid {})",
+                                    p.name, p.pid
+                                );
+                                format!(
+                                    "Critical-alert safeguard: killed {} (pid {}).",
+                                    p.name, p.pid
+                                )
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "Critical-alert safeguard: cannot kill {} (pid {}): {e}",
+                                    p.name, p.pid
+                                );
+                                format!(
+                                    "Critical-alert safeguard: could not kill {} (pid {}): {e}",
+                                    p.name, p.pid
+                                )
+                            }
+                        };
+                        let mut d = data.lock().unwrap();
+                        let now = d.start.elapsed().as_secs_f64();
+                        d.kill_note = Some((now, note));
+                    }
+                    None => println!("Critical-alert safeguard: no GPU process to kill."),
+                }
+            }
+
+            // Sounds: an actual termination plays the critical-terminating
+            // sound as a priority request (nothing queues ahead of it and
+            // nothing interrupts it once playing); a failed kill leaves the
+            // regular red alert sound, which is what this excursion earned.
+            if terminated {
+                player.play_priority(settings.terminating_sound.clone());
+            } else if let Some(sound) = alert_sound {
                 player.play(sound);
             }
+
             // Automatic minimum power limit (see alerts::auto_power_action);
-            // applying it goes through the privileged helper.
+            // applying it goes through the privileged helper (kept last so a
+            // first-time pkexec spawn can never delay the sounds above).
             if let Some(watts) = auto_power_action(
                 &mut auto_power,
                 max_current,
@@ -501,6 +589,48 @@ pub(crate) fn spawn_poller(
         }
     });
     cmd_tx
+}
+
+/// SIGKILL a process (the critical-alert safeguard). No privileges are
+/// involved: processes owned by other users answer with EPERM (the app runs
+/// unprivileged, which is exactly the right blast radius for a safeguard).
+fn kill_process(pid: u32) -> io::Result<()> {
+    if unsafe { libc::kill(pid as libc::c_int, libc::SIGKILL) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// Rank GPU processes for the display list and the kill safeguard: highest
+/// SM utilization first, ties broken by VRAM usage, then by pid (stable
+/// order). Drops pid 0 (NVML placeholders) and the app's own pid: an eframe
+/// window holds a small GPU context and must never be the safeguard's victim.
+fn rank_processes(mut procs: Vec<GpuProcess>, top: usize) -> Vec<GpuProcess> {
+    let own = std::process::id();
+    procs.retain(|p| p.pid != 0 && p.pid != own);
+    procs.sort_by(|a, b| {
+        b.util_percent
+            .cmp(&a.util_percent)
+            .then(b.mem_bytes.cmp(&a.mem_bytes))
+            .then(a.pid.cmp(&b.pid))
+    });
+    procs.truncate(top);
+    // Resolve names only for what is displayed.
+    for p in &mut procs {
+        p.name = process_name(p.pid);
+    }
+    procs
+}
+
+/// Human-readable process name: `/proc/<pid>/comm` (the executable's name),
+/// falling back to `"pid N"` when the process is gone or unreadable.
+fn process_name(pid: u32) -> String {
+    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("pid {pid}"))
 }
 
 /// Read a single register byte via the SMBus byte-data protocol.
@@ -654,6 +784,9 @@ mod nvml {
     const NVML_ERROR_INVALID_ARGUMENT: u32 = 2;
     const NVML_ERROR_NOT_SUPPORTED: u32 = 3;
     const NVML_ERROR_NO_PERMISSION: u32 = 4;
+    /// Process/utilization lists: the provided buffer is too small, the
+    /// required entry count is written back (the documented sizing protocol).
+    const NVML_ERROR_INSUFFICIENT_SIZE: u32 = 7;
     /// Sensor type for the main GPU temperature (NVML_TEMPERATURE_GPU).
     const NVML_TEMPERATURE_GPU: u32 = 0;
     /// Temperature thresholds (NVML_TEMPERATURE_THRESHOLD_t).
@@ -676,6 +809,17 @@ mod nvml {
         unsafe extern "C" fn(device: *mut c_void, threshold: u32, temp: *mut i32) -> u32;
     type FnGetMemoryInfo =
         unsafe extern "C" fn(device: *mut c_void, memory: *mut NvmlMemory) -> u32;
+    type FnGetRunningProcesses = unsafe extern "C" fn(
+        device: *mut c_void,
+        count: *mut u32,
+        processes: *mut NvmlProcessInfo,
+    ) -> u32;
+    type FnGetProcessUtilization = unsafe extern "C" fn(
+        device: *mut c_void,
+        samples: *mut NvmlProcessUtilizationSample,
+        count: *mut u32,
+        last_seen_timestamp: u64,
+    ) -> u32;
 
     /// Matches NVML's `nvml_memory_t` (all fields in bytes). Field order
     /// matters: it must stay in sync with the C ABI (total, free, used).
@@ -684,6 +828,31 @@ mod nvml {
         pub total: u64,
         pub free: u64,
         pub used: u64,
+    }
+
+    /// Matches NVML's `nvmlProcessInfo_v2_t` (which the `_v3` list getters
+    /// also use; the compiler inserts 4 bytes of padding before the u64).
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct NvmlProcessInfo {
+        pid: u32,
+        used_gpu_memory: u64,
+        gpu_instance_id: u32,
+        compute_instance_id: u32,
+    }
+
+    /// Matches NVML's `nvmlProcessUtilizationSample_t`: SM/memory/encoder
+    /// utilization per process, averaged over the interval covered by the
+    /// sample (`timeStamp` in microseconds).
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct NvmlProcessUtilizationSample {
+        pid: u32,
+        time_stamp: u64,
+        sm_util: u32,
+        mem_util: u32,
+        enc_util: u32,
+        dec_util: u32,
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -721,6 +890,14 @@ mod nvml {
         get_temperature: FnGetTemperature,
         get_temperature_threshold: FnGetTemperatureThreshold,
         get_memory_info: FnGetMemoryInfo,
+        /// Process monitoring (optional symbols; feature degrades to an
+        /// empty list when the driver does not export them).
+        get_compute_procs: Option<FnGetRunningProcesses>,
+        get_graphics_procs: Option<FnGetRunningProcesses>,
+        get_process_util: Option<FnGetProcessUtilization>,
+        /// Newest utilization sample timestamp consumed by
+        /// [`Nvml::process_utilization`], so each poll reads only new samples.
+        last_util_ts: AtomicU64,
     }
 
     // The dlopen handle is shared between threads; NVML is thread-safe.
@@ -745,6 +922,20 @@ mod nvml {
                 return None;
             }
             unsafe { std::mem::transmute::<*mut c_void, $ty>(sym) }
+        }};
+    }
+
+    /// Like [`load_fn!`], but a missing symbol is `None` instead of a hard
+    /// failure: optional features degrade instead of killing NVML entirely.
+    macro_rules! load_opt_fn {
+        ($lib:expr, $ty:ty, $name:expr) => {{
+            let c_name = CString::new($name).ok()?;
+            let sym = unsafe { libc::dlsym($lib, c_name.as_ptr()) };
+            if sym.is_null() {
+                None
+            } else {
+                Some(unsafe { std::mem::transmute::<*mut c_void, $ty>(sym) })
+            }
         }};
     }
 
@@ -775,6 +966,21 @@ mod nvml {
                 "nvmlDeviceGetTemperatureThreshold"
             );
             let get_memory_info = load_fn!(lib, FnGetMemoryInfo, "nvmlDeviceGetMemoryInfo");
+            let get_compute_procs = load_opt_fn!(
+                lib,
+                FnGetRunningProcesses,
+                "nvmlDeviceGetComputeRunningProcesses_v3"
+            );
+            let get_graphics_procs = load_opt_fn!(
+                lib,
+                FnGetRunningProcesses,
+                "nvmlDeviceGetGraphicsRunningProcesses_v3"
+            );
+            let get_process_util = load_opt_fn!(
+                lib,
+                FnGetProcessUtilization,
+                "nvmlDeviceGetProcessUtilization"
+            );
 
             if unsafe { init() } != NVML_SUCCESS {
                 unsafe { libc::dlclose(lib) };
@@ -801,6 +1007,10 @@ mod nvml {
                 get_temperature,
                 get_temperature_threshold,
                 get_memory_info,
+                get_compute_procs,
+                get_graphics_procs,
+                get_process_util,
+                last_util_ts: AtomicU64::new(0),
             })
         }
 
@@ -899,6 +1109,110 @@ mod nvml {
                 (None, None)
             }
         }
+
+        /// The top GPU-using processes, ranked by utilization then VRAM use
+        /// (see [`super::rank_processes`]). Empty when nothing uses the GPU
+        /// or the driver does not export the process queries.
+        pub fn processes(&self, top: usize) -> Vec<GpuProcess> {
+            let mut merged: HashMap<u32, GpuProcess> = HashMap::new();
+            for get in [self.get_compute_procs, self.get_graphics_procs]
+                .into_iter()
+                .flatten()
+            {
+                // A process can hold both a compute and a graphics context;
+                // keep the largest reported memory (the two lists may report
+                // the same context).
+                for (pid, mem) in self.running_processes(get) {
+                    let e = merged.entry(pid).or_default();
+                    e.pid = pid;
+                    e.mem_bytes = e.mem_bytes.max(mem);
+                }
+            }
+            for (pid, util) in self.process_utilization() {
+                if let Some(p) = merged.get_mut(&pid) {
+                    p.util_percent = util;
+                }
+            }
+            super::rank_processes(merged.into_values().collect(), top)
+        }
+
+        /// `(pid, GPU memory bytes)` for one process list (compute or
+        /// graphics), using the documented sizing protocol: a first call
+        /// with a NULL buffer and count 0 answers with the number of
+        /// entries needed; the buffer is then oversize so a process
+        /// appearing in between cannot break the read.
+        fn running_processes(&self, get: FnGetRunningProcesses) -> Vec<(u32, u64)> {
+            let mut count: u32 = 0;
+            let rc = unsafe { (get)(self.device, &mut count, ptr::null_mut()) };
+            if rc == NVML_SUCCESS || rc != NVML_ERROR_INSUFFICIENT_SIZE {
+                // SUCCESS means no processes; anything else is an unexpected
+                // error: skip this list rather than fail the whole sample.
+                return Vec::new();
+            }
+            let cap = count.saturating_mul(2).saturating_add(5).clamp(1, 4096);
+            let mut buf = vec![NvmlProcessInfo::default(); cap as usize];
+            let mut n = cap;
+            if unsafe { (get)(self.device, &mut n, buf.as_mut_ptr()) } != NVML_SUCCESS {
+                return Vec::new();
+            }
+            buf.iter()
+                .take((n as usize).min(cap as usize))
+                .filter(|p| p.pid != 0)
+                .map(|p| {
+                    // NVML_VALUE_NOT_AVAILABLE (all bits set) when memory
+                    // reporting is unavailable (e.g. some drivers hide other
+                    // users' processes): show 0 rather than 18 exabytes.
+                    let mem = if p.used_gpu_memory == u64::MAX {
+                        0
+                    } else {
+                        p.used_gpu_memory
+                    };
+                    (p.pid, mem)
+                })
+                .collect()
+        }
+
+        /// Newest SM utilization percent per process. `lastSeenTimeStamp = 0`
+        /// means "since the last call" on current drivers, but a timestamp
+        /// cursor is kept anyway so each poll consumes each recorded sample
+        /// exactly once regardless of how the driver interprets 0.
+        fn process_utilization(&self) -> HashMap<u32, u32> {
+            let get = match self.get_process_util {
+                Some(f) => f,
+                None => return HashMap::new(),
+            };
+            let cursor = self.last_util_ts.load(Ordering::Relaxed);
+            let mut count: u32 = 0;
+            let rc = unsafe { (get)(self.device, ptr::null_mut(), &mut count, cursor) };
+            if rc == NVML_SUCCESS || rc != NVML_ERROR_INSUFFICIENT_SIZE {
+                return HashMap::new();
+            }
+            let cap = count.saturating_mul(2).saturating_add(5).clamp(1, 4096);
+            let mut buf = vec![NvmlProcessUtilizationSample::default(); cap as usize];
+            let mut n = cap;
+            if unsafe { (get)(self.device, buf.as_mut_ptr(), &mut n, cursor) } != NVML_SUCCESS {
+                return HashMap::new();
+            }
+            let mut newest_ts = cursor;
+            let mut newest: HashMap<u32, (u64, u32)> = HashMap::new();
+            for s in buf.iter().take((n as usize).min(cap as usize)) {
+                newest_ts = newest_ts.max(s.time_stamp);
+                newest
+                    .entry(s.pid)
+                    .and_modify(|(ts, u)| {
+                        if s.time_stamp >= *ts {
+                            *ts = s.time_stamp;
+                            *u = s.sm_util;
+                        }
+                    })
+                    .or_insert((s.time_stamp, s.sm_util));
+            }
+            self.last_util_ts.store(newest_ts, Ordering::Relaxed);
+            newest
+                .into_iter()
+                .map(|(pid, (_ts, util))| (pid, util))
+                .collect()
+        }
     }
 
     impl Drop for Nvml {
@@ -908,5 +1222,59 @@ mod nvml {
                 libc::dlclose(self.lib);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn proc(pid: u32, util: u32, mem: u64) -> GpuProcess {
+        GpuProcess {
+            pid,
+            name: String::new(),
+            mem_bytes: mem,
+            util_percent: util,
+        }
+    }
+
+    #[test]
+    fn rank_orders_by_utilization_then_memory_then_pid() {
+        // Highest utilization wins; ties fall back to VRAM, then pid.
+        let procs = vec![
+            proc(10, 10, 100),
+            proc(11, 50, 200),
+            proc(12, 50, 900), // same util as 11, more memory -> ahead
+            proc(13, 50, 900), // same util and memory as 12, higher pid -> behind
+            proc(14, 5, 100000),
+        ];
+        let top = rank_processes(procs, 3);
+        let pids: Vec<u32> = top.iter().map(|p| p.pid).collect();
+        assert_eq!(pids, vec![12, 13, 11]);
+    }
+
+    #[test]
+    fn rank_truncates_to_top_n() {
+        let procs = (0..10).map(|i| proc(100 + i, i, i as u64)).collect();
+        assert_eq!(rank_processes(procs, 3).len(), 3);
+    }
+
+    #[test]
+    fn rank_drops_own_and_zero_pids() {
+        // pid 0 (NVML placeholder) and the app's own pid are never listed,
+        // so the kill safeguard can never pick them.
+        let own = std::process::id();
+        let procs = vec![proc(0, 100, 1000), proc(own, 100, 1000), proc(77, 1, 1)];
+        let top = rank_processes(procs, 5);
+        assert_eq!(top.len(), 1);
+        assert_eq!(top[0].pid, 77);
+    }
+
+    #[test]
+    fn process_name_falls_back_for_unknown_pid() {
+        // A pid far outside the allocated range has no /proc entry.
+        assert_eq!(process_name(u32::MAX), "pid 4294967295");
+        // The current process always has a readable /proc/comm.
+        assert!(!process_name(std::process::id()).is_empty());
     }
 }
