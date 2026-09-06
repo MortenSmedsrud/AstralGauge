@@ -144,9 +144,10 @@ impl eframe::App for App {
 
         let window_secs = HORIZONS_MIN[self.window_idx as usize] as f64 * 60.0;
 
-        // Top bar with the settings button (gear), top right.
-        egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            // GPU name on the left, settings button (gear) on the right.
             ui.horizontal(|ui| {
+                ui.heading("ASUS 5090 ROG Astral");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
                         .add(
@@ -161,10 +162,6 @@ impl eframe::App for App {
                     }
                 });
             });
-        });
-
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("ASUS 5090 ROG Astral");
             ui.separator();
 
             // Total power: prefer NVML (same source as nvidia-smi),
