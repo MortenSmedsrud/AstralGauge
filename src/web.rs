@@ -63,6 +63,12 @@ pub(crate) struct WebData {
     /// with its age reference (seconds since `start`). Desktop-UI only (and
     /// deliberately not in the web JSON); the UI shows it only while fresh.
     pub(crate) kill_note: Option<(f64, String)>,
+    /// Latching critical-current notification: set by the poller on the
+    /// rising edge into the red range, shown (flashing) in both UIs until a
+    /// user acknowledges it — an "Acknowledge" click in the desktop UI or a
+    /// `POST /ack` on the web page. The current returning to normal never
+    /// clears it; the next red excursion arms it again.
+    pub(crate) critical_alert: bool,
 }
 
 impl WebData {
@@ -83,6 +89,7 @@ impl WebData {
             power_note: None,
             power_auth: AuthState::Idle,
             kill_note: None,
+            critical_alert: false,
         };
         // Pre-reserve history for the default 1 Hz sample rate so the common
         // case never reallocates; a faster slider setting just grows the vecs.
@@ -284,6 +291,25 @@ fn web_handle(mut stream: TcpStream, data: Arc<Mutex<WebData>>) {
                 None => web_respond(&mut stream, "503 Service Unavailable", "text/plain", "busy"),
             }
         }
+        ("POST", "/ack") => {
+            // Acknowledge the critical-current alert: clears the latching
+            // notification in both UIs. Same try-lock pattern as /data so a
+            // connection thread can never block the shutdown join.
+            let mut cleared = false;
+            for _ in 0..10 {
+                if let Ok(mut d) = data.try_lock() {
+                    d.critical_alert = false;
+                    cleared = true;
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            if cleared {
+                web_respond(&mut stream, "200 OK", "text/plain", "OK");
+            } else {
+                web_respond(&mut stream, "503 Service Unavailable", "text/plain", "busy");
+            }
+        }
         ("GET", _) => web_respond(&mut stream, "404 Not Found", "text/plain", "Not found"),
         _ => web_respond(
             &mut stream,
@@ -334,6 +360,8 @@ fn web_json(data: &WebData, window_secs: f64) -> String {
     out.push_str("]");
     out.push_str(",\"show_graphs\":");
     out.push_str(if data.show_graphs { "true" } else { "false" });
+    out.push_str(",\"critical_alert\":");
+    out.push_str(if data.critical_alert { "true" } else { "false" });
     out.push_str(",\"sample\":{\"pins\":[");
     for (i, p) in s.pins.iter().enumerate() {
         if i > 0 {
@@ -477,6 +505,10 @@ const INDEX_HTML: &str = r###"<!DOCTYPE html>
   h1 { font-size: 22px; margin: 10px 0 6px; }
   .stats { display: flex; flex-wrap: wrap; gap: 20px; font-size: 17px; font-weight: 600; }
   #power { font-size: 21px; }
+  #alert { display: none; align-items: center; flex-wrap: wrap; gap: 12px; color: #f03c3c; font-weight: 700; font-size: 16px; animation: blink 1s step-end infinite; }
+  #alert button { background: #4a1414; color: #f0d0d0; border: 1px solid #f03c3c; border-radius: 3px; padding: 4px 14px; font-size: 14px; font-weight: 700; cursor: pointer; }
+  #alert button:hover { background: #5f1a1a; }
+  @keyframes blink { 50% { opacity: 0.15; } }
   .line { margin: 8px 0; font-size: 14px; }
   .dim { color: #999; }
   .tables { display: flex; gap: 48px; margin: 10px 0 4px; }
@@ -506,6 +538,7 @@ const INDEX_HTML: &str = r###"<!DOCTYPE html>
   <h1>ASUS 5090 ROG Astral</h1>
   <div class="stats">
     <span id="power">Total power: …</span>
+    <span id="alert"><span>⚠ ALERT: critical current detected! Please check your GPU power cables!</span><button id="ackbtn" type="button">Acknowledge</button></span>
     <span id="temp"></span>
     <span id="vram"></span>
   </div>
@@ -727,8 +760,18 @@ function pinLabel(pin, value) {
   return 'Pin ' + String(pin).padStart(2) + ': ' + value.toFixed(3).padStart(7);
 }
 
+// Latching critical-current alert: shown while the poller has it armed,
+// dismissed only by the Acknowledge button (which POSTs /ack).
+const alertEl = document.getElementById('alert');
+document.getElementById('ackbtn').addEventListener('click', function () {
+  alertEl.style.display = 'none';
+  fetch('/ack', { method: 'POST' }).catch(function () {});
+});
+
 function render(d) {
   const s = d.sample;
+
+  alertEl.style.display = d.critical_alert ? 'inline-flex' : 'none';
 
   if (s.power_w != null) {
     document.getElementById('power').textContent = 'Total power: ' + s.power_w.toFixed(1) + ' W';
@@ -896,6 +939,7 @@ mod tests {
         d.power_range_max = Some(600.0);
         d.temp_range_max = Some(108.0);
         d.mem_range_max = Some(32.0);
+        d.critical_alert = true;
         let now = d.start.elapsed().as_secs_f64();
         for i in 0..NUM_PINS {
             for j in 0..10 {
@@ -916,8 +960,13 @@ mod tests {
     }
 
     fn http_get(port: u16, target: &str) -> String {
+        http_request("GET", port, target)
+    }
+
+    fn http_request(method: &str, port: u16, target: &str) -> String {
         let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
-        let req = format!("GET {target} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        let req =
+            format!("{method} {target} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
         stream.write_all(req.as_bytes()).unwrap();
         let mut out = Vec::new();
         stream.read_to_end(&mut out).unwrap();
@@ -935,6 +984,7 @@ mod tests {
         assert!(json.contains("\"temp_c\":55.0"));
         assert!(json.contains("\"mem_total_gb\":32.0"));
         assert!(json.contains("\"show_graphs\":true"));
+        assert!(json.contains("\"critical_alert\":true"));
         assert!(json.contains("\"poll_ms\":1000"));
         assert!(json.contains("\"limits\":[9.2,10.0]"));
         // Top process entry, with the process name JSON-escaped.
@@ -1003,11 +1053,20 @@ mod tests {
         let page = http_get(port, "/");
         assert!(page.starts_with("HTTP/1.1 200 OK"));
         assert!(page.contains("AstralGauge"));
+        assert!(page.contains("critical current detected"));
 
         let json_resp = http_get(port, "/data?window=60");
         assert!(json_resp.starts_with("HTTP/1.1 200 OK"));
         let body = json_resp.split("\r\n\r\n").nth(1).unwrap();
         assert!(body.contains("\"power_w\":300.5"));
+        assert!(body.contains("\"critical_alert\":true"));
+
+        // Acknowledging the critical alert clears the latching notification.
+        let ack = http_request("POST", port, "/ack");
+        assert!(ack.starts_with("HTTP/1.1 200 OK"));
+        assert!(!data.lock().unwrap().critical_alert);
+        let after_ack = http_get(port, "/data?window=60");
+        assert!(after_ack.contains("\"critical_alert\":false"));
 
         let not_found = http_get(port, "/nope");
         assert!(not_found.starts_with("HTTP/1.1 404"));

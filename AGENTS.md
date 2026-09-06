@@ -71,23 +71,30 @@ src/alerts.rs    LIMIT CHECKING + SOUNDS. `Settings` (limits + sound
                  safeguard flag), `Sound` (embedded WAV via `include_bytes!`
                  or a user-selected file), `AlertState` +
                  `over_limit_sound()` (edge + repeat decision logic),
-                 `KillGuardState` + `kill_guard_action()` (once-per-red-
-                 excursion kill edge, opt-in), `AutoPowerState` +
+                 `KillGuardState` + `kill_guard_action()` (opt-in kill on the
+                 red edge, repeating while red stays exceeded at most once
+                 per `KILL_REPEAT_COOLDOWN`, gated on the previous kill's
+                 sound still playing), `CriticalAlertState` +
+                 `critical_alert_edge()` (red rising edge that arms the
+                 latching critical notification), `AutoPowerState` +
                  `auto_power_action()` (automatic minimum-power-limit state
                  machine), `SoundPlayer` (rodio playback thread, priority-
-                 aware for the critical-terminating sound) and the
-                 shipped-sound default paths.
+                 aware for the critical-terminating sound, with
+                 `priority_sound_playing()` so the safeguard never cuts in on
+                 the kill sound) and the shipped-sound default paths.
 src/web.rs       WEB SERVER + SHARED STATE. `WebData` (latest sample —
                  including the top GPU processes, served as the JSON
                  `processes` array — histories, mirrored UI settings),
                  `WebData::record()`
                  (sample ingestion + history pruning), `WebServer` /
                  `WebState` lifecycle, the tiny HTTP server
-                 (`GET /` → page, `GET /data?window=SECS` → JSON),
+                 (`GET /` → page, `GET /data?window=SECS` → JSON,
+                 `POST /ack` → acknowledge the critical alert),
                  hand-rolled JSON serialization, and `INDEX_HTML`
                  (the whole single-page web UI, JS included).
 src/ui.rs        DESKTOP UI. `App` (eframe::App::update: main window with
-                 the "Top GPU processes" list, settings dialog, graphs),
+                 the "Top GPU processes" list, the flashing critical-current
+                 banner next to the total power, settings dialog, graphs),
                  `Config` (everything the settings panel edits: limits,
                  sounds, sample interval, web server, critical-alert
                  safeguard — new app-wide settings go here), `FileDialog`
@@ -109,12 +116,14 @@ critical sections are short — keep them that way:
    loops: drain `Cmd` channel (`SetLimit`/`Interval`) → read NVML + pins +
    top GPU processes → lock the data, read `settings`, `record(sample)` →
    run `alerts::over_limit_sound` outside the lock (evaluated, not played
-   yet) → on a red rising edge with the kill safeguard on,
-   `alerts::kill_guard_action` SIGKILLs the top-ranked process (the outcome
-   lands in `WebData::kill_note`, GUI-only) → play: a successful termination
-   sends the critical-terminating sound via `SoundPlayer::play_priority`
-   (replacing that excursion's red alert); otherwise the pending alert
-   sound plays.
+   yet) → on a red rising edge, set `WebData::critical_alert` (the latching
+   notification) → with the kill safeguard on, `alerts::kill_guard_action`
+   SIGKILLs the top-ranked process on the red edge and repeats while the
+   current stays red at most once per `KILL_REPEAT_COOLDOWN` (5 s) — never
+   while the previous kill's sound is still playing; the outcome lands in
+   `WebData::kill_note`, GUI-only → play: a successful termination sends the
+   critical-terminating sound via `SoundPlayer::play_priority` (replacing
+   that excursion's red alert); otherwise the pending alert sound plays.
    Monitored data keeps flowing while the window is minimized.
 2. **Audio thread** (`alerts::SoundPlayer`): owns the rodio
    `OutputStream`/`Sink` (created lazily on first play; absence of audio is
@@ -138,7 +147,8 @@ critical sections are short — keep them that way:
    degrades to an error note, never a crash.
 4. **Web server thread(s)** (`web::web_serve` + one thread per connection):
    `try_lock` with retry → 503 on contention so a GUI frame can never
-   deadlock against the server-thread join at shutdown.
+   deadlock against the server-thread join at shutdown (both `/data` and
+   `POST /ack` follow this pattern).
 5. **GUI thread** (`ui::App::update`): renders from `WebData`, mirrors the
    UI-side settings into it (`poll_ms`, `show_graphs`, `settings`), sends
    `Cmd`s to the poller (`SetLimit`, `Interval`, `GrantPowerAccess`).
@@ -172,10 +182,14 @@ context). Shown in the main window and the web page.
 Optional (`Settings::kill_top_process_on_red`, default off, settings dialog
 "Critical-alert safeguard"):
 
-- Rising edge into the red range: SIGKILL the **first entry of that list**
-  (once per excursion — never repeated while the limit stays exceeded;
-  re-entering red fires again; enabling it mid-excursion does not kill
-  retroactively).
+- Rising edge into the red range: SIGKILL the **first entry of that list**,
+  and **keep killing while the current stays red**, at most once per
+  `alerts::KILL_REPEAT_COOLDOWN` (5 s). A kill is additionally held back
+  while the previous kill's terminating sound is still playing
+  (`SoundPlayer::priority_sound_playing`). The cooldown runs between any two
+  kills (so oscillating around the red threshold cannot become a kill loop);
+  enabling the option mid-excursion still never kills retroactively — a
+  repeat only ever follows a kill this excursion already started.
 - Needs **no privileges**: `kill()` only reaches processes of the app's own
   user (others answer EPERM — logged, not fatal), which deliberately bounds
   the blast radius; the root power helper is never reachable by it either.
@@ -188,6 +202,22 @@ Optional (`Settings::kill_top_process_on_red`, default off, settings dialog
   requests, nothing interrupts it, and it **replaces** the red alert sound
   of the same excursion (a failed kill plays the regular red alert
   instead).
+
+## Latching critical-current notification
+
+Independent of the kill safeguard: on the red rising edge
+(`alerts::critical_alert_edge`) the poller sets `WebData::critical_alert`.
+Both UIs then show a **flashing red** banner to the right of the total-power
+readout ("⚠ ALERT: critical current detected! Please check your GPU power
+cables!") with an **Acknowledge** button that appears and disappears with it
+(`ui.rs` ↔ `INDEX_HTML`, kept in sync; the web one POSTs `/ack`).
+
+- **User-dismissal only:** power returning to normal never hides it; the
+  desktop button and `POST /ack` are the only ways it clears, and the next
+  red excursion shows it again.
+- Mirrored in the web JSON as `critical_alert`; the desktop blink animates
+  via `ALERT_BLINK_SECS` and forces 250 ms idle repaints while shown (the
+  web page blinks with a CSS `step-end` keyframe).
 
 ## Automatic minimum power limit (`alerts::auto_power_action`)
 
@@ -243,18 +273,20 @@ Optional (`Settings::auto_min_power` = Off / On yellow / On red):
 
 ## Tests
 
-`cargo test` (17 tests, no GPU/display needed):
+`cargo test` (18 tests, no GPU/display needed):
 
 - `alerts::tests`: settings defaults; embedded WAVs decode; alert edge
   triggering; 15 s repeat-while-exceeded behavior; powering-down sound
   switch with auto power; auto-power lower/restore edges and bounds;
-  kill-guard once-per-excursion behavior; priority requests outranking
-  normal playback requests.
+  kill-guard repeat-while-red behavior with the 5 s cooldown and kill-sound
+  gating; critical-notification red-edge triggering; priority requests
+  outranking normal playback requests.
 - `hardware::tests`: process ranking (utilization/memory/pid order,
   truncation, own + zero pid exclusion) and `/proc` name fallback.
-- `web::tests`: JSON field content (incl. process entries and name
-  escaping), `record()` history append/prune/range caching, query-param
-  parsing, HTTP server serve/404/busy-port/restart.
+- `web::tests`: JSON field content (incl. process entries, name escaping and
+  the latching `critical_alert` flag), `record()` history append/prune/range
+  caching, query-param parsing, HTTP server serve/404/busy-port/restart and
+  the `POST /ack` dismissal.
 
 Tests that bind ports use `free_port()` (bind :0, drop, reuse).
 

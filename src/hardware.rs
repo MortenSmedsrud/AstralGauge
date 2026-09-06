@@ -22,8 +22,8 @@ use std::thread;
 use std::time::Duration;
 
 use crate::alerts::{
-    auto_power_action, kill_guard_action, over_limit_sound, AlertState, AutoPowerState,
-    KillGuardState, SoundPlayer,
+    auto_power_action, critical_alert_edge, kill_guard_action, over_limit_sound, AlertState,
+    AutoPowerState, CriticalAlertState, KillGuardState, SoundPlayer,
 };
 use crate::web::WebData;
 
@@ -391,6 +391,7 @@ pub(crate) fn spawn_poller(
         let mut power_helper = PowerHelper::new();
         let mut auto_power = AutoPowerState::default();
         let mut kill_guard = KillGuardState::default();
+        let mut critical_state = CriticalAlertState::default();
 
         loop {
             // Handle UI commands
@@ -523,12 +524,27 @@ pub(crate) fn spawn_poller(
             // replaces the critical alert (see the priority sound below).
             let alert_sound = over_limit_sound(&mut alert_state, max_current, &settings);
 
+            // The red rising edge also arms the latching critical-current
+            // notification (flashing banner in both UIs). It only ever gets
+            // cleared by a user acknowledgment, never by the current dropping.
+            if critical_alert_edge(&mut critical_state, max_current, &settings) {
+                data.lock().unwrap().critical_alert = true;
+            }
+
             // Critical-alert safeguard (opt-in, see alerts::kill_guard_action):
-            // on the rising edge into the red range, SIGKILL the top GPU-using
-            // process. Kills need no privileges (same-user processes only);
-            // the outcome goes to stderr and (freshly) into the desktop UI.
+            // on the rising edge into the red range — and then repeating while
+            // the current stays red, at most once per cooldown and never over
+            // a still-playing kill sound — SIGKILL the top GPU-using process.
+            // Kills need no privileges (same-user processes only); the outcome
+            // goes to stderr and (freshly) into the desktop UI.
             let mut terminated = false;
-            if kill_guard_action(&mut kill_guard, max_current, &settings) {
+            if kill_guard_action(
+                &mut kill_guard,
+                max_current,
+                &settings,
+                player.priority_sound_playing(),
+            ) {
+                kill_guard.note_kill_attempt();
                 match top_process {
                     Some(p) => {
                         let note = match kill_process(p.pid) {

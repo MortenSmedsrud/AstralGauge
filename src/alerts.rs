@@ -3,13 +3,16 @@
 //! [`Settings`] holds the yellow/red current limits and the sound
 //! configuration used across the app. [`over_limit_sound`] folds one poll
 //! sample's maximum pin current into the latched alert state and decides
-//! which (if any) alert sound should play now. [`SoundPlayer`] owns a rodio
-//! output thread that plays the queued sounds, one at a time.
+//! which (if any) alert sound should play now. [`critical_alert_edge`] and
+//! [`kill_guard_action`] derive the latching UI notification and the
+//! critical-alert kill safeguard's actions from the same current. [`SoundPlayer`]
+//! owns a rodio output thread that plays the queued sounds, one at a time.
 
 use std::fs::File;
 use std::io::{BufReader, Cursor};
 use std::path::PathBuf;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -30,6 +33,12 @@ pub(crate) const ALERT_REPEAT_DELAY: Duration = Duration::from_secs(15);
 /// level before the previously saved power limit is restored (hysteresis
 /// against flapping right at the threshold).
 pub(crate) const AUTO_POWER_RESTORE_DELAY: Duration = Duration::from_secs(30);
+
+/// Minimum time between two critical-alert safeguard kills while the current
+/// stays in the red range (a kill loop faster than this is worse than the
+/// excursion). Additionally, a kill never interrupts a still-playing
+/// critical-terminating sound of the previous kill.
+pub(crate) const KILL_REPEAT_COOLDOWN: Duration = Duration::from_secs(5);
 
 /// When the power management limit should be automatically lowered to its
 /// hardware minimum (requires the privileged power helper, see
@@ -262,30 +271,79 @@ fn active_sound(sound: &Sound, s: &Settings, over_red: bool) -> Sound {
 }
 
 /// Critical-alert safeguard state carried across poll samples: whether the
-/// red range is currently latched (so entering it counts as a rising edge).
+/// red range is currently latched (so entering it counts as a rising edge)
+/// and when the safeguard last fired (start of the repeat cooldown).
 #[derive(Default)]
 pub(crate) struct KillGuardState {
     latched_red: bool,
+    last_kill: Option<Instant>,
+}
+
+impl KillGuardState {
+    /// Start the repeat cooldown after the poller attempted a kill (whether
+    /// or not it succeeded: a targetless or refused kill must not be retried
+    /// every poll).
+    pub(crate) fn note_kill_attempt(&mut self) {
+        self.last_kill = Some(Instant::now());
+    }
 }
 
 /// Fold one sample's maximum pin current into the critical-alert safeguard
 /// state and return whether the top GPU-using process should be killed now.
 ///
-/// Only fires while [`Settings::kill_top_process_on_red`] is enabled, and
-/// once per red excursion: on the rising edge into the red range. Staying
-/// in the range never repeats the kill (a runaway kill loop is worse than
-/// the excursion), and re-entering it fires again. The latch follows the
-/// red range continuously, so enabling the option mid-excursion does not
-/// kill retroactively either — only a fresh excursion does.
+/// Only fires while [`Settings::kill_top_process_on_red`] is enabled. It
+/// fires on the rising edge into the red range and then **repeats while the
+/// current stays red**, at most once per [`KILL_REPEAT_COOLDOWN`]. A kill is
+/// also held back while `kill_sound_playing` is true: the previous kill's
+/// critical-terminating sound must never be interrupted. The cooldown runs
+/// between any two kills (so oscillating around the threshold cannot turn
+/// into a kill loop), and the latch follows the red range continuously, so
+/// enabling the option mid-excursion does not kill retroactively — only a
+/// fresh edge (or a repeat of a kill this excursion already made) does.
 pub(crate) fn kill_guard_action(
     state: &mut KillGuardState,
     max_current: f64,
     s: &Settings,
+    kill_sound_playing: bool,
 ) -> bool {
     let over_red = max_current >= s.red_limit_a as f64;
-    let fire = over_red && !state.latched_red && s.kill_top_process_on_red;
+    let rising = over_red && !state.latched_red;
+    let due = state
+        .last_kill
+        .is_none_or(|t| t.elapsed() >= KILL_REPEAT_COOLDOWN);
+    // First kill of an excursion on its rising edge; afterwards, repeats are
+    // driven by the cooldown alone (never retroactively when the option gets
+    // enabled while already in the red range).
+    let fire = s.kill_top_process_on_red
+        && over_red
+        && !kill_sound_playing
+        && due
+        && (rising || state.last_kill.is_some());
     state.latched_red = over_red;
     fire
+}
+
+/// Critical-alert notification state carried across poll samples: whether the
+/// red range is currently latched, so re-entering it is a fresh alert edge.
+#[derive(Default)]
+pub(crate) struct CriticalAlertState {
+    latched_red: bool,
+}
+
+/// Fold one sample's maximum pin current into the critical-alert notification
+/// state and return whether the critical alert just *triggered* (rising edge
+/// into the red range). That edge shows the latching "critical current"
+/// notification in the UIs; only a user acknowledgment clears it, and the
+/// next red excursion arms it again.
+pub(crate) fn critical_alert_edge(
+    state: &mut CriticalAlertState,
+    max_current: f64,
+    s: &Settings,
+) -> bool {
+    let over_red = max_current >= s.red_limit_a as f64;
+    let rising = over_red && !state.latched_red;
+    state.latched_red = over_red;
+    rising
 }
 
 /// Automatic-power-limit state carried across poll samples: the limit to
@@ -396,6 +454,10 @@ fn next_request(current: SoundRequest, next: SoundRequest) -> SoundRequest {
 /// (headless session, missing device, undecodable file).
 pub(crate) struct SoundPlayer {
     tx: mpsc::Sender<SoundRequest>,
+    /// Set while a priority (critical-terminating) sound is playing; lets the
+    /// poller hold back the next safeguard kill instead of cutting the
+    /// previous kill's sound in on.
+    priority_playing: Arc<AtomicBool>,
 }
 
 impl SoundPlayer {
@@ -404,8 +466,19 @@ impl SoundPlayer {
     /// (or fail on) audio initialization.
     pub(crate) fn spawn() -> SoundPlayer {
         let (tx, rx) = mpsc::channel();
-        thread::spawn(move || audio_loop(rx));
-        SoundPlayer { tx }
+        let priority_playing = Arc::new(AtomicBool::new(false));
+        let flag = priority_playing.clone();
+        thread::spawn(move || audio_loop(rx, flag));
+        SoundPlayer {
+            tx,
+            priority_playing,
+        }
+    }
+
+    /// Whether the critical-terminating (priority) sound is playing right
+    /// now. False when no audio output exists at all.
+    pub(crate) fn priority_sound_playing(&self) -> bool {
+        self.priority_playing.load(Ordering::SeqCst)
     }
 
     /// Queue a sound for playback. Sounds play one at a time; while one is
@@ -428,7 +501,7 @@ impl SoundPlayer {
     }
 }
 
-fn audio_loop(rx: mpsc::Receiver<SoundRequest>) {
+fn audio_loop(rx: mpsc::Receiver<SoundRequest>, priority_playing: Arc<AtomicBool>) {
     // rodio stops playback when the output stream is dropped, so the session
     // lives for the whole thread; it is None until the first successful try.
     let mut session: Option<(OutputStream, Sink)> = None;
@@ -485,8 +558,15 @@ fn audio_loop(rx: mpsc::Receiver<SoundRequest>) {
                 // Blocks until this sound finished, so only one plays at a
                 // time; the next queued file is picked up by the loop above.
                 Ok(source) => {
+                    let priority = request.priority;
+                    if priority {
+                        priority_playing.store(true, Ordering::SeqCst);
+                    }
                     sink.append(source);
                     sink.sleep_until_end();
+                    if priority {
+                        priority_playing.store(false, Ordering::SeqCst);
+                    }
                 }
                 Err(msg) => eprintln!("Cannot play alert sound: {msg}"),
             }
@@ -666,7 +746,7 @@ mod tests {
     }
 
     #[test]
-    fn kill_guard_fires_once_per_red_excursion() {
+    fn kill_guard_repeats_while_red_with_cooldown() {
         let mut s = Settings::default();
         let mut state = KillGuardState::default();
         s.red_sound_enabled = true;
@@ -675,25 +755,69 @@ mod tests {
         let green = s.yellow_limit_a as f64 - 1.0;
 
         // Disabled: entering and staying in red never kills.
-        assert!(!kill_guard_action(&mut state, red, &s));
-        assert!(!kill_guard_action(&mut state, red, &s));
+        assert!(!kill_guard_action(&mut state, red, &s, false));
+        assert!(!kill_guard_action(&mut state, red, &s, false));
 
-        // Enabled mid-excursion: the red range is already latched, so no
-        // retroactive kill; the next fresh excursion is what fires.
+        // Enabled mid-excursion: the red range is already latched and this
+        // excursion has not killed yet, so no retroactive kill.
         s.kill_top_process_on_red = true;
-        assert!(!kill_guard_action(&mut state, red, &s));
+        assert!(!kill_guard_action(&mut state, red, &s, false));
 
         // Leave red (yellow does not fire, it is not the trigger range),
-        // then a new red excursion kills once and never repeats.
-        assert!(!kill_guard_action(&mut state, yellow, &s));
-        assert!(kill_guard_action(&mut state, red, &s));
-        assert!(!kill_guard_action(&mut state, red, &s));
-        assert!(!kill_guard_action(&mut state, yellow, &s));
+        // then a new red excursion fires on the rising edge.
+        assert!(!kill_guard_action(&mut state, yellow, &s, false));
+        assert!(kill_guard_action(&mut state, red, &s, false));
+        state.note_kill_attempt();
 
-        // Re-entering red fires again; the green range keeps state reset.
-        assert!(kill_guard_action(&mut state, red, &s));
-        assert!(!kill_guard_action(&mut state, green, &s));
-        assert!(kill_guard_action(&mut state, red, &s));
+        // Still red: no repeat before the cooldown elapsed.
+        assert!(!kill_guard_action(&mut state, red, &s, false));
+        // Once the kill sound finished and the cooldown expired, it repeats.
+        state.last_kill = Some(Instant::now() - KILL_REPEAT_COOLDOWN);
+        assert!(!kill_guard_action(&mut state, red, &s, true)); // sound still playing
+        state.last_kill = Some(Instant::now() - KILL_REPEAT_COOLDOWN);
+        assert!(kill_guard_action(&mut state, red, &s, false));
+        state.note_kill_attempt();
+        state.last_kill = Some(Instant::now() - KILL_REPEAT_COOLDOWN);
+        assert!(kill_guard_action(&mut state, red, &s, false));
+        state.note_kill_attempt();
+
+        // Leaving red stops the repeats (the cooldown never runs while
+        // green), and re-entering respects it too: within the cooldown the
+        // fresh edge waits, then fires.
+        assert!(!kill_guard_action(&mut state, yellow, &s, false));
+        assert!(!kill_guard_action(&mut state, red, &s, false));
+        state.last_kill = Some(Instant::now() - KILL_REPEAT_COOLDOWN);
+        assert!(kill_guard_action(&mut state, red, &s, false));
+        state.note_kill_attempt();
+        assert!(!kill_guard_action(&mut state, green, &s, false));
+        assert!(!kill_guard_action(&mut state, red, &s, false)); // in cooldown
+
+        // Disabling the safeguard stops it again, even while red.
+        state.last_kill = Some(Instant::now() - KILL_REPEAT_COOLDOWN);
+        s.kill_top_process_on_red = false;
+        assert!(!kill_guard_action(&mut state, red, &s, false));
+    }
+
+    #[test]
+    fn critical_alert_triggers_on_red_edges() {
+        let s = Settings::default();
+        let mut state = CriticalAlertState::default();
+        let red = s.red_limit_a as f64 + 0.5;
+        let yellow = (s.yellow_limit_a + s.red_limit_a) as f64 / 2.0;
+        let green = s.yellow_limit_a as f64 - 1.0;
+
+        // Only the rising edge into the red range triggers the notification;
+        // it never re-triggers while the excursion lasts (the latching UI
+        // state is cleared by the user, not by this state machine).
+        assert!(!critical_alert_edge(&mut state, green, &s));
+        assert!(!critical_alert_edge(&mut state, yellow, &s));
+        assert!(critical_alert_edge(&mut state, red, &s));
+        assert!(!critical_alert_edge(&mut state, red, &s));
+        assert!(!critical_alert_edge(&mut state, yellow, &s));
+        assert!(!critical_alert_edge(&mut state, green, &s));
+
+        // A fresh excursion is a fresh trigger.
+        assert!(critical_alert_edge(&mut state, red, &s));
     }
 
     #[test]

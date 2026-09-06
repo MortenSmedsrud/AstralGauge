@@ -21,6 +21,12 @@ pub(crate) const HORIZONS_MIN: [u32; 6] = [1, 5, 10, 15, 30, 60];
 /// Seconds a critical-alert safeguard note stays visible in the main window.
 const KILL_NOTE_TTL_SECS: f64 = 60.0;
 
+/// Critical-current alert blink period (s) and the idle repaint interval
+/// (ms) while it flashes: repaints run at least twice per blink half-period
+/// so the flash stays crisp even with a slow sample interval.
+const ALERT_BLINK_SECS: f64 = 0.5;
+const ALERT_REPAINT_MS: u64 = 250;
+
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 
 fn current_color(current: f64, s: &Settings) -> egui::Color32 {
@@ -274,7 +280,35 @@ impl eframe::App for App {
                     format!("Total power: {:.1} W (estimated)", est)
                 }
             };
-            ui.label(egui::RichText::new(power_text).strong().size(20.0));
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new(power_text).strong().size(20.0));
+
+                // Latching critical-current notification: flashing while the
+                // poller has it armed, dismissed only by this button (which
+                // disappears together with it). Power returning to normal
+                // never clears it; the next red excursion shows it again.
+                if data.critical_alert {
+                    ui.add_space(16.0);
+                    let bright = (now / ALERT_BLINK_SECS) as u64 % 2 == 0;
+                    let color = if bright {
+                        egui::Color32::from_rgb(255, 70, 70)
+                    } else {
+                        egui::Color32::from_rgb(110, 25, 25)
+                    };
+                    ui.label(
+                        egui::RichText::new(
+                            "\u{26a0} ALERT: critical current detected! \
+                             Please check your GPU power cables!",
+                        )
+                        .strong()
+                        .color(color)
+                        .size(15.0),
+                    );
+                    if ui.button("Acknowledge").clicked() {
+                        data.critical_alert = false;
+                    }
+                }
+            });
 
             // GPU temperature and VRAM (NVML)
             let mut gpu_texts: Vec<String> = Vec::new();
@@ -882,10 +916,16 @@ replaces the critical alert sound of that same excursion.",
             self.file_dialog = None;
         }
 
-        // Redraw about as fast as the data arrives when idle.
+        // Redraw about as fast as the data arrives when idle, and fast
+        // enough to keep the critical alert's flash animating while it shows.
         // Input events (slider drags, checkbox, window moves) still trigger
         // immediate repaints, so the UI stays fully responsive.
-        ctx.request_repaint_after(Duration::from_millis(self.config.poll_ms));
+        let idle_ms = if data.critical_alert {
+            self.config.poll_ms.min(ALERT_REPAINT_MS)
+        } else {
+            self.config.poll_ms
+        };
+        ctx.request_repaint_after(Duration::from_millis(idle_ms));
     }
 }
 
