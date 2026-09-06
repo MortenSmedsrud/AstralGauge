@@ -83,7 +83,8 @@ pub(crate) struct App {
 /// Every field is persisted to the settings file (see [`crate::persist`]):
 /// loaded by [`App::new`] on startup and written again whenever the panel
 /// accepts a change (or a denied power authentication rolls a saved option
-/// back).
+/// back). The panel's "Reset defaults" button restores [`Config::defaults`]
+/// into the draft — the settings as they were before persistence existed.
 #[derive(Clone, PartialEq)]
 struct Config {
     /// Per-pin current limits and alert sounds.
@@ -96,6 +97,29 @@ struct Config {
     web_enabled: bool,
     /// Web server port.
     web_port: String,
+}
+
+impl Config {
+    /// The settings the app shipped with, before persistence existed: every
+    /// built-in default. What "Reset defaults" restores.
+    fn defaults() -> Config {
+        Config {
+            alerts: Settings::default(),
+            poll_ms: DEFAULT_POLL_MS,
+            web_enabled: false,
+            web_port: DEFAULT_WEB_PORT.to_string(),
+        }
+    }
+
+    /// The persisted form of these settings (see [`crate::persist`]).
+    fn stored(&self) -> persist::StoredSettings {
+        persist::StoredSettings {
+            alerts: self.alerts.clone(),
+            poll_ms: self.poll_ms,
+            web_enabled: self.web_enabled,
+            web_port: self.web_port.clone(),
+        }
+    }
 }
 
 /// Append to the one-shot warning rather than replacing it, so several
@@ -115,12 +139,7 @@ impl App {
     pub(crate) fn new(cmd_tx: mpsc::Sender<Cmd>, data: Arc<Mutex<WebData>>) -> App {
         // Load the settings saved by the previous run (see `persist`);
         // a corrupt file is reported and the defaults take over.
-        let defaults = persist::StoredSettings {
-            alerts: Settings::default(),
-            poll_ms: DEFAULT_POLL_MS,
-            web_enabled: false,
-            web_port: DEFAULT_WEB_PORT.to_string(),
-        };
+        let defaults = Config::defaults().stored();
         let to_config = |stored: persist::StoredSettings| Config {
             alerts: stored.alerts,
             poll_ms: stored.poll_ms,
@@ -319,12 +338,7 @@ impl eframe::App for App {
                         // Persist the rollback: the option is off now (it was
                         // denied at startup or when enabled), and it must not
                         // silently ask for root again on the next run.
-                        if let Err(e) = persist::save(&persist::StoredSettings {
-                            alerts: self.config.alerts.clone(),
-                            poll_ms: self.config.poll_ms,
-                            web_enabled: self.config.web_enabled,
-                            web_port: self.config.web_port.clone(),
-                        }) {
+                        if let Err(e) = persist::save(&self.config.stored()) {
                             eprintln!("Could not save the rolled-back settings: {e}");
                         }
                         self.warning = Some(
@@ -885,7 +899,8 @@ replaces the critical alert sound of that same excursion.",
                     ui.separator();
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         // Right-to-left: added first = rightmost, so Accept
-                        // ends up to the left of Cancel.
+                        // ends up to the left of Cancel and the reset button
+                        // is leftmost of the row.
                         if ui.button("Cancel").clicked() {
                             cancel = true;
                         }
@@ -895,6 +910,23 @@ replaces the critical alert sound of that same excursion.",
                                 egui::Button::new(egui::RichText::new("Accept").strong()),
                             )
                             .clicked();
+                        // Restores every setting to its built-in default in
+                        // the draft (limits, sounds, automatic power limit,
+                        // safeguard, interval, web server); Accept commits
+                        // and persists the reset, Cancel still discards it.
+                        let already_default = *draft == Config::defaults();
+                        if ui
+                            .add_enabled(!already_default, egui::Button::new("Reset defaults"))
+                            .on_hover_text(if already_default {
+                                "The settings shown are already the defaults."
+                            } else {
+                                "Restore every setting to its built-in default.\
+Apply the reset with Accept, discard it with Cancel."
+                            })
+                            .clicked()
+                        {
+                            *draft = Config::defaults();
+                        }
                     });
                 });
             if !open {
@@ -950,12 +982,7 @@ replaces the critical alert sound of that same excursion.",
                 // Persist the accepted settings (the applied state, after
                 // any web start/stop rollback above). Save errors surface in
                 // the same warning dialog as other Accept failures.
-                if let Err(e) = persist::save(&persist::StoredSettings {
-                    alerts: self.config.alerts.clone(),
-                    poll_ms: self.config.poll_ms,
-                    web_enabled: self.config.web_enabled,
-                    web_port: self.config.web_port.clone(),
-                }) {
+                if let Err(e) = persist::save(&self.config.stored()) {
                     add_warning(
                         &mut self.warning,
                         format!("Settings were applied, but could not be saved: {e}"),

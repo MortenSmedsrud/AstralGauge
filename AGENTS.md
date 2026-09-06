@@ -113,7 +113,9 @@ src/ui.rs        DESKTOP UI. `App` (eframe::App::update: main window with
                  sounds, sample interval, web server, critical-alert
                  safeguard — new app-wide settings go here; every field is
                  persisted by `persist` — loaded in `App::new`, saved on
-                 Accept), `FileDialog`
+                 Accept; its "Reset defaults" button restores
+                 `Config::defaults()` (the pre-persistence built-in
+                 defaults) into the draft for Accept to commit), `FileDialog`
                  (built-in .wav picker), `add_pin_graph`,
                  `add_metric_graph`, `draw_hover_readout`, colors.
 sound/           Shipped alert WAVs, embedded into the binary at compile
