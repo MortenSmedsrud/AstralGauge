@@ -242,6 +242,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "astral-gauge"
+version = "0.1.0"
+dependencies = [
+ "eframe",
+ "libc",
+ "rodio",
+]
+
+[[package]]
 name = "async-broadcast"
 version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2605,15 +2614,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0103b1cef7ec0cf76490e969665504990193874ea05c85ff9bab8b911d0a0564"
 dependencies = [
  "zerovec",
-]
-
-[[package]]
-name = "power-monitor"
-version = "0.1.0"
-dependencies = [
- "eframe",
- "libc",
- "rodio",
 ]
 
 [[package]]

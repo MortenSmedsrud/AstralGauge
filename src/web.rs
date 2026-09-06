@@ -419,7 +419,7 @@ const INDEX_HTML: &str = r###"<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Power Monitor</title>
+<title>AstralGauge</title>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
@@ -761,7 +761,7 @@ async function tick() {
     fails = 0;
     showErr('');
   } catch (e) {
-    if (++fails >= 5) showErr('Cannot reach the power monitor. Is the web interface enabled?');
+    if (++fails >= 5) showErr('Cannot reach AstralGauge. Is the web interface enabled?');
   }
 }
 setInterval(tick, 1000);
@@ -921,7 +921,7 @@ mod tests {
         let server = WebServer::start(port, data.clone()).unwrap();
         let page = http_get(port, "/");
         assert!(page.starts_with("HTTP/1.1 200 OK"));
-        assert!(page.contains("Power Monitor"));
+        assert!(page.contains("AstralGauge"));
 
         let json_resp = http_get(port, "/data?window=60");
         assert!(json_resp.starts_with("HTTP/1.1 200 OK"));

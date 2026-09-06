@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Context for AI agents (and humans) working on **PowerMonitor**.
+Context for AI agents (and humans) working on **AstralGauge** (formerly PowerMonitor).
 
 ## What this app is
 

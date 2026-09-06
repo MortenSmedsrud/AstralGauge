@@ -1,4 +1,4 @@
-//! Power Monitor: watches the six 12VHPWR rails of an ASUS RTX 5090 ROG
+//! AstralGauge: watches the six 12VHPWR rails of an ASUS RTX 5090 ROG
 //! Astral through its IT8915FN monitoring chip (I2C), alongside NVML GPU
 //! metrics, and alerts when the per-pin current limits are exceeded.
 //!
@@ -31,7 +31,7 @@ fn main() {
         Some(bus) => bus,
         None => {
             eprintln!("Warning: auto-detect failed. Defaulting to bus 0.");
-            eprintln!("Pass the bus number explicitly, e.g.: power-monitor 15");
+            eprintln!("Pass the bus number explicitly, e.g.: astral-gauge 15");
             0
         }
     };
@@ -58,7 +58,7 @@ fn main() {
 
     let app = ui::App::new(cmd_tx, data);
 
-    if let Err(e) = eframe::run_native("Power Monitor", options, Box::new(|_cc| Ok(Box::new(app))))
+    if let Err(e) = eframe::run_native("AstralGauge", options, Box::new(|_cc| Ok(Box::new(app))))
     {
         eprintln!("eframe error: {e}");
         std::process::exit(1);
