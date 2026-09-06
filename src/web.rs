@@ -357,7 +357,7 @@ fn web_json(data: &WebData, window_secs: f64) -> String {
         "{:.1},{:.1}",
         data.settings.yellow_limit_a, data.settings.red_limit_a
     ));
-    out.push_str("]");
+    out.push(']');
     out.push_str(",\"show_graphs\":");
     out.push_str(if data.show_graphs { "true" } else { "false" });
     out.push_str(",\"critical_alert\":");

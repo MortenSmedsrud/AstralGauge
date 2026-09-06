@@ -641,9 +641,11 @@ mod tests {
 
     #[test]
     fn over_limit_sound_edge_triggers() {
-        let mut s = Settings::default();
-        s.yellow_sound_enabled = true;
-        s.red_sound_enabled = true;
+        let mut s = Settings {
+            yellow_sound_enabled: true,
+            red_sound_enabled: true,
+            ..Default::default()
+        };
         let mut st = AlertState::default();
         // Below yellow: nothing.
         assert_eq!(over_limit_sound(&mut st, 5.0, &s), None);
@@ -676,8 +678,10 @@ mod tests {
 
     #[test]
     fn auto_power_lowers_on_yellow_and_restores() {
-        let mut s = Settings::default();
-        s.auto_min_power = AutoMinPower::OnYellow;
+        let mut s = Settings {
+            auto_min_power: AutoMinPower::OnYellow,
+            ..Default::default()
+        };
         let mut st = AutoPowerState::default();
         // Below yellow: nothing. Yellow triggers a lowering to the minimum.
         assert_eq!(
@@ -723,8 +727,10 @@ mod tests {
 
     #[test]
     fn auto_power_red_trigger_and_bounds() {
-        let mut s = Settings::default();
-        s.auto_min_power = AutoMinPower::OnRed;
+        let s = Settings {
+            auto_min_power: AutoMinPower::OnRed,
+            ..Default::default()
+        };
         let mut st = AutoPowerState::default();
         // OnRed does not react to yellow currents.
         assert_eq!(
@@ -822,8 +828,10 @@ mod tests {
 
     #[test]
     fn over_limit_sound_repeats_after_delay() {
-        let mut s = Settings::default();
-        s.yellow_sound_enabled = true;
+        let s = Settings {
+            yellow_sound_enabled: true,
+            ..Default::default()
+        };
         let mut st = AlertState::default();
         assert_eq!(
             over_limit_sound(&mut st, 9.5, &s),
@@ -841,9 +849,11 @@ mod tests {
 
     #[test]
     fn auto_power_switches_to_powering_down_sounds() {
-        let mut s = Settings::default();
-        s.yellow_sound_enabled = true;
-        s.red_sound_enabled = true;
+        let mut s = Settings {
+            yellow_sound_enabled: true,
+            red_sound_enabled: true,
+            ..Default::default()
+        };
         let mine = Sound::File(PathBuf::from("/tmp/mine.wav"));
 
         // Feature off: the plain embedded sounds.

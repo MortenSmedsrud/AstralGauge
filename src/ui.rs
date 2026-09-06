@@ -418,7 +418,7 @@ impl eframe::App for App {
                 // never clears it; the next red excursion shows it again.
                 if data.critical_alert {
                     ui.add_space(16.0);
-                    let bright = (now / ALERT_BLINK_SECS) as u64 % 2 == 0;
+                    let bright = ((now / ALERT_BLINK_SECS) as u64).is_multiple_of(2);
                     let color = if bright {
                         egui::Color32::from_rgb(255, 70, 70)
                     } else {
@@ -1153,6 +1153,7 @@ Apply the reset with Accept, discard it with Cancel."
 /// Hover readout shared by all graphs: while the pointer is inside the
 /// graph rect, draw a faint vertical crosshair, a marker on the data line,
 /// and a label with the value of the nearest sample.
+#[allow(clippy::too_many_arguments)]
 fn draw_hover_readout(
     ui: &egui::Ui,
     painter: &egui::Painter,
@@ -1358,8 +1359,8 @@ fn add_pin_graph(
             vis,
             t0,
             window_secs,
-            &x_of,
-            &y_of,
+            x_of,
+            y_of,
             |v| current_color(v, settings),
             "A",
         );
@@ -1371,6 +1372,7 @@ fn add_pin_graph(
 /// (the range NVML reports, e.g. max power limit or total VRAM), so the
 /// scale never jumps as the data changes. When no range is known yet the
 /// scale auto-fits to the data instead.
+#[allow(clippy::too_many_arguments)]
 fn add_metric_graph(
     ui: &mut egui::Ui,
     title: &str,
@@ -1471,8 +1473,8 @@ fn add_metric_graph(
             vis,
             t0,
             window_secs,
-            &x_of,
-            &y_of,
+            x_of,
+            y_of,
             |_v| color,
             unit,
         );

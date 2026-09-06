@@ -474,7 +474,7 @@ pub(crate) fn spawn_poller(
                                 polls += 1;
                                 poll_sum_ms += el;
                                 poll_max_ms = poll_max_ms.max(el);
-                                if polls == 50 || polls % 500 == 0 {
+                                if polls == 50 || polls.is_multiple_of(500) {
                                     eprintln!(
                                     "I2C read batch: avg {} ms per poll, worst {} ms (polls 1..{})",
                                     poll_sum_ms / polls, poll_max_ms, polls
@@ -726,8 +726,8 @@ fn read_pins(file: &File) -> Option<Vec<PinReading>> {
         {
             eprintln!("I2C block read unavailable; using 24 byte reads per poll.");
         }
-        for i in 0..TOTAL_BYTES {
-            raw[i] = smbus_read_byte(fd, REG_POWER + i as u8).ok()?;
+        for (offset, byte) in raw.iter_mut().enumerate() {
+            *byte = smbus_read_byte(fd, REG_POWER + offset as u8).ok()?;
         }
     }
 
@@ -770,12 +770,7 @@ pub(crate) fn find_i2c_bus() -> Option<u32> {
     }
 
     candidates.sort();
-    for bus in candidates {
-        if probe_it8915(bus) {
-            return Some(bus);
-        }
-    }
-    None
+    candidates.into_iter().find(|&bus| probe_it8915(bus))
 }
 
 /// Probe a bus for an IT8915 by reading register 0x80 and checking that
