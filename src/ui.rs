@@ -1,6 +1,6 @@
 //! Desktop UI (eframe/egui): the main window with the live readings, tables
-//! and graphs, plus the settings dialog (current limits, alert sounds) and
-//! the built-in sound file picker.
+//! and graphs, plus the settings dialog (current limits, alert sounds,
+//! sample interval, web server) and the built-in sound file picker.
 //!
 //! [`App`] never polls hardware itself: it renders from the shared
 //! [`WebData`] (updated by the poller thread) and sends [`Cmd`]s to the
@@ -31,27 +31,43 @@ fn current_color(current: f64, s: &Settings) -> egui::Color32 {
 pub(crate) struct App {
     cmd_tx: mpsc::Sender<Cmd>,
     pending_limit: Option<u32>,
-    /// Sample interval in ms (sent to the poller when the slider changes).
-    poll_ms: u64,
     /// Latest sample, histories and NVML ranges, shared with the web server.
     data: Arc<Mutex<WebData>>,
     /// Index into HORIZONS_MIN for the visible time window.
     window_idx: u8,
     /// Toggle for the per-pin graphs (history keeps accumulating either way).
     show_graphs: bool,
-    /// Web interface port (text box; applied when the checkbox is toggled).
-    web_port: String,
-    /// Web server state; `Stopped` by default.
+    /// The applied settings (limits, sounds, interval, web server).
+    config: Config,
+    /// Web server state; `Stopped` by default. Runtime state, deliberately
+    /// kept out of [`Config`] (which only holds the applied intent).
     web: WebState,
     /// One-shot warning (e.g. port in use), shown in a small dialog.
     web_error: Option<String>,
-    /// The applied limits and sounds.
-    settings: Settings,
     /// While set, the settings panel is open and editing this draft copy
-    /// of the settings (Accept commits it, Cancel discards it).
-    draft_settings: Option<Settings>,
+    /// of [`Config`] (Accept commits it, Cancel discards it).
+    draft: Option<Config>,
     /// While set, the sound file picker is open.
     file_dialog: Option<FileDialog>,
+}
+
+/// Everything the settings panel edits, in one struct. [`App`] keeps the
+/// applied copy while the panel edits a draft of it: Accept commits the
+/// draft, Cancel discards it. New app-wide settings belong here — add the
+/// field, a control in the settings panel, and (when the poller or the web
+/// page needs it) mirror it to [`WebData`] at the top of `update`.
+#[derive(Clone, PartialEq)]
+struct Config {
+    /// Per-pin current limits and alert sounds.
+    alerts: Settings,
+    /// Poller sample interval in ms (sent to the poller when it changes).
+    poll_ms: u64,
+    /// Whether the web server should run. The running handle itself lives
+    /// in [`App::web`]; this is the applied intent, kept in sync with what
+    /// actually runs.
+    web_enabled: bool,
+    /// Web server port.
+    web_port: String,
 }
 
 impl App {
@@ -59,15 +75,18 @@ impl App {
         App {
             cmd_tx,
             pending_limit: None,
-            poll_ms: DEFAULT_POLL_MS,
             data,
             window_idx: 0,
             show_graphs: true,
-            web_port: DEFAULT_WEB_PORT.to_string(),
+            config: Config {
+                alerts: Settings::default(),
+                poll_ms: DEFAULT_POLL_MS,
+                web_enabled: false,
+                web_port: DEFAULT_WEB_PORT.to_string(),
+            },
             web: WebState::Stopped,
             web_error: None,
-            settings: Settings::default(),
-            draft_settings: None,
+            draft: None,
             file_dialog: None,
         }
     }
@@ -133,12 +152,12 @@ impl eframe::App for App {
         // here we only mirror the UI settings and render from the shared
         // data, which keeps updating even while this window is minimized.
         let mut data = self.data.lock().unwrap();
-        data.poll_ms = self.poll_ms;
+        data.poll_ms = self.config.poll_ms;
         data.show_graphs = self.show_graphs;
-        if data.settings != self.settings {
+        if data.settings != self.config.alerts {
             // Mirrored so the poller plays alert sounds and the web page
             // draws the same thresholds the GUI shows.
-            data.settings = self.settings.clone();
+            data.settings = self.config.alerts.clone();
         }
         let now = data.start.elapsed().as_secs_f64();
 
@@ -156,9 +175,9 @@ impl eframe::App for App {
                         )
                         .on_hover_text("Settings")
                         .clicked()
-                        && self.draft_settings.is_none()
+                        && self.draft.is_none()
                     {
-                        self.draft_settings = Some(self.settings.clone());
+                        self.draft = Some(self.config.clone());
                     }
                 });
             });
@@ -228,73 +247,6 @@ impl eframe::App for App {
 
             ui.separator();
 
-            ui.horizontal(|ui| {
-                ui.label("Sample interval:");
-                let mut ms = self.poll_ms;
-                let changed = ui
-                    .add(
-                        egui::DragValue::new(&mut ms)
-                            .range(100..=10_000)
-                            .suffix(" ms"),
-                    )
-                    .changed();
-                if changed {
-                    self.poll_ms = ms;
-                    let _ = self.cmd_tx.send(Cmd::Interval(ms));
-                }
-            });
-
-            ui.separator();
-
-            // Web interface: the text box holds the port, the checkbox
-            // starts/stops the HTTP server that mirrors this UI for other
-            // devices. Disabled by default; a busy port is rejected with a
-            // warning instead of starting the service.
-            ui.horizontal(|ui| {
-                ui.label("Web server:");
-                let mut enabled = matches!(&self.web, WebState::Running(_));
-                let mut port = self.web_port.clone();
-                if ui
-                    .add(egui::TextEdit::singleline(&mut port).desired_width(70.0))
-                    .changed()
-                {
-                    // Digits only; the value is applied when the checkbox is toggled.
-                    self.web_port = port.chars().filter(|c| c.is_ascii_digit()).collect();
-                }
-                if ui.checkbox(&mut enabled, "Enable").changed() {
-                    if enabled {
-                        match self.web_port.trim().parse::<u16>() {
-                            Ok(port) if port != 0 => match WebServer::start(port, self.data.clone())
-                            {
-                                Ok(server) => self.web = WebState::Running(server),
-                                Err(e) => {
-                                    enabled = false;
-                                    self.web_error = Some(format!(
-                                        "Port {port} is not available: {e}\n\nThe web interface was not started.",
-                                    ));
-                                }
-                            },
-                            _ => {
-                                enabled = false;
-                                self.web_error = Some(
-                                    "Port must be a number between 1 and 65535.".to_owned(),
-                                );
-                            }
-                        }
-                    } else {
-                        self.web = WebState::Stopped;
-                    }
-                }
-                if enabled {
-                    if let WebState::Running(server) = &self.web {
-                        ui.label(
-                            egui::RichText::new(format!("active on port {}", server.port))
-                                .weak(),
-                        );
-                    }
-                }
-            });
-
             ui.checkbox(&mut self.show_graphs, "Show graphs");
             if self.show_graphs {
                 // Time window for the graphs (discrete steps)
@@ -346,7 +298,7 @@ impl eframe::App for App {
             for row in 0..2 {
                 ui.horizontal(|ui| {
                     for i in row * 3..row * 3 + 3 {
-                        let color = current_color(data.sample.pins[i].current, &self.settings);
+                        let color = current_color(data.sample.pins[i].current, &self.config.alerts);
                         ui.label(
                             egui::RichText::new(format!(
                                 "Pin {:>2}: {:>7.3}",
@@ -356,8 +308,8 @@ impl eframe::App for App {
                         );
                     }
                     if row == 0 {
-                        let y = self.settings.yellow_limit_a;
-                        let r = self.settings.red_limit_a;
+                        let y = self.config.alerts.yellow_limit_a;
+                        let r = self.config.alerts.red_limit_a;
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.label(
                                 egui::RichText::new(format!("● ≥ {r:.1}A"))
@@ -407,7 +359,7 @@ impl eframe::App for App {
                                     now,
                                     window_secs,
                                     graph_size,
-                                    &self.settings,
+                                    &self.config.alerts,
                                 );
                             } else {
                                 match col {
@@ -468,14 +420,15 @@ impl eframe::App for App {
                 });
         }
 
-        // Settings panel: edits a draft copy of the settings. Accept
-        // commits it and closes the panel, Cancel (or the window's X)
-        // discards it. Accept is only enabled while the draft actually
-        // differs from the applied settings.
+        // Settings panel: edits a draft copy of the Config (limits, sounds,
+        // sample interval, web server). Accept commits it and closes the
+        // panel, Cancel (or the window's X) discards it. Accept is only
+        // enabled while the draft actually differs from the applied config.
         let mut accept = false;
         let mut cancel = false;
         let mut open_browser: Option<(SoundField, PathBuf)> = None;
-        if let Some(draft) = &mut self.draft_settings {
+        let current = self.config.clone();
+        if let Some(draft) = &mut self.draft {
             let mut open = true;
             egui::Window::new("Settings")
                 .open(&mut open)
@@ -486,46 +439,91 @@ impl eframe::App for App {
                     ui.set_min_width(400.0);
 
                     ui.strong("Current limits");
-                    let mut yellow = draft.yellow_limit_a;
+                    let mut yellow = draft.alerts.yellow_limit_a;
                     ui.add(
-                        egui::Slider::new(&mut yellow, MIN_LIMIT_A..=draft.red_limit_a)
+                        egui::Slider::new(&mut yellow, MIN_LIMIT_A..=draft.alerts.red_limit_a)
                             .step_by(0.1)
                             .suffix(" A")
                             .text("Yellow starts"),
                     );
-                    draft.yellow_limit_a = (yellow * 10.0).round() / 10.0;
-                    let mut red = draft.red_limit_a;
+                    draft.alerts.yellow_limit_a = (yellow * 10.0).round() / 10.0;
+                    let mut red = draft.alerts.red_limit_a;
                     ui.add(
-                        egui::Slider::new(&mut red, draft.yellow_limit_a..=MAX_LIMIT_A)
+                        egui::Slider::new(&mut red, draft.alerts.yellow_limit_a..=MAX_LIMIT_A)
                             .step_by(0.1)
                             .suffix(" A")
                             .text("Red starts"),
                     );
-                    draft.red_limit_a = (red * 10.0).round() / 10.0;
+                    draft.alerts.red_limit_a = (red * 10.0).round() / 10.0;
 
                     ui.add_space(6.0);
                     ui.separator();
                     ui.strong("Alert sounds");
                     ui.checkbox(
-                        &mut draft.yellow_sound_enabled,
+                        &mut draft.alerts.yellow_sound_enabled,
                         "Play sound when the yellow limit is surpassed",
                     );
                     sound_file_row(
                         ui,
-                        &mut draft.yellow_sound_path,
+                        &mut draft.alerts.yellow_sound_path,
                         SoundField::Yellow,
                         &mut open_browser,
                     );
                     ui.checkbox(
-                        &mut draft.red_sound_enabled,
+                        &mut draft.alerts.red_sound_enabled,
                         "Play sound when the red limit is surpassed",
                     );
                     sound_file_row(
                         ui,
-                        &mut draft.red_sound_path,
+                        &mut draft.alerts.red_sound_path,
                         SoundField::Red,
                         &mut open_browser,
                     );
+
+                    ui.add_space(6.0);
+                    ui.separator();
+                    ui.strong("Sampling");
+                    ui.horizontal(|ui| {
+                        ui.label("Sample interval:");
+                        ui.add(
+                            egui::DragValue::new(&mut draft.poll_ms)
+                                .range(100..=10_000)
+                                .suffix(" ms"),
+                        );
+                    });
+
+                    ui.add_space(6.0);
+                    ui.separator();
+                    // The HTTP server mirroring this UI for other devices.
+                    // Disabled by default; applied on Accept, where a busy or
+                    // invalid port is rejected with a warning (a server that
+                    // is already running keeps its port).
+                    ui.strong("Web server");
+                    ui.horizontal(|ui| {
+                        ui.label("Port:");
+                        if ui
+                            .add(
+                                egui::TextEdit::singleline(&mut draft.web_port).desired_width(70.0),
+                            )
+                            .changed()
+                        {
+                            // Digits only; applied on Accept.
+                            draft.web_port = draft
+                                .web_port
+                                .chars()
+                                .filter(|c| c.is_ascii_digit())
+                                .collect();
+                        }
+                        ui.checkbox(&mut draft.web_enabled, "Enable");
+                        if draft.web_enabled {
+                            if let WebState::Running(server) = &self.web {
+                                ui.label(
+                                    egui::RichText::new(format!("active on port {}", server.port))
+                                        .weak(),
+                                );
+                            }
+                        }
+                    });
 
                     ui.add_space(6.0);
                     ui.separator();
@@ -537,7 +535,7 @@ impl eframe::App for App {
                         }
                         accept = ui
                             .add_enabled(
-                                *draft != self.settings,
+                                *draft != current,
                                 egui::Button::new(egui::RichText::new("Accept").strong()),
                             )
                             .clicked();
@@ -551,13 +549,53 @@ impl eframe::App for App {
             self.file_dialog = Some(FileDialog::new(field, &path));
         }
         if accept {
-            if let Some(draft) = self.draft_settings.take() {
-                self.settings = draft;
+            if let Some(mut draft) = self.draft.take() {
+                if draft.poll_ms != self.config.poll_ms {
+                    let _ = self.cmd_tx.send(Cmd::Interval(draft.poll_ms));
+                }
+                // Reconcile the web server with the accepted draft: start,
+                // stop, or restart it on a new port. A failed start never
+                // tears down a server that is already running.
+                let running_port = match &self.web {
+                    WebState::Running(server) => Some(server.port),
+                    WebState::Stopped => None,
+                };
+                match (draft.web_enabled, draft.web_port.trim().parse::<u16>()) {
+                    (false, _) => {
+                        if running_port.is_some() {
+                            self.web = WebState::Stopped;
+                        }
+                    }
+                    (true, Ok(port)) if port != 0 => {
+                        if running_port != Some(port) {
+                            match WebServer::start(port, self.data.clone()) {
+                                Ok(server) => self.web = WebState::Running(server),
+                                Err(e) => {
+                                    self.web_error = Some(format!(
+                                        "Port {port} is not available: {e}\n\nThe web interface was not started.",
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    (true, _) => {
+                        self.web_error =
+                            Some("Port must be a number between 1 and 65535.".to_owned());
+                    }
+                }
+                // The applied config mirrors what actually runs: a failed
+                // start is not "enabled", and the port is the live one.
+                if matches!(self.web, WebState::Stopped) {
+                    draft.web_enabled = false;
+                } else if let WebState::Running(server) = &self.web {
+                    draft.web_port = server.port.to_string();
+                }
+                self.config = draft;
             }
         }
         if cancel {
             // Cancel / window close: discard the draft, closing the panel.
-            self.draft_settings = None;
+            self.draft = None;
         }
         if accept || cancel {
             self.file_dialog = None;
@@ -631,10 +669,10 @@ impl eframe::App for App {
                     }
                 });
             if let Some(path) = picked {
-                if let Some(draft) = &mut self.draft_settings {
+                if let Some(draft) = &mut self.draft {
                     match fd.field {
-                        SoundField::Yellow => draft.yellow_sound_path = path,
-                        SoundField::Red => draft.red_sound_path = path,
+                        SoundField::Yellow => draft.alerts.yellow_sound_path = path,
+                        SoundField::Red => draft.alerts.red_sound_path = path,
                     }
                 }
                 dialog_close = true;
@@ -650,7 +688,7 @@ impl eframe::App for App {
         // Redraw about as fast as the data arrives when idle.
         // Input events (slider drags, checkbox, window moves) still trigger
         // immediate repaints, so the UI stays fully responsive.
-        ctx.request_repaint_after(Duration::from_millis(self.poll_ms));
+        ctx.request_repaint_after(Duration::from_millis(self.config.poll_ms));
     }
 }
 

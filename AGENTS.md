@@ -64,8 +64,10 @@ src/web.rs       WEB SERVER + SHARED STATE. `WebData` (latest sample,
                  (`GET /` → page, `GET /data?window=SECS` → JSON),
                  hand-rolled JSON serialization, and `INDEX_HTML`
                  (the whole single-page web UI, JS included).
-src/ui.rs        DESKTOP UI. `App` (eframe::App::update: main window,
-                 settings dialog, web toggle, graphs), `FileDialog`
+src/ui.rs        DESKTOP UI. `App` (eframe::App::update: main window, settings
+                 dialog, graphs), `Config` (everything the settings panel
+                 edits: limits, sounds, sample interval, web server — new
+                 app-wide settings go here), `FileDialog`
                  (built-in .wav picker), `add_pin_graph`,
                  `add_metric_graph`, `draw_hover_readout`, colors.
 sound/           Shipped alert WAVs (attention.wav = yellow, critical.wav = red).
