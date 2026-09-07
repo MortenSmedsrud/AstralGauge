@@ -100,7 +100,8 @@ without copyright headers, so the notices are listed here:
 
 MPL-2.0: the corresponding source of the crates listed in the MPL-2.0
 section is published on crates.io; the exact versions are recorded in
-Cargo.lock.
+Cargo.lock. dwrote is a Windows-only dependency (the Windows font backend
+of crossfont); it is not compiled into this Linux-only build.
 
 BITSTREAM VERA LICENSE
 

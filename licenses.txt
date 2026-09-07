@@ -242,14 +242,11 @@ Used by:
   cursor-icon 1.2.0 — Kirill Chibisov <contact@kchibisov.com>
   as-raw-xcb-connection 1.0.1
   clang-sys 1.9.1 — Kyle Mayes <kyle@mayeses.com>
-  claxon 0.4.3 — Ruud van Asseldonk <dev@veniogames.com>
-  encoding_rs 0.8.35 — Henri Sivonen <hsivonen@hsivonen.fi>
   hound 3.5.1 — Ruud van Asseldonk <dev@veniogames.com>
   kurbo 0.13.1
   nohash-hasher 0.2.0 — Parity Technologies <admin@parity.io>
   polycool 0.4.0
   static_assertions 1.1.0 — Nikolai Vazquez
-  tinyvec 1.13.2 — Lokathor <zefria@gmail.com>
   utf8_iter 1.0.4 — Henri Sivonen <hsivonen@hsivonen.fi>
   x11rb-protocol 0.13.2 — Uli Schlachter <psychon@znc.in>, Eduardo Sánchez Muñoz <eduardosm-dev@e64.io>, notgull <jtnunley01@gmail.com>
   x11rb 0.13.2 — Uli Schlachter <psychon@znc.in>, Eduardo Sánchez Muñoz <eduardosm-dev@e64.io>, notgull <jtnunley01@gmail.com>
@@ -299,7 +296,6 @@ Used by:
   windows_x86_64_msvc 0.42.2 — Microsoft
   windows_x86_64_msvc 0.52.6 — Microsoft
   windows_x86_64_msvc 0.53.1
-  tinyvec_macros 0.1.1 — Soveu <marx.tomasz@gmail.com>
   zerocopy-derive 0.8.56
   zerocopy 0.8.56
   web-time 1.1.0
@@ -490,7 +486,6 @@ Used by:
   jni-sys-macros 0.4.1 — Robert Bragg <robert@sixbynine.org>
   jni 0.22.4 — jni team
   khronos_api 3.1.0 — Brendan Zabarauskas <bjzaba@yahoo.com.au>, Corey Richardson, Arseny Kapoulkine, Pierre Krieger <pierre.krieger1708@gmail.com>
-  lewton 0.10.2 — est31 <MTest31@outlook.com>
   libc 0.2.189
   linebender_resource_handle 0.1.1
   litrs 1.0.0 — Lukas Kalbertodt <lukas.kalbertodt@gmail.com>
@@ -606,8 +601,6 @@ Used by:
   bindgen 0.72.1 — Copyright (c) 2013, Jyun-Yan You
   tiny-skia-path 0.11.4 — Copyright (c) 2011 Google Inc. All rights reserved.
   tiny-skia 0.11.4 — Copyright (c) 2011 Google Inc. All rights reserved.
-  encoding_rs 0.8.35 — Copyright © WHATWG (Apple, Google, Mozilla, Microsoft).
-  ogg 0.8.0 — Copyright (c) 2016-2017 est31 <MTest31@outlook.com> and contributors
 
 ------------------------------------------------------------
 Boost Software License 1.0 (BSL-1.0)
@@ -757,7 +750,6 @@ Used by:
   phf_macros 0.13.1 — Copyright (c) 2014-2022 Steven Fackler, Yuki Okushi
   phf_shared 0.13.1 — Copyright (c) 2014-2022 Steven Fackler, Yuki Okushi
   byteorder-lite 0.1.0 — Copyright (c) 2015 Andrew Gallant
-  byteorder 1.5.0 — Copyright (c) 2015 Andrew Gallant
   memchr 2.8.3 — Copyright (c) 2015 Andrew Gallant
   walkdir 2.5.0 — Copyright (c) 2015 Andrew Gallant
   combine 4.6.8 — Copyright (c) 2015 Markus Westerlind
@@ -1149,10 +1141,6 @@ Exhibit B - "Incompatible With Secondary Licenses" Notice
 
 Used by:
   dwrote 0.11.5 — The Servo Project Developers, Vladimir Vukicevic <vladimir@pobox.com>
-  symphonia-bundle-mp3 0.5.5 — Philip Deljanov <philip.deljanov@gmail.com>
-  symphonia-core 0.5.5 — Philip Deljanov <philip.deljanov@gmail.com>
-  symphonia-metadata 0.5.5 — Philip Deljanov <philip.deljanov@gmail.com>
-  symphonia 0.5.5 — Philip Deljanov <philip.deljanov@gmail.com>
 
 ------------------------------------------------------------
 SIL Open Font License 1.1 (OFL-1.1)
@@ -1478,7 +1466,8 @@ without copyright headers, so the notices are listed here:
 
 MPL-2.0: the corresponding source of the crates listed in the MPL-2.0
 section is published on crates.io; the exact versions are recorded in
-Cargo.lock.
+Cargo.lock. dwrote is a Windows-only dependency (the Windows font backend
+of crossfont); it is not compiled into this Linux-only build.
 
 BITSTREAM VERA LICENSE
 

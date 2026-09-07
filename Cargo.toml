@@ -40,4 +40,7 @@ winit = {
     ],
 }
 libc = "0.2"
-rodio = "0.20"
+# WAV-only decoding (every alert sound is a .wav); the default features
+# pull in the MPL-2.0 symphonia stack for mp3/flac/vorbis, which this
+# app never uses.
+rodio = { version = "0.20", default-features = false, features = ["wav"] }
