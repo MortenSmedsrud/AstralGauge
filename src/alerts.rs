@@ -152,6 +152,14 @@ pub(crate) struct Settings {
     /// when a pin current enters the red range. Disabled by default; see
     /// [`kill_guard_action`].
     pub(crate) kill_top_process_on_red: bool,
+    /// Route the safeguard's SIGKILL through the privileged power helper, so
+    /// processes of other users (for example an inference service running as
+    /// root) can be terminated too. Needs the helper's administrator
+    /// credentials (shared with the power limiting — one prompt serves
+    /// both); a denied authentication reverts it, exactly like
+    /// `auto_min_power`. Only meaningful while `kill_top_process_on_red` is
+    /// enabled.
+    pub(crate) kill_other_users_processes: bool,
     /// Sound played when the safeguard actually terminates a process. It is
     /// a priority sound: nothing interrupts it, and it replaces the red
     /// alert of the same excursion.
@@ -169,6 +177,7 @@ impl Default for Settings {
             red_sound: Sound::Embedded(EmbeddedSound::Critical),
             auto_min_power: AutoMinPower::default(),
             kill_top_process_on_red: false,
+            kill_other_users_processes: false,
             terminating_sound: Sound::Embedded(EmbeddedSound::CriticalTerminating),
         }
     }
@@ -586,6 +595,7 @@ mod tests {
         assert_eq!(s.red_limit_a, DEFAULT_RED_LIMIT_A);
         assert!(!s.yellow_sound_enabled && !s.red_sound_enabled);
         assert_eq!(s.auto_min_power, AutoMinPower::Off);
+        assert!(!s.kill_top_process_on_red && !s.kill_other_users_processes);
         assert!(s.yellow_limit_a >= MIN_LIMIT_A);
         assert!(s.yellow_limit_a <= s.red_limit_a);
         assert!(s.red_limit_a <= MAX_LIMIT_A);

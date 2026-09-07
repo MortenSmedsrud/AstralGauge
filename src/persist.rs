@@ -116,6 +116,11 @@ fn to_json(stored: &StoredSettings) -> String {
         "  \"kill_top_process_on_red\": {},",
         s.kill_top_process_on_red
     );
+    let _ = writeln!(
+        out,
+        "  \"kill_other_users_processes\": {},",
+        s.kill_other_users_processes
+    );
     out.push_str("  \"terminating_sound\": ");
     write_sound(&mut out, &s.terminating_sound);
     out.push_str(",\n");
@@ -239,6 +244,8 @@ fn from_json(root: &Json, defaults: &StoredSettings) -> Result<StoredSettings, S
     }
     alerts.kill_top_process_on_red =
         boolean(root, "kill_top_process_on_red")?.unwrap_or(d.kill_top_process_on_red);
+    alerts.kill_other_users_processes =
+        boolean(root, "kill_other_users_processes")?.unwrap_or(d.kill_other_users_processes);
     if let Some(v) = root.get("terminating_sound") {
         alerts.terminating_sound = parse_sound(v)?;
     }
@@ -607,6 +614,7 @@ mod tests {
                 red_sound: Sound::File(PathBuf::from("/tmp/sélect \"one\"\n.wav")),
                 auto_min_power: AutoMinPower::OnYellow,
                 kill_top_process_on_red: true,
+                kill_other_users_processes: true,
                 terminating_sound: Sound::Embedded(EmbeddedSound::CriticalTerminating),
             },
             poll_ms: 250,

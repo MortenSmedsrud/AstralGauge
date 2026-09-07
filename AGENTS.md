@@ -74,12 +74,15 @@ src/hardware.rs  HARDWARE POLLING. IT8915 constants + raw i2c-dev/SMBus
                  names come from `/proc/<pid>/comm`) and `rank_processes`
                  (utilization, then VRAM, then pid; own and pid 0 excluded).
                  Also the privileged power helper: `PowerHelper` (spawns
-                 this same binary as root through pkexec) and
+                 this same binary as root through pkexec; `KILL <pid>` is
+                 the safeguard's cross-user kill) and
                  `run_power_helper()` (the helper mode), plus `kill_process`
-                 (the safeguard's SIGKILL, unprivileged on purpose).
+                 (the safeguard's SIGKILL: unprivileged by default, called
+                 as root by the helper for the opt-in cross-user kill).
 src/alerts.rs    LIMIT CHECKING + SOUNDS. `Settings` (limits + sound
-                 config + `auto_min_power` mode + `kill_top_process_on_red`
-                 safeguard flag), `Sound` (embedded WAV via `include_bytes!`
+                 config + `auto_min_power` mode + the `kill_top_process_on_`
+                 `red` / `kill_other_users_processes` safeguard flags),
+                 `Sound` (embedded WAV via `include_bytes!`
                  or a user-selected file), `AlertState` +
                  `over_limit_sound()` (edge + repeat decision logic),
                  `KillGuardState` + `kill_guard_action()` (opt-in kill on the
@@ -176,10 +179,16 @@ critical sections are short — keep them that way:
    notification) → with the kill safeguard on, `alerts::kill_guard_action`
    SIGKILLs the top-ranked process on the red edge and repeats while the
    current stays red at most once per `KILL_REPEAT_COOLDOWN` (5 s) — never
-   while the previous kill's sound is still playing; the outcome lands in
-   `WebData::kill_note`, GUI-only → play: a successful termination sends the
-   critical-terminating sound via `SoundPlayer::play_priority` (replacing
-   that excursion's red alert); otherwise the pending alert sound plays.
+   while the previous kill's sound is still playing. The kill is
+   unprivileged by default (other users' processes answer EPERM); with
+   `Settings::kill_other_users_processes` it goes through the power helper
+   (`KILL <pid>`), so the outcome arrives on the next poll and the
+   excursion's alert sound is held back until a termination (which plays
+   the critical-terminating sound) or a failure (which plays it) is known.
+   The outcome lands in `WebData::kill_note`, GUI-only → play: a successful
+   termination sends the critical-terminating sound via
+   `SoundPlayer::play_priority` (replacing that excursion's red alert);
+   otherwise the pending alert sound plays.
    Monitored data keeps flowing while the window is minimized.
 2. **Audio thread** (`alerts::SoundPlayer`): owns the rodio
    `OutputStream`/`Sink` (created lazily on first play; absence of audio is
@@ -187,24 +196,31 @@ critical sections are short — keep them that way:
    when a sound finishes it drops stale queued requests and plays the
    newest. Never blocks the caller.
 3. **Privileged power helper** (`hardware::PowerHelper`): the app runs as a
-   normal user but NVML's limit setter needs root. On demand (manual Apply,
-   the automatic min-power feature, the "Test privileged access" button,
-   or at startup when the saved settings have the automatic min-power
-   enabled) the poller spawns `pkexec <own exe> --power-helper`, which asks
-   the desktop polkit agent for the password and runs `run_power_helper()`
-   as root. Every prompt's purpose is announced to the user: spawning the
-   helper sets a `power_note` saying the administrator authentication is
-   for the GPU power limiting, and the settings panel shows the pending /
-   granted / denied state next to the option. The helper stays alive, speaks `SET <watts>`/`PING` lines on
-   stdin and `OK`/`ERR …` lines on stdout; reader threads relay replies into
-   a status cell the poller mirrors as `WebData::power_note` (GUI-only, not
-   in the web JSON) **and** a `hardware::AuthState` (Idle / Active / Failed)
-   mirrored as `WebData::power_auth`. Enabling automatic min-power in the
-   settings dialog immediately pings the helper (so the password prompt shows
-   while the user is at the dialog) and watches `power_auth`: a `Failed`
-   state turns the option back off (it cannot work without privileges),
-   `Active` keeps it. Auth is asked once per app run; a denied/absent agent
-   degrades to an error note, never a crash.
+   normal user but NVML's limit setter (and the safeguard's cross-user kill)
+   needs root. On demand (manual Apply, the automatic min-power feature,
+   a red excursion with the cross-user kill enabled, the "Test privileged
+   access" button, or at startup when the saved settings have either
+   privileged option enabled) the poller spawns `pkexec <own exe>
+   --power-helper`, which asks the desktop polkit agent for the password
+   and runs `run_power_helper()` as root. Every prompt's purpose is
+   announced to the user: spawning the helper sets a `power_note` saying the
+   administrator authentication is for the GPU power limiting and the
+   privileged process kill, and the settings panel shows the pending /
+   granted / denied state next to the options. The helper stays alive,
+   speaks `SET <watts>`/`PING`/`KILL <pid>` lines on stdin and `OK`/`ERR …`
+   /`KILL OK <pid>`/`KILL ERR <pid> …` lines on stdout; reader threads relay
+   replies into a status cell the poller mirrors as `WebData::power_note`
+   (GUI-only, not in the web JSON) **and** a `hardware::AuthState` (Idle /
+   Active / Failed) mirrored as `WebData::power_auth` (kill outcomes into a
+   separate cell consumed on the next poll). Enabling the automatic
+   min-power or the cross-user kill option in the settings dialog
+   immediately pings the helper (so the password prompt shows while the
+   user is at the dialog) and watches `power_auth`: a `Failed` state turns
+   the option(s) back off (they cannot work without privileges), `Active`
+   keeps them. One authentication serves both (enabling both at once never
+   asks twice); the same happens at startup when either was saved enabled.
+   Auth is asked once per app run; a denied/absent agent degrades to an
+   error note, never a crash.
 4. **Web server thread(s)** (`web::web_serve` + one thread per connection):
    `try_lock` with retry → 503 on contention so a GUI frame can never
    deadlock against the server-thread join at shutdown (both `/data` and
@@ -254,9 +270,16 @@ Optional (`Settings::kill_top_process_on_red`, default off, settings dialog
   kills (so oscillating around the red threshold cannot become a kill loop);
   enabling the option mid-excursion still never kills retroactively — a
   repeat only ever follows a kill this excursion already started.
-- Needs **no privileges**: `kill()` only reaches processes of the app's own
-  user (others answer EPERM — logged, not fatal), which deliberately bounds
-  the blast radius; the root power helper is never reachable by it either.
+- Unprivileged by default: `kill()` only reaches processes of the app's
+  own user (others answer EPERM — logged, not fatal), which deliberately
+  bounds the blast radius. Opt-in `Settings::kill_other_users_processes`
+  (settings dialog, only checkable while the safeguard is on): the SIGKILL
+  goes through the privileged power helper instead, so other users'
+  (root's) processes — e.g. an inference service — can be terminated too.
+  It needs the helper's administrator credentials (shared with the power
+  limiting, asked once — at startup when saved enabled, or when enabled in
+  the dialog) and reverts automatically on a denied authentication, exactly
+  like the automatic minimum power.
 - Result (killed / could-not-kill) goes to stderr and into
   `WebData::kill_note`, shown in the main window for a minute (GUI-only,
   not in the web JSON).
@@ -300,8 +323,11 @@ Optional (`Settings::auto_min_power` = Off / On yellow / On red):
   `WebData::power_auth`), so enabling it never silently fails at the first
   excursion. The same happens at startup when the persisted settings have
   it enabled: `App::new` authenticates the helper then (the prompt is
-  announced as being for the power limiting) and reverts — and re-saves —
-  the option when the credentials are not given.
+  announced as being for the power limiting and the privileged process
+  kill) and reverts — and re-saves — the option when the credentials are
+  not given. The cross-user kill safeguard option shares this machinery:
+  the same pending-auth watch reverts **both** options when the
+  authentication is denied, and one prompt serves both.
 
 ## Cross-cutting conventions
 
@@ -341,7 +367,7 @@ Optional (`Settings::auto_min_power` = Off / On yellow / On red):
 
 ## Tests
 
-`cargo test` (25 tests, no GPU/display needed):
+`cargo test` (26 tests, no GPU/display needed):
 
 - `alerts::tests`: settings defaults; embedded WAVs decode; alert edge
   triggering; 15 s repeat-while-exceeded behavior; powering-down sound
@@ -350,7 +376,8 @@ Optional (`Settings::auto_min_power` = Off / On yellow / On red):
   gating; critical-notification red-edge triggering; priority requests
   outranking normal playback requests.
 - `hardware::tests`: process ranking (utilization/memory/pid order,
-  truncation, own + zero pid exclusion) and `/proc` name fallback.
+  truncation, own + zero pid exclusion), `/proc` name fallback, and the
+  privileged helper's `KILL` reply parsing.
 - `persist::tests`: settings JSON round-trips (defaults, custom values,
   user sound paths with escapes), a real save()/load() file round-trip in a
   throwaway HOME, unknown/missing-key tolerance, clamping and yellow/red

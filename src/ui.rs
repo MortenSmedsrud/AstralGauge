@@ -203,12 +203,15 @@ impl App {
                 }
             }
         }
-        // A saved automatic power limit needs root: ask for the credentials
-        // now, at startup. The authentication dialog is announced as being
-        // for the power limiting (see `hardware::PowerHelper` and the note
-        // in the settings panel), and a denial turns the option back off
-        // through `auto_power_pending_auth` in `update`.
-        let auto_power_pending_auth = config.alerts.auto_min_power != AutoMinPower::Off;
+        // Saved privileged options (automatic power limit, killing other
+        // users' processes) need root: ask for the credentials now, at
+        // startup (one prompt serves both). The authentication dialog is
+        // announced as being for the power limiting and the privileged
+        // process kill (see `hardware::PowerHelper` and the note in the
+        // settings panel), and a denial turns the options back off through
+        // `auto_power_pending_auth` in `update`.
+        let auto_power_pending_auth = config.alerts.auto_min_power != AutoMinPower::Off
+            || config.alerts.kill_other_users_processes;
         if auto_power_pending_auth {
             let _ = cmd_tx.send(Cmd::GrantPowerAccess);
         }
@@ -332,25 +335,30 @@ impl eframe::App for App {
         // here we only mirror the UI settings and render from the shared
         // data, which keeps updating even while this window is minimized.
         let mut data = self.data.lock().unwrap();
-        // Automatic power limit waiting for its authentication prompt, ahead
-        // of the settings mirror below: the option is only good to have while
-        // the privileged helper is up, so a denied authentication turns it
-        // back off before it is ever mirrored to the poller.
+        // Privileged options (automatic power limit, killing other users'
+        // processes) waiting for their authentication prompt, ahead of the
+        // settings mirror below: they are only good to have while the
+        // privileged helper is up, so a denied authentication turns them
+        // back off before they are ever mirrored to the poller.
         if self.auto_power_pending_auth {
             match data.power_auth {
                 AuthState::Active => self.auto_power_pending_auth = false,
                 AuthState::Failed => {
                     self.auto_power_pending_auth = false;
-                    if self.config.alerts.auto_min_power != AutoMinPower::Off {
+                    if self.config.alerts.auto_min_power != AutoMinPower::Off
+                        || self.config.alerts.kill_other_users_processes
+                    {
                         self.config.alerts.auto_min_power = AutoMinPower::Off;
-                        // Persist the rollback: the option is off now (it was
-                        // denied at startup or when enabled), and it must not
-                        // silently ask for root again on the next run.
+                        self.config.alerts.kill_other_users_processes = false;
+                        // Persist the rollback: the options are off now
+                        // (they were denied at startup or when enabled), and
+                        // they must not silently ask for root again on the
+                        // next run.
                         if let Err(e) = persist::save(&self.config.stored()) {
                             eprintln!("Could not save the rolled-back settings: {e}");
                         }
                         self.warning = Some(
-                            "Authentication was not granted, so the automatic power limit was turned back off.\n\nEnable it again and accept the authentication prompt to use this feature."
+                            "Authentication was not granted, so the options that need administrator credentials (automatic power limit, killing other users' processes) were turned back off.\n\nEnable them again and accept the authentication prompt to use these features."
                                 .to_owned(),
                         );
                     }
@@ -706,244 +714,283 @@ impl eframe::App for App {
         // sample interval, web server). Accept commits it and closes the
         // panel, Cancel (or the window's X) discards it. Accept is only
         // enabled while the draft actually differs from the applied config.
+        // The window is capped to the drawable area of the main window (the
+        // dialog cannot exist outside it, it is drawn into the same canvas),
+        // its content scrolls, and the button bar is pinned to the bottom so
+        // it stays reachable.
         let mut accept = false;
         let mut cancel = false;
         let mut open_browser: Option<(SoundField, Option<PathBuf>)> = None;
         let current = self.config.clone();
         if let Some(draft) = &mut self.draft {
             let mut open = true;
+            // The dialog is drawn into the main window (it is not a separate
+            // OS window), so it cannot be moved outside of it: cap its size
+            // to the drawable area, pin the button bar to its bottom, and
+            // let the content scroll.
+            let viewport = ui.ctx().viewport_rect();
+            let default_size = egui::vec2(480.0, 860.0)
+                .min(viewport.size() - egui::vec2(24.0, 48.0))
+                .max(egui::vec2(360.0, 260.0));
             egui::Window::new("Settings")
                 .open(&mut open)
                 .collapsible(false)
-                .resizable(false)
-                .default_pos([150.0, 90.0])
+                .resizable(true)
+                .default_pos([150.0, 12.0])
+                .default_size(default_size)
+                .max_size(viewport.size() - egui::vec2(16.0, 16.0))
                 .show(ui.ctx(), |ui| {
-                    ui.set_min_width(400.0);
-
-                    ui.strong("Current limits");
-                    let mut yellow = draft.alerts.yellow_limit_a;
-                    ui.add(
-                        egui::Slider::new(&mut yellow, MIN_LIMIT_A..=draft.alerts.red_limit_a)
-                            .step_by(0.1)
-                            .suffix(" A")
-                            .text("Yellow starts"),
-                    );
-                    draft.alerts.yellow_limit_a = (yellow * 10.0).round() / 10.0;
-                    let mut red = draft.alerts.red_limit_a;
-                    ui.add(
-                        egui::Slider::new(&mut red, draft.alerts.yellow_limit_a..=MAX_LIMIT_A)
-                            .step_by(0.1)
-                            .suffix(" A")
-                            .text("Red starts"),
-                    );
-                    draft.alerts.red_limit_a = (red * 10.0).round() / 10.0;
-
-                    ui.add_space(6.0);
-                    ui.separator();
-                    ui.strong("Alert sounds");
-                    ui.checkbox(
-                        &mut draft.alerts.yellow_sound_enabled,
-                        "Play sound when the yellow limit is surpassed",
-                    );
-                    sound_file_row(
-                        ui,
-                        &mut draft.alerts.yellow_sound,
-                        SoundField::Yellow,
-                        &mut open_browser,
-                    );
-                    ui.checkbox(
-                        &mut draft.alerts.red_sound_enabled,
-                        "Play sound when the red limit is surpassed",
-                    );
-                    sound_file_row(
-                        ui,
-                        &mut draft.alerts.red_sound,
-                        SoundField::Red,
-                        &mut open_browser,
-                    );
-
-                    ui.add_space(6.0);
-                    ui.separator();
-                    // Lower the GPU power limit to its minimum when a pin
-                    // reaches the selected limit. Applying it needs root, so
-                    // the first change asks polkit (pkexec) for a password.
-                    ui.strong("Automatic power limit");
-                    let auto_labels = ["Never", "On yellow limit", "On red limit"];
-                    let mut auto_idx = draft.alerts.auto_min_power.index();
-                    ui.horizontal(|ui| {
-                        ui.label("Lower the power limit to its minimum:");
-                        egui::ComboBox::from_label("")
-                            .selected_text(auto_labels[auto_idx])
-                            .show_ui(ui, |ui| {
-                                for (i, label) in auto_labels.iter().enumerate() {
-                                    ui.selectable_value(&mut auto_idx, i, *label);
+                    // The Accept/Cancel/Reset bar stays at the bottom of the
+                    // window, visible no matter how tall the content is; the
+                    // content itself scrolls.
+                    egui::Panel::bottom("settings_buttons").show(ui, |ui| {
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                // Right-to-left: added first = rightmost, so
+                                // Accept ends up to the left of Cancel and
+                                // the reset button is leftmost of the row.
+                                if ui.button("Cancel").clicked() {
+                                    cancel = true;
+                                }
+                                accept = ui
+                                    .add_enabled(
+                                        *draft != current,
+                                        egui::Button::new(egui::RichText::new("Accept").strong()),
+                                    )
+                                    .clicked();
+                                // Restores every setting to its built-in
+                                // default in the draft (limits, sounds,
+                                // automatic power limit, safeguard, interval,
+                                // web server); Accept commits and persists
+                                // the reset, Cancel still discards it.
+                                let already_default = *draft == Config::defaults();
+                                if ui
+                                    .add_enabled(
+                                        !already_default,
+                                        egui::Button::new("Reset defaults"),
+                                    )
+                                    .on_hover_text(if already_default {
+                                        "The settings shown are already the defaults."
+                                    } else {
+                                        "Restore every setting to its built-in default.\
+Apply the reset with Accept, discard it with Cancel."
+                                    })
+                                    .clicked()
+                                {
+                                    *draft = Config::defaults();
                                 }
                             });
-                    });
-                    draft.alerts.auto_min_power = AutoMinPower::from_index(auto_idx);
-                    ui.label(
-                        egui::RichText::new(
-                            "When a pin reaches the selected limit, the power management limit is \
-set to the card's minimum and restored once the current has been back below it for 30 \
-seconds. Applying limits needs administrator rights: enabling this opens an \
-authentication dialog right away, and turns the option back off if it is not \
-accepted. While enabled, the built-in alert sounds play their powering-down \
-variants instead. Settings are remembered: when the app starts with this option on, \
-it asks for the administrator password right away (again for this power-limiting \
-feature) and disables the option if the prompt is not granted.",
-                        )
-                        .weak()
-                        .size(12.0),
-                    );
-                    // Make the purpose of every authentication prompt
-                    // explicit here too, and keep the user posted on the
-                    // outcome (also feedback for the Test button below).
-                    if self.auto_power_pending_auth {
-                        ui.label(
-                            egui::RichText::new(
-                                "An administrator authentication for the GPU power limiting is \
-open — please answer the authentication dialog. Without it this option turns \
-back off.",
-                            )
-                            .color(egui::Color32::from_rgb(240, 210, 40)),
-                        );
-                    } else {
-                        match power_auth {
-                            AuthState::Active => {
+                        });
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            ui.set_min_width(400.0);
+
+                            ui.strong("Current limits");
+                            let mut yellow = draft.alerts.yellow_limit_a;
+                            ui.add(
+                                egui::Slider::new(&mut yellow, MIN_LIMIT_A..=draft.alerts.red_limit_a)
+                                    .step_by(0.1)
+                                    .suffix(" A")
+                                    .text("Yellow starts"),
+                            );
+                            draft.alerts.yellow_limit_a = (yellow * 10.0).round() / 10.0;
+                            let mut red = draft.alerts.red_limit_a;
+                            ui.add(
+                                egui::Slider::new(&mut red, draft.alerts.yellow_limit_a..=MAX_LIMIT_A)
+                                    .step_by(0.1)
+                                    .suffix(" A")
+                                    .text("Red starts"),
+                            );
+                            draft.alerts.red_limit_a = (red * 10.0).round() / 10.0;
+
+                            ui.add_space(6.0);
+                            ui.separator();
+                            ui.strong("Alert sounds");
+                            ui.checkbox(
+                                &mut draft.alerts.yellow_sound_enabled,
+                                "Play sound when the yellow limit is surpassed",
+                            );
+                            sound_file_row(
+                                ui,
+                                &mut draft.alerts.yellow_sound,
+                                SoundField::Yellow,
+                                &mut open_browser,
+                            );
+                            ui.checkbox(
+                                &mut draft.alerts.red_sound_enabled,
+                                "Play sound when the red limit is surpassed",
+                            );
+                            sound_file_row(
+                                ui,
+                                &mut draft.alerts.red_sound,
+                                SoundField::Red,
+                                &mut open_browser,
+                            );
+
+                            ui.add_space(6.0);
+                            ui.separator();
+                            // Lower the GPU power limit to its minimum when a pin
+                            // reaches the selected limit. Applying it needs root, so
+                            // the first change asks polkit (pkexec) for a password.
+                            ui.strong("Automatic power limit");
+                            let auto_labels = ["Never", "On yellow limit", "On red limit"];
+                            let mut auto_idx = draft.alerts.auto_min_power.index();
+                            ui.horizontal(|ui| {
+                                ui.label("Lower the power limit to its minimum:");
+                                egui::ComboBox::from_label("")
+                                    .selected_text(auto_labels[auto_idx])
+                                    .show_ui(ui, |ui| {
+                                        for (i, label) in auto_labels.iter().enumerate() {
+                                            ui.selectable_value(&mut auto_idx, i, *label);
+                                        }
+                                    });
+                            });
+                            draft.alerts.auto_min_power = AutoMinPower::from_index(auto_idx);
+                            ui.label(
+                                egui::RichText::new(
+                                    "When a pin reaches the selected limit, the power management limit is \
+        set to the card's minimum and restored once the current has been back below it for 30 \
+        seconds. Applying limits needs administrator rights: enabling this opens an \
+        authentication dialog right away, and turns the option back off if it is not \
+        accepted. While enabled, the built-in alert sounds play their powering-down \
+        variants instead. Settings are remembered: when the app starts with this option on, \
+        it asks for the administrator password right away (again for this power-limiting \
+        feature) and disables the option if the prompt is not granted.",
+                                )
+                                .weak()
+                                .size(12.0),
+                            );
+                            // Make the purpose of every authentication prompt
+                            // explicit here too, and keep the user posted on the
+                            // outcome (also feedback for the Test button below).
+                            if self.auto_power_pending_auth {
                                 ui.label(
                                     egui::RichText::new(
-                                        "Privileged power access: granted (administrator \
-credentials were given for the GPU power limiting).",
+                                        "An administrator authentication for the GPU power limiting and \
+        the privileged process kill is open — please answer the authentication dialog. Without it \
+        the options that need it turn back off.",
                                     )
-                                    .weak()
-                                    .size(12.0),
+                                    .color(egui::Color32::from_rgb(240, 210, 40)),
                                 );
-                            }
-                            AuthState::Failed => {
-                                ui.label(
-                                    egui::RichText::new(
-                                        "Privileged power access: not granted. \"Test privileged \
-access\" asks for the administrator password for the GPU power limiting again.",
-                                    )
-                                    .weak()
-                                    .size(12.0),
-                                );
-                            }
-                            AuthState::Idle => {}
-                        }
-                    }
-                    if ui.button("Test privileged access").clicked() {
-                        // Spawn the helper now, so the password prompt shows
-                        // here instead of on the first limit excursion.
-                        let _ = self.cmd_tx.send(Cmd::GrantPowerAccess);
-                    }
-
-                    ui.add_space(6.0);
-                    ui.separator();
-                    // Last-resort protection: SIGKILL the top GPU-using
-                    // process on the rising edge into the red range.
-                    ui.strong("Critical-alert safeguard");
-                    ui.checkbox(
-                        &mut draft.alerts.kill_top_process_on_red,
-                        "Kill the top GPU-using process when the red limit is reached",
-                    );
-                    ui.label(
-                        egui::RichText::new(
-                            "As a last resort, the first process of the \"Top GPU processes\" list \
-(is ranked by utilization, then VRAM usage) is killed with SIGKILL the moment a pin current \
-first reaches the red limit. It fires once per excursion, never while the limit merely stays \
-exceeded, and only processes of your own user can be killed (the app itself is never a \
-target). The killed process gets no chance to save its work. Disabled by default. When a \
-process is terminated, the terminating sound below plays: it cannot be interrupted and it \
-replaces the critical alert sound of that same excursion.",
-                        )
-                        .weak()
-                        .size(12.0),
-                    );
-                    sound_file_row(
-                        ui,
-                        &mut draft.alerts.terminating_sound,
-                        SoundField::Terminating,
-                        &mut open_browser,
-                    );
-
-                    ui.add_space(6.0);
-                    ui.separator();
-                    ui.strong("Sampling");
-                    ui.horizontal(|ui| {
-                        ui.label("Sample interval:");
-                        ui.add(
-                            egui::DragValue::new(&mut draft.poll_ms)
-                                .range(100..=10_000)
-                                .suffix(" ms"),
-                        );
-                    });
-
-                    ui.add_space(6.0);
-                    ui.separator();
-                    // The HTTP server mirroring this UI for other devices.
-                    // Disabled by default; applied on Accept, where a busy or
-                    // invalid port is rejected with a warning (a server that
-                    // is already running keeps its port).
-                    ui.strong("Web server");
-                    ui.horizontal(|ui| {
-                        ui.label("Port:");
-                        if ui
-                            .add(
-                                egui::TextEdit::singleline(&mut draft.web_port).desired_width(70.0),
-                            )
-                            .changed()
-                        {
-                            // Digits only; applied on Accept.
-                            draft.web_port = draft
-                                .web_port
-                                .chars()
-                                .filter(|c| c.is_ascii_digit())
-                                .collect();
-                        }
-                        ui.checkbox(&mut draft.web_enabled, "Enable");
-                        if draft.web_enabled {
-                            if let WebState::Running(server) = &self.web {
-                                ui.label(
-                                    egui::RichText::new(format!("active on port {}", server.port))
-                                        .weak(),
-                                );
-                            }
-                        }
-                    });
-
-                    ui.add_space(6.0);
-                    ui.separator();
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        // Right-to-left: added first = rightmost, so Accept
-                        // ends up to the left of Cancel and the reset button
-                        // is leftmost of the row.
-                        if ui.button("Cancel").clicked() {
-                            cancel = true;
-                        }
-                        accept = ui
-                            .add_enabled(
-                                *draft != current,
-                                egui::Button::new(egui::RichText::new("Accept").strong()),
-                            )
-                            .clicked();
-                        // Restores every setting to its built-in default in
-                        // the draft (limits, sounds, automatic power limit,
-                        // safeguard, interval, web server); Accept commits
-                        // and persists the reset, Cancel still discards it.
-                        let already_default = *draft == Config::defaults();
-                        if ui
-                            .add_enabled(!already_default, egui::Button::new("Reset defaults"))
-                            .on_hover_text(if already_default {
-                                "The settings shown are already the defaults."
                             } else {
-                                "Restore every setting to its built-in default.\
-Apply the reset with Accept, discard it with Cancel."
-                            })
-                            .clicked()
-                        {
-                            *draft = Config::defaults();
-                        }
+                                match power_auth {
+                                    AuthState::Active => {
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "Privileged power access: granted (administrator \
+        credentials were given for the GPU power limiting and the privileged process kill).",
+                                            )
+                                            .weak()
+                                            .size(12.0),
+                                        );
+                                    }
+                                    AuthState::Failed => {
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "Privileged power access: not granted. \"Test privileged \
+        access\" asks for the administrator password for the GPU power limiting and the privileged \
+        process kill again.",
+                                            )
+                                            .weak()
+                                            .size(12.0),
+                                        );
+                                    }
+                                    AuthState::Idle => {}
+                                }
+                            }
+                            if ui.button("Test privileged access").clicked() {
+                                // Spawn the helper now, so the password prompt shows
+                                // here instead of at the first privileged change
+                                // (limit set or cross-user kill).
+                                let _ = self.cmd_tx.send(Cmd::GrantPowerAccess);
+                            }
+
+                            ui.add_space(6.0);
+                            ui.separator();
+                            // Last-resort protection: SIGKILL the top GPU-using
+                            // process on the rising edge into the red range.
+                            ui.strong("Critical-alert safeguard");
+                            ui.checkbox(
+                                &mut draft.alerts.kill_top_process_on_red,
+                                "Kill the top GPU-using process when the red limit is reached",
+                            );
+                            ui.add_enabled(
+                                draft.alerts.kill_top_process_on_red,
+                                egui::Checkbox::new(
+                                    &mut draft.alerts.kill_other_users_processes,
+                                    "Also kill processes of other users (administrator credentials required)",
+                                ),
+                            );
+                            ui.label(
+                                egui::RichText::new(
+                                    "As a last resort, the first process of the \"Top GPU processes\" list \
+        (is ranked by utilization, then VRAM usage) is killed with SIGKILL the moment a pin current \
+        first reaches the red limit. It fires once per excursion, never while the limit merely stays \
+        exceeded, and the app itself is never a target. The killed process gets no chance to save \
+        its work. Disabled by default. When a process is terminated, the terminating sound below \
+        plays: it cannot be interrupted and it replaces the critical alert sound of that same \
+        excursion.\nBy default only processes of your own user can be killed. With the option above, the \
+        SIGKILL goes through the privileged helper instead, so processes of other users — for \
+        example an inference service running as root — can be terminated as well. That requires \
+        the administrator credentials from the power section (asked once, shared with the power \
+        limiting), and like the automatic power limit the option turns back off automatically \
+        when the authentication is denied.",
+                                )
+                                .weak()
+                                .size(12.0),
+                            );
+                            sound_file_row(
+                                ui,
+                                &mut draft.alerts.terminating_sound,
+                                SoundField::Terminating,
+                                &mut open_browser,
+                            );
+
+                            ui.add_space(6.0);
+                            ui.separator();
+                            ui.strong("Sampling");
+                            ui.horizontal(|ui| {
+                                ui.label("Sample interval:");
+                                ui.add(
+                                    egui::DragValue::new(&mut draft.poll_ms)
+                                        .range(100..=10_000)
+                                        .suffix(" ms"),
+                                );
+                            });
+
+                            ui.add_space(6.0);
+                            ui.separator();
+                            // The HTTP server mirroring this UI for other devices.
+                            // Disabled by default; applied on Accept, where a busy or
+                            // invalid port is rejected with a warning (a server that
+                            // is already running keeps its port).
+                            ui.strong("Web server");
+                            ui.horizontal(|ui| {
+                                ui.label("Port:");
+                                if ui
+                                    .add(
+                                        egui::TextEdit::singleline(&mut draft.web_port).desired_width(70.0),
+                                    )
+                                    .changed()
+                                {
+                                    // Digits only; applied on Accept.
+                                    draft.web_port = draft
+                                        .web_port
+                                        .chars()
+                                        .filter(|c| c.is_ascii_digit())
+                                        .collect();
+                                }
+                                ui.checkbox(&mut draft.web_enabled, "Enable");
+                                if draft.web_enabled {
+                                    if let WebState::Running(server) = &self.web {
+                                        ui.label(
+                                            egui::RichText::new(format!("active on port {}", server.port))
+                                                .weak(),
+                                        );
+                                    }
+                                }
+                            });
+
+                        });
                     });
                 });
             if !open {
@@ -995,6 +1042,11 @@ Apply the reset with Accept, discard it with Cancel."
                 } else if let WebState::Running(server) = &self.web {
                     draft.web_port = server.port.to_string();
                 }
+                // The cross-user kill only exists while the safeguard itself
+                // is on.
+                if !draft.alerts.kill_top_process_on_red {
+                    draft.alerts.kill_other_users_processes = false;
+                }
                 self.config = draft;
                 // Persist the accepted settings (the applied state, after
                 // any web start/stop rollback above). Save errors surface in
@@ -1005,15 +1057,19 @@ Apply the reset with Accept, discard it with Cancel."
                         format!("Settings were applied, but could not be saved: {e}"),
                     );
                 }
-                // Newly enabled automatic power limit: authenticate the
-                // privileged helper right now. The prompt appears while the
-                // user is here (instead of possibly going unnoticed at the
-                // first excursion), and a denied authentication turns the
-                // option back off via the pending-auth check in `update`.
-                let auto = self.config.alerts.auto_min_power;
-                if auto != AutoMinPower::Off && auto != current.alerts.auto_min_power {
-                    self.auto_power_pending_auth =
-                        current.alerts.auto_min_power == AutoMinPower::Off;
+                // Newly enabled privileged options (automatic power limit,
+                // killing other users' processes): authenticate the helper
+                // right now. The prompt appears while the user is here
+                // (instead of possibly going unnoticed at the first
+                // excursion), one authentication serves both, and a denied
+                // authentication turns the options back off via the
+                // pending-auth check in `update`.
+                let needs_privilege = self.config.alerts.auto_min_power != AutoMinPower::Off
+                    || self.config.alerts.kill_other_users_processes;
+                let had_privilege = current.alerts.auto_min_power != AutoMinPower::Off
+                    || current.alerts.kill_other_users_processes;
+                if needs_privilege {
+                    self.auto_power_pending_auth = !had_privilege;
                     let _ = self.cmd_tx.send(Cmd::GrantPowerAccess);
                 }
             }

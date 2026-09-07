@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use crate::alerts::{
     auto_power_action, critical_alert_edge, kill_guard_action, over_limit_sound, AlertState,
-    AutoPowerState, CriticalAlertState, KillGuardState, SoundPlayer,
+    AutoPowerState, CriticalAlertState, KillGuardState, Sound, SoundPlayer,
 };
 use crate::web::WebData;
 
@@ -129,15 +129,27 @@ pub(crate) enum AuthState {
     Failed,
 }
 
-/// Applies GPU power limits with elevated privileges.
+/// The outcome of a privileged kill, relayed by the helper's reader thread
+/// and consumed by the poller on its next poll.
+pub(crate) struct KillOutcome {
+    pub(crate) pid: u32,
+    pub(crate) success: bool,
+    /// The helper's error text when the kill failed (empty on success).
+    pub(crate) message: String,
+}
+
+/// Applies GPU power limits — and, when the safeguard asks for it, SIGKILLs
+/// processes — with elevated privileges.
 ///
-/// NVML's power-limit setter requires root, while the app runs as a normal
-/// user. When a limit change is needed (manually or by the automatic
-/// minimum-power feature), the app runs *itself* through polkit's `pkexec`,
-/// which prompts for a password via the desktop's polkit agent and execs the
-/// helper mode ([`run_power_helper`]) as root. The helper stays alive for the
-/// app's lifetime, so the password is asked once; it speaks a one-line
-/// protocol over stdin/stdout and nothing else.
+/// NVML's power-limit setter (and killing other users' processes) requires
+/// root, while the app runs as a normal user. When a privileged change is
+/// needed (a limit set manually or by the automatic minimum-power feature,
+/// or the cross-user kill of the critical-alert safeguard), the app runs
+/// *itself* through polkit's `pkexec`, which prompts for a password via the
+/// desktop's polkit agent and execs the helper mode ([`run_power_helper`])
+/// as root. The helper stays alive for the app's lifetime, so the password
+/// is asked once and serves both purposes; it speaks a one-line protocol
+/// over stdin/stdout and nothing else.
 pub(crate) struct PowerHelper {
     child: Option<Child>,
     /// Short human-readable status (latest helper result or failure), kept by
@@ -147,6 +159,9 @@ pub(crate) struct PowerHelper {
     /// Authentication state, written by the reader thread (and on spawn
     /// failures) and mirrored into [`WebData::power_auth`] by the poller.
     auth: Arc<Mutex<AuthState>>,
+    /// Outcome of the last `KILL` command, set by the reader thread and
+    /// consumed by the poller (`None` while no reply is outstanding).
+    kill_outcome: Arc<Mutex<Option<KillOutcome>>>,
 }
 
 impl PowerHelper {
@@ -155,6 +170,7 @@ impl PowerHelper {
             child: None,
             status: Arc::new(Mutex::new(None)),
             auth: Arc::new(Mutex::new(AuthState::Idle)),
+            kill_outcome: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -194,8 +210,8 @@ impl PowerHelper {
         // announce here (in the user's own UI, not only in polkit's dialog)
         // what the root credentials are for: the GPU power limiting.
         self.set_status(
-            "Administrator authentication for the GPU power limiting requested — \
-             please confirm in the authentication dialog."
+            "Administrator authentication for the GPU power limiting and the privileged \
+process kill requested — please confirm in the authentication dialog."
                 .into(),
         );
         let spawned = Command::new("pkexec")
@@ -221,11 +237,18 @@ impl PowerHelper {
         if let Some(out) = child.stdout.take() {
             let status = self.status.clone();
             let auth = self.auth.clone();
+            let kill_outcome = self.kill_outcome.clone();
             thread::spawn(move || {
                 for line in BufReader::new(out).lines().map_while(Result::ok) {
                     // Any reply proves the helper is up as root (an ERR is a
                     // helper/NVML failure, not an authentication one).
                     *auth.lock().unwrap() = AuthState::Active;
+                    if line.starts_with("KILL ") {
+                        // A safeguard-kill outcome: consumed by the poller,
+                        // not part of the limit-centric status note.
+                        *kill_outcome.lock().unwrap() = Some(parse_kill_line(&line));
+                        continue;
+                    }
                     match line.strip_prefix("ERR ") {
                         Some(msg) => *status.lock().unwrap() = Some(format!("Power helper: {msg}")),
                         None => {
@@ -253,10 +276,12 @@ impl PowerHelper {
         true
     }
 
-    /// Send one command to the helper, starting it if needed.
-    fn request(&mut self, line: &str) {
+    /// Send one command to the helper, starting it if needed. Returns
+    /// whether the command reached the helper (it died in the meantime if
+    /// not; the next request respawns and re-prompts it).
+    fn request(&mut self, line: &str) -> bool {
         if !self.ensure_running() {
-            return;
+            return false;
         }
         let child = self.child.as_mut().unwrap();
         let sent = child
@@ -268,6 +293,9 @@ impl PowerHelper {
             // next request respawns (and re-prompts) it.
             self.child = None;
             self.set_status("Privileged power helper exited.".into());
+            false
+        } else {
+            true
         }
     }
 
@@ -282,6 +310,18 @@ impl PowerHelper {
     pub(crate) fn ping(&mut self) {
         self.request("PING");
     }
+
+    /// SIGKILL `pid` through the helper (asks for the password on first
+    /// use). Returns whether the command was sent; the outcome arrives via
+    /// [`PowerHelper::take_kill_outcome`], usually on the next poll.
+    pub(crate) fn kill(&mut self, pid: u32) -> bool {
+        self.request(&format!("KILL {pid}"))
+    }
+
+    /// Consume the helper's reply to the last `KILL`, if it answered yet.
+    pub(crate) fn take_kill_outcome(&self) -> Option<KillOutcome> {
+        self.kill_outcome.lock().unwrap().take()
+    }
 }
 
 impl Drop for PowerHelper {
@@ -295,9 +335,11 @@ impl Drop for PowerHelper {
 
 /// Privileged helper mode (`--power-helper`, normally only started through
 /// pkexec by [`PowerHelper`]): read one-line commands from stdin and apply
-/// power limits via NVML with the elevated privileges.
+/// power limits via NVML — or SIGKILL a process, for the cross-user kill of
+/// the critical-alert safeguard — with the elevated privileges.
 ///
-/// Protocol: `SET <watts>` answers `OK` or `ERR <msg>`, `PING` answers `OK`,
+/// Protocol: `SET <watts>` answers `OK` or `ERR <msg>`, `PING` answers
+/// `OK`, `KILL <pid>` answers `KILL OK <pid>` or `KILL ERR <pid> <msg>`,
 /// `EXIT` ends. Only wattages in a sane range are accepted; the helper never
 /// touches I2C, sounds or any configuration.
 pub(crate) fn run_power_helper() -> i32 {
@@ -328,6 +370,15 @@ pub(crate) fn run_power_helper() -> i32 {
                 }
                 Ok(_) => "ERR watts out of range".to_owned(),
                 Err(_) => "ERR watts is not a number".to_owned(),
+            }
+        } else if let Some(rest) = line.strip_prefix("KILL ") {
+            match rest.trim().parse::<u32>() {
+                Ok(pid) if pid != 0 => match kill_process(pid) {
+                    Ok(()) => format!("KILL OK {pid}"),
+                    Err(e) => format!("KILL ERR {pid} {e}"),
+                },
+                Ok(_) => "KILL ERR 0 pid must be at least 1".to_owned(),
+                Err(_) => "KILL ERR 0 pid is not a number".to_owned(),
             }
         } else {
             "ERR unknown command".to_owned()
@@ -400,6 +451,12 @@ pub(crate) fn spawn_poller(
         let mut power_helper = PowerHelper::new();
         let mut auto_power = AutoPowerState::default();
         let mut kill_guard = KillGuardState::default();
+        // A cross-user kill dispatched through the helper, awaiting its
+        // reply (resolved on the next poll); and the alert sound the current
+        // excursion earned, held back until that reply is known (a
+        // termination replaces it with the critical-terminating sound).
+        let mut pending_kill: Option<GpuProcess> = None;
+        let mut held_sound: Option<Sound> = None;
         let mut critical_state = CriticalAlertState::default();
 
         loop {
@@ -544,10 +601,59 @@ pub(crate) fn spawn_poller(
             // on the rising edge into the red range — and then repeating while
             // the current stays red, at most once per cooldown and never over
             // a still-playing kill sound — SIGKILL the top GPU-using process.
-            // Kills need no privileges (same-user processes only); the outcome
-            // goes to stderr and (freshly) into the desktop UI.
+            // By default the kill is unprivileged (same-user processes only;
+            // others answer EPERM, which bounds the blast radius); with
+            // `Settings::kill_other_users_processes` it goes through the
+            // privileged helper instead, so its outcome arrives on the next
+            // poll and the alert sound this excursion earned waits for it.
+            // The outcome goes to stderr and (freshly) into the desktop UI.
             let mut terminated = false;
-            if kill_guard_action(
+            let mut kill_note: Option<String> = None;
+            if let Some(p) = pending_kill.take() {
+                // A cross-user kill was dispatched on an earlier poll:
+                // resolve it before anything else kill-related.
+                match power_helper.take_kill_outcome() {
+                    Some(o) if o.pid == p.pid => {
+                        terminated = o.success;
+                        kill_note = Some(if o.success {
+                            println!(
+                                "Critical-alert safeguard: killed {} (pid {})",
+                                p.name, p.pid
+                            );
+                            format!(
+                                "Critical-alert safeguard: killed {} (pid {}).",
+                                p.name, p.pid
+                            )
+                        } else {
+                            eprintln!(
+                                "Critical-alert safeguard: cannot kill {} (pid {}): {}",
+                                p.name, p.pid, o.message
+                            );
+                            format!(
+                                "Critical-alert safeguard: could not kill {} (pid {}): {}.",
+                                p.name, p.pid, o.message
+                            )
+                        });
+                    }
+                    Some(_) => {
+                        // Stray reply for an already-resolved kill: drop it
+                        // and keep waiting for the pending one's.
+                        pending_kill = Some(p);
+                    }
+                    None if power_helper.auth_state() == AuthState::Failed => {
+                        // The helper is gone and no reply will come.
+                        eprintln!(
+                            "Critical-alert safeguard: cannot kill {} (pid {}): privileged helper not running.",
+                            p.name, p.pid
+                        );
+                        kill_note = Some(format!(
+                            "Critical-alert safeguard: could not kill {} (pid {}): privileged helper not running.",
+                            p.name, p.pid
+                        ));
+                    }
+                    None => pending_kill = Some(p), // reply still missing
+                }
+            } else if kill_guard_action(
                 &mut kill_guard,
                 max_current,
                 &settings,
@@ -556,43 +662,70 @@ pub(crate) fn spawn_poller(
                 kill_guard.note_kill_attempt();
                 match top_process {
                     Some(p) => {
-                        let note = match kill_process(p.pid) {
-                            Ok(()) => {
-                                terminated = true;
-                                println!(
-                                    "Critical-alert safeguard: killed {} (pid {})",
-                                    p.name, p.pid
-                                );
-                                format!(
-                                    "Critical-alert safeguard: killed {} (pid {}).",
-                                    p.name, p.pid
-                                )
-                            }
-                            Err(e) => {
+                        if settings.kill_other_users_processes {
+                            if power_helper.kill(p.pid) {
+                                // Outcome + sound follow the helper's reply.
+                                pending_kill = Some(p);
+                            } else {
                                 eprintln!(
-                                    "Critical-alert safeguard: cannot kill {} (pid {}): {e}",
+                                    "Critical-alert safeguard: cannot kill {} (pid {}): privileged helper not running.",
                                     p.name, p.pid
                                 );
-                                format!(
-                                    "Critical-alert safeguard: could not kill {} (pid {}): {e}",
+                                kill_note = Some(format!(
+                                    "Critical-alert safeguard: could not kill {} (pid {}): privileged helper not running.",
                                     p.name, p.pid
-                                )
+                                ));
                             }
-                        };
-                        let mut d = data.lock().unwrap();
-                        let now = d.start.elapsed().as_secs_f64();
-                        d.kill_note = Some((now, note));
+                        } else {
+                            match kill_process(p.pid) {
+                                Ok(()) => {
+                                    terminated = true;
+                                    println!(
+                                        "Critical-alert safeguard: killed {} (pid {})",
+                                        p.name, p.pid
+                                    );
+                                    kill_note = Some(format!(
+                                        "Critical-alert safeguard: killed {} (pid {}).",
+                                        p.name, p.pid
+                                    ));
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "Critical-alert safeguard: cannot kill {} (pid {}): {e}",
+                                        p.name, p.pid
+                                    );
+                                    kill_note = Some(format!(
+                                        "Critical-alert safeguard: could not kill {} (pid {}): {e}",
+                                        p.name, p.pid
+                                    ));
+                                }
+                            }
+                        }
                     }
                     None => println!("Critical-alert safeguard: no GPU process to kill."),
                 }
+            }
+            if let Some(note) = kill_note {
+                let mut d = data.lock().unwrap();
+                let now = d.start.elapsed().as_secs_f64();
+                d.kill_note = Some((now, note));
             }
 
             // Sounds: an actual termination plays the critical-terminating
             // sound as a priority request (nothing queues ahead of it and
             // nothing interrupts it once playing); a failed kill leaves the
             // regular red alert sound, which is what this excursion earned.
+            // While a cross-user kill awaits its reply the alert sound is
+            // held back: a termination replaces it, a failure plays it now.
             if terminated {
                 player.play_priority(settings.terminating_sound.clone());
+                held_sound = None;
+            } else if pending_kill.is_some() {
+                if let Some(sound) = alert_sound {
+                    held_sound = Some(sound);
+                }
+            } else if let Some(sound) = held_sound.take() {
+                player.play(sound);
             } else if let Some(sound) = alert_sound {
                 player.play(sound);
             }
@@ -616,14 +749,40 @@ pub(crate) fn spawn_poller(
     cmd_tx
 }
 
-/// SIGKILL a process (the critical-alert safeguard). No privileges are
-/// involved: processes owned by other users answer with EPERM (the app runs
-/// unprivileged, which is exactly the right blast radius for a safeguard).
+/// SIGKILL a process (the critical-alert safeguard). Called unprivileged by
+/// the poller by default: processes owned by other users answer with EPERM
+/// (the app runs as the user, which is exactly the right blast radius for a
+/// safeguard); called as root by the privileged helper when
+/// `Settings::kill_other_users_processes` routes the kill through it.
 fn kill_process(pid: u32) -> io::Result<()> {
     if unsafe { libc::kill(pid as libc::c_int, libc::SIGKILL) } == 0 {
         Ok(())
     } else {
         Err(io::Error::last_os_error())
+    }
+}
+
+/// Parse the helper's reply to a `KILL` command: `KILL OK <pid>` or
+/// `KILL ERR <pid> <msg>` (a malformed line reads as a failed kill).
+fn parse_kill_line(line: &str) -> KillOutcome {
+    let (rest, success) = match line.strip_prefix("KILL OK ") {
+        Some(rest) => (rest, true),
+        None => match line.strip_prefix("KILL ERR ") {
+            Some(rest) => (rest, false),
+            None => {
+                return KillOutcome {
+                    pid: 0,
+                    success: false,
+                    message: line.to_owned(),
+                }
+            }
+        },
+    };
+    let (pid_text, message) = rest.split_once(' ').unwrap_or((rest, ""));
+    KillOutcome {
+        pid: pid_text.parse().unwrap_or(0),
+        success,
+        message: message.to_owned(),
     }
 }
 
@@ -1296,5 +1455,17 @@ mod tests {
         assert_eq!(process_name(u32::MAX), "pid 4294967295");
         // The current process always has a readable /proc/comm.
         assert!(!process_name(std::process::id()).is_empty());
+    }
+
+    #[test]
+    fn parse_kill_line_reads_pid_and_outcome() {
+        let ok = parse_kill_line("KILL OK 4242");
+        assert!((ok.pid, ok.success, ok.message.is_empty()) == (4242, true, true));
+        let err = parse_kill_line("KILL ERR 4242 Operation not permitted (os error 1)");
+        assert!((err.pid, err.success) == (4242, false));
+        assert_eq!(err.message, "Operation not permitted (os error 1)");
+        // A malformed line must not panic and must read as a failed kill.
+        let bad = parse_kill_line("KILL BOGUS");
+        assert!(!bad.success);
     }
 }
