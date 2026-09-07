@@ -109,7 +109,7 @@ src/persist.rs   SETTINGS PERSISTENCE. The applied `ui::Config` is stored as
                  ignores unknown keys, defaults missing ones, clamps numbers
                  into the panel's ranges, and reports a corrupt file (which
                  it never touches) instead of silently resetting it.
-src/ui.rs        DESKTOP UI. `App` (eframe::App::update: main window with
+src/ui.rs        DESKTOP UI. `App` (eframe::App::ui: main window with
                  the "Top GPU processes" list, the flashing critical-current
                  banner next to the total power, settings dialog, the About
                  dialog (scrollable embedded license text, `ABOUT_TEXT` from
@@ -365,6 +365,22 @@ Tests that bind ports use `free_port()` (bind :0, drop, reuse).
   poll, first at 50) — don't remove it; it's the canary for I2C bus
   contention.
 - Web `/data` `window` param is clamped to 60..=3600 s server-side.
-- eframe 0.31 / egui 0.31 API (e.g. `StrokeKind::Middle` in painter calls);
-  rodio 0.20 API (`OutputStream::try_default`, `Sink`, `Decoder`) — 0.21+
+- eframe 0.36 / egui 0.36 API. `eframe::App`'s entry point is
+  `fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame)` — the app
+  receives a margin-less root `Ui` (panels are built on it; in 0.36
+  `CentralPanel::show` takes `&mut Ui`, `Window::show` still takes
+  `&Context`, and `Ui::fonts` became `Ui::fonts_mut` with the immutable
+  `FontsView`). eframe 0.36 defaults to the wgpu renderer; this project
+  pins the 0.31-era glow (OpenGL) backend explicitly in `Cargo.toml`
+  (`default-features = false` + feature list), plus a direct `winit` dep
+  that re-enables the two `winit/default` features eframe no longer turns
+  on (`wayland-dlopen`, `wayland-csd-adwaita`).
+- `cargo audit` is clean except one allowed (non-failing) warning:
+  `ttf-parser` (unmaintained) stays in the lockfile through winit's
+  target-specific `sctk-adwaita` → `ab_glyph` dependency (Wayland CSD) and
+  cannot be removed without dropping winit. `quick-xml` ≥0.41 (via
+  `wayland-scanner`) is the only copy left; the vulnerable 0.30 chain
+  (`zbus 4` → `zbus_xml 4`) is gone since eframe 0.34 pulls
+  `atspi` → `zbus 5`.
+- rodio 0.20 API (`OutputStream::try_default`, `Sink`, `Decoder`) — 0.21+
   renamed these.

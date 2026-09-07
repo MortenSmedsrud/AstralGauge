@@ -4,6 +4,24 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-eframe = "0.31"
+# eframe 0.36 defaults to the wgpu renderer; keep the 0.31-era glow
+# (OpenGL) backend explicitly, plus the remaining default features.
+eframe = {
+    version = "0.36",
+    default-features = false,
+    features = [
+        "accesskit",
+        "default_fonts",
+        "glow",
+        "links",
+        "wayland",
+        "web_screen_reader",
+        "x11",
+    ],
+}
+# eframe 0.36 dropped `winit/default`; re-enable the two features it
+# used to bring in (dynamic libwayland loading, Adwaita client-side
+# decorations on Wayland) so the winit feature set is unchanged.
+winit = { version = "0.30", features = ["wayland-csd-adwaita", "wayland-dlopen"] }
 libc = "0.2"
 rodio = "0.20"

@@ -326,7 +326,7 @@ Click to choose your own .wav file instead.",
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // Sample ingestion happens on the poller thread (WebData::record);
         // here we only mirror the UI settings and render from the shared
         // data, which keeps updating even while this window is minimized.
@@ -371,7 +371,7 @@ impl eframe::App for App {
 
         let window_secs = HORIZONS_MIN[self.window_idx as usize] as f64 * 60.0;
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             // GPU name on the left, settings button (gear) on the right.
             ui.horizontal(|ui| {
                 ui.heading("ASUS 5090 ROG Astral");
@@ -622,7 +622,7 @@ impl eframe::App for App {
                 let spacing = 8.0;
                 let graph_w = (ui.available_width() - 2.0 * spacing) / 3.0;
                 let item_spacing_y = ui.spacing().item_spacing.y;
-                let label_h = ui.fonts(|f| f.row_height(&egui::FontId::default()));
+                let label_h = ui.fonts_mut(|f| f.row_height(&egui::FontId::default()));
                 let graph_h = ((ui.available_height() - 3.0 * label_h - 6.0 * item_spacing_y)
                     / 3.0)
                     .max(60.0);
@@ -692,7 +692,7 @@ impl eframe::App for App {
                 .resizable(false)
                 .collapsible(false)
                 .default_pos([300.0, 350.0])
-                .show(ctx, |ui| {
+                .show(ui.ctx(), |ui| {
                     ui.label(msg.as_str());
                     ui.add_space(8.0);
                     if ui.button("OK").clicked() {
@@ -716,7 +716,7 @@ impl eframe::App for App {
                 .collapsible(false)
                 .resizable(false)
                 .default_pos([150.0, 90.0])
-                .show(ctx, |ui| {
+                .show(ui.ctx(), |ui| {
                     ui.set_min_width(400.0);
 
                     ui.strong("Current limits");
@@ -1037,7 +1037,7 @@ Apply the reset with Accept, discard it with Cancel."
                 .collapsible(false)
                 .default_pos([260.0, 200.0])
                 .default_width(360.0)
-                .show(ctx, |ui| {
+                .show(ui.ctx(), |ui| {
                     ui.monospace(fd.dir.display().to_string());
                     if let Some(err) = &fd.error {
                         ui.colored_label(egui::Color32::from_rgb(240, 120, 120), err);
@@ -1118,7 +1118,7 @@ Apply the reset with Accept, discard it with Cancel."
             .open(&mut about_open)
             .default_pos([120.0, 120.0])
             .default_size([680.0, 560.0])
-            .show(ctx, |ui| {
+            .show(ui.ctx(), |ui| {
                 ui.label(
                     egui::RichText::new(format!("AstralGauge {}", env!("CARGO_PKG_VERSION")))
                         .strong(),
@@ -1143,7 +1143,8 @@ Apply the reset with Accept, discard it with Cancel."
         } else {
             self.config.poll_ms
         };
-        ctx.request_repaint_after(Duration::from_millis(idle_ms));
+        ui.ctx()
+            .request_repaint_after(Duration::from_millis(idle_ms));
     }
 }
 
