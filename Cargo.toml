@@ -19,9 +19,24 @@ eframe = {
         "x11",
     ],
 }
-# eframe 0.36 dropped `winit/default`; re-enable the two features it
-# used to bring in (dynamic libwayland loading, Adwaita client-side
-# decorations on Wayland) so the winit feature set is unchanged.
-winit = { version = "0.30", features = ["wayland-csd-adwaita", "wayland-dlopen"] }
+# eframe 0.36 dropped `winit/default`; this direct dep re-enables the
+# features that used to come with it, with `default-features = false`
+# so nothing else re-adds them — notably the default CSD font backend
+# `ab_glyph` → unmaintained `ttf-parser` (RUSTSEC-2026-0192) stays out
+# of the graph. The Adwaita CSD is kept via the `crossfont` backend
+# (system fontconfig fonts) instead. Cost: building the CSD needs a C
+# compiler (crossfont builds a bundled FreeType) and libfontconfig-dev,
+# on top of the ALSA dev packages.
+winit = {
+    version = "0.30",
+    default-features = false,
+    features = [
+        "rwh_06",
+        "wayland-csd-adwaita-crossfont",
+        "wayland-dlopen",
+        "wayland",
+        "x11",
+    ],
+}
 libc = "0.2"
 rodio = "0.20"

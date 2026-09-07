@@ -281,6 +281,8 @@ Used by:
   zune-core 0.5.3
   zune-jpeg 0.5.15
   unicode-general-category 1.1.0
+  winapi 0.3.9
+  wio 0.2.2
   crc32fast 1.5.1
   foreign-types-macros 0.2.4
   foreign-types-shared 0.3.1
@@ -298,6 +300,7 @@ Used by:
   futures-macro 0.3.34
   futures-task 0.3.34
   futures-util 0.3.34
+  crossfont 0.8.1
   memmap2 0.9.11
   async-recursion 1.1.1
   weezl 0.1.12
@@ -325,6 +328,7 @@ Used by:
   core-foundation 0.9.4
   core-graphics-types 0.1.3
   core-graphics 0.23.2
+  core-text 20.1.0
   coreaudio-rs 0.11.3
   crossbeam-utils 0.8.23
   displaydoc 0.2.7
@@ -384,7 +388,6 @@ Used by:
   smol_str 0.2.2
   stable_deref_trait 1.2.1
   tempfile 3.27.0
-  ttf-parser 0.25.1
   unicode-segmentation 1.13.3
   url 2.5.8
   uuid 1.26.0
@@ -422,8 +425,6 @@ Used by:
   winit 0.30.13
   bytemuck 1.25.2
   bytemuck_derive 1.12.0
-  ab_glyph 0.2.32
-  ab_glyph_rasterizer 0.1.10
   accesskit 0.24.1
   accesskit_atspi_common 0.18.1
   accesskit_consumer 0.35.0
@@ -480,7 +481,6 @@ Used by:
   objc2-ui-kit 0.3.2
   oboe-sys 0.6.1
   oboe 0.6.1
-  owned_ttf_parser 0.25.1
   pin-project-internal 1.1.13
   pin-project-lite 0.2.17
   pin-project 1.1.13
@@ -510,6 +510,8 @@ Used by:
   unicode-ident 1.0.24
   vello_common 0.1.0
   vello_cpu 0.1.0
+  winapi-i686-pc-windows-gnu 0.4.0
+  winapi-x86_64-pc-windows-gnu 0.4.0
 ------------------------------------------------------------
 BSD 2-Clause "Simplified" License (BSD-2-Clause)
 ------------------------------------------------------------
@@ -678,6 +680,7 @@ Used by:
   smithay-client-toolkit 0.20.0
   calloop 0.13.0
   calloop 0.14.4
+  cstr 0.2.12
   slab 0.4.12
   tracing-attributes 0.1.31
   tracing-core 0.1.36
@@ -722,6 +725,8 @@ Used by:
   zbus-lockstep 0.5.2
   zvariant_utils 4.2.0
   winnow 1.0.4
+  freetype-rs 0.36.0
+  freetype-sys 0.20.1
   xml-rs 0.8.29
   phf 0.13.1
   phf_generator 0.13.1
@@ -738,6 +743,7 @@ Used by:
   xkbcommon-dl 0.4.2
   harfrust 0.12.0
   crunchy 0.2.4
+  yeslogic-fontconfig-sys 5.0.0
   quick-xml 0.41.0
 ------------------------------------------------------------
 Mozilla Public License 2.0 (MPL-2.0)
@@ -1117,6 +1123,7 @@ Exhibit B - "Incompatible With Secondary Licenses" Notice
   defined by the Mozilla Public License, v. 2.0.
 
 Used by:
+  dwrote 0.11.5
   symphonia-bundle-mp3 0.5.5
   symphonia-core 0.5.5
   symphonia-metadata 0.5.5

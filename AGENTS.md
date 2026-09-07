@@ -46,6 +46,10 @@ sh licenses.sh                  # regenerate the embedded license text
   (and revert to the built-in with its Reset button).
 - rodio pulls in cpal/ALSA: building needs the ALSA dev headers
   (`libasound2-dev` and `pkg-config` on Debian/Ubuntu).
+- The Wayland CSD titlebar is rendered through winit's `crossfont` font
+  backend (see the `winit` dep in `Cargo.toml`): building it additionally
+  needs a C compiler (crossfont compiles a bundled FreeType) and
+  `libfontconfig-dev` (Debian/Ubuntu: `libfontconfig1-dev`).
 
 ## File organization
 
@@ -373,14 +377,19 @@ Tests that bind ports use `free_port()` (bind :0, drop, reuse).
   `FontsView`). eframe 0.36 defaults to the wgpu renderer; this project
   pins the 0.31-era glow (OpenGL) backend explicitly in `Cargo.toml`
   (`default-features = false` + feature list), plus a direct `winit` dep
-  that re-enables the two `winit/default` features eframe no longer turns
-  on (`wayland-dlopen`, `wayland-csd-adwaita`).
-- `cargo audit` is clean except one allowed (non-failing) warning:
-  `ttf-parser` (unmaintained) stays in the lockfile through winit's
-  target-specific `sctk-adwaita` → `ab_glyph` dependency (Wayland CSD) and
-  cannot be removed without dropping winit. `quick-xml` ≥0.41 (via
-  `wayland-scanner`) is the only copy left; the vulnerable 0.30 chain
-  (`zbus 4` → `zbus_xml 4`) is gone since eframe 0.34 pulls
-  `atspi` → `zbus 5`.
+  with `default-features = false` that re-enables the features eframe no
+  longer turns on — `wayland-dlopen` and the Adwaita CSD via
+  `wayland-csd-adwaita-crossfont`. `default-features = false` matters:
+  without it the direct dep silently re-adds winit's whole default set,
+  including the default `ab_glyph` CSD backend → the unmaintained
+  `ttf-parser` (RUSTSEC-2026-0192).
+- `cargo audit` is clean. The former `ttf-parser` warning (RUSTSEC
+  2026-0192, unmaintained) is gone: the Wayland CSD now uses winit's
+  `crossfont` backend instead of the default `ab_glyph` one, so
+  `ttf-parser`/`owned_ttf_parser`/`ab_glyph` are out of the graph. The
+  price is a bundled-FreeType C build + libfontconfig at compile time
+  (see Running & developing). `quick-xml` ≥0.41 (via `wayland-scanner`)
+  is the only copy left; the vulnerable 0.30 chain (`zbus 4` →
+  `zbus_xml 4`) is gone since eframe 0.34 pulls `atspi` → `zbus 5`.
 - rodio 0.20 API (`OutputStream::try_default`, `Sink`, `Decoder`) — 0.21+
   renamed these.
