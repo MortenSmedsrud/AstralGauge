@@ -82,3 +82,7 @@ app's own arguments.)
 MIT — see [LICENSE](LICENSE). The full list of third-party licenses for the
 dependencies is embedded in the binary and shown in the About dialog
 (generated into `licenses.txt`).
+
+---
+
+*This project was developed with the assistance of the Zed agent and Qwen3.8-27B.*
