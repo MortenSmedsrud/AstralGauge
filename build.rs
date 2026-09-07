@@ -9,7 +9,7 @@
 //! (e.g. cargo-about is not installed).
 
 fn main() {
-    for input in ["Cargo.lock", "about.toml", "about-text.hbs"] {
+    for input in ["Cargo.lock", "about.toml", "licenses.py"] {
         println!("cargo:rerun-if-changed={input}");
     }
 
