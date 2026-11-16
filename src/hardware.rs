@@ -829,11 +829,26 @@ fn open_i2c(bus_number: Option<u32>) -> Result<File, String> {
 /// safeguard); called as root by the privileged helper when
 /// `Settings::kill_other_users_processes` routes the kill through it.
 fn kill_process(pid: u32) -> io::Result<()> {
-    if unsafe { libc::kill(pid as libc::c_int, libc::SIGKILL) } == 0 {
+    let target = single_process_pid(pid).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("refusing to signal pid {pid}: not a single process id"),
+        )
+    })?;
+    if unsafe { libc::kill(target, libc::SIGKILL) } == 0 {
         Ok(())
     } else {
         Err(io::Error::last_os_error())
     }
+}
+
+/// `pid` as a `kill()` target that addresses exactly one process, or `None`.
+/// `kill()` gives 0 and negative values group meanings — 0 is the caller's
+/// process group, -1 is *every process it may signal* (as root: the whole
+/// system), -N is process group N — so a bogus PID from NVML, which a plain
+/// `as` cast would wrap negative (u32::MAX → -1), must never get there.
+fn single_process_pid(pid: u32) -> Option<libc::pid_t> {
+    libc::pid_t::try_from(pid).ok().filter(|&p| p > 0)
 }
 
 /// Parse the helper's reply to a `KILL` command: `KILL OK <pid>` or
@@ -1546,6 +1561,20 @@ mod tests {
         assert!(err.contains("pin 2"), "{err}");
         pins[2] = pin(65.535, 8.4);
         assert!(check_plausible(&pins).is_err());
+    }
+
+    #[test]
+    fn only_single_process_pids_reach_kill() {
+        // Tested on the pure conversion only: a broken guard in a test of
+        // kill_process itself would SIGKILL every process of the test user.
+        assert_eq!(single_process_pid(1), Some(1));
+        assert_eq!(single_process_pid(4242), Some(4242));
+        assert_eq!(single_process_pid(i32::MAX as u32), Some(i32::MAX));
+        // 0 = own process group; above i32::MAX wraps to group/broadcast
+        // targets (u32::MAX would be kill(-1)).
+        assert_eq!(single_process_pid(0), None);
+        assert_eq!(single_process_pid(i32::MAX as u32 + 1), None);
+        assert_eq!(single_process_pid(u32::MAX), None);
     }
 
     #[test]
