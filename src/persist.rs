@@ -12,7 +12,7 @@
 
 use std::fmt::Write as _;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::alerts::{AutoMinPower, EmbeddedSound, Settings, Sound, MAX_LIMIT_A, MIN_LIMIT_A};
 
@@ -52,25 +52,43 @@ fn env_dir(name: &str) -> Option<PathBuf> {
 /// fields taken from `defaults`), `Ok(None)` no file yet (first run), and
 /// `Err(msg)` a corrupt file — left untouched, never silently reset.
 pub(crate) fn load(defaults: &StoredSettings) -> Result<Option<StoredSettings>, String> {
-    let path = match settings_path() {
-        Some(path) => path,
-        None => return Ok(None),
-    };
-    let text = match fs::read_to_string(&path) {
+    match settings_path() {
+        Some(path) => load_from(&path, defaults),
+        None => Ok(None),
+    }
+}
+
+/// [`load`] from an explicit file (the system service's
+/// `/etc/astral-gauge/settings.json`).
+pub(crate) fn load_from(
+    path: &Path,
+    defaults: &StoredSettings,
+) -> Result<Option<StoredSettings>, String> {
+    let text = match fs::read_to_string(path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
     };
-    let root = parse_json(&text).map_err(|e| format!("{}: {e}", path.display()))?;
-    from_json(&root, defaults)
+    parse(&text, defaults)
         .map(Some)
         .map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Parse a settings document (see [`load`] for the tolerance rules). Also
+/// used for settings that arrive over the service link.
+pub(crate) fn parse(text: &str, defaults: &StoredSettings) -> Result<StoredSettings, String> {
+    from_json(&parse_json(text)?, defaults)
 }
 
 /// Write the settings atomically (a sibling `.tmp` file plus rename, so a
 /// crash can never leave a half-written file), creating the directory.
 pub(crate) fn save(stored: &StoredSettings) -> Result<(), String> {
     let path = settings_path().ok_or("no config directory: set $XDG_CONFIG_HOME or $HOME")?;
+    save_to(&path, stored)
+}
+
+/// [`save`] to an explicit file.
+pub(crate) fn save_to(path: &Path, stored: &StoredSettings) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     }
@@ -79,7 +97,7 @@ pub(crate) fn save(stored: &StoredSettings) -> Result<(), String> {
     if let Err(e) = fs::write(&tmp, &json) {
         return Err(format!("cannot write {}: {e}", tmp.display()));
     }
-    if let Err(e) = fs::rename(&tmp, &path) {
+    if let Err(e) = fs::rename(&tmp, path) {
         let _ = fs::remove_file(&tmp);
         return Err(format!("cannot replace {}: {e}", path.display()));
     }
@@ -91,7 +109,7 @@ pub(crate) fn save(stored: &StoredSettings) -> Result<(), String> {
 // ---------------------------------------------------------------------------
 
 /// The whole document, pretty-printed in a fixed key order.
-fn to_json(stored: &StoredSettings) -> String {
+pub(crate) fn to_json(stored: &StoredSettings) -> String {
     let s = &stored.alerts;
     let mut out = String::from("{\n");
     let _ = writeln!(out, "  \"yellow_limit_a\": {},", s.yellow_limit_a);
@@ -155,7 +173,7 @@ fn write_sound(out: &mut String, sound: &Sound) {
     }
 }
 
-fn embedded_key(sound: EmbeddedSound) -> &'static str {
+pub(crate) fn embedded_key(sound: EmbeddedSound) -> &'static str {
     match sound {
         EmbeddedSound::Attention => "attention",
         EmbeddedSound::Critical => "critical",
@@ -165,7 +183,7 @@ fn embedded_key(sound: EmbeddedSound) -> &'static str {
     }
 }
 
-fn embedded_from_key(key: &str) -> Option<EmbeddedSound> {
+pub(crate) fn embedded_from_key(key: &str) -> Option<EmbeddedSound> {
     match key {
         "attention" => Some(EmbeddedSound::Attention),
         "critical" => Some(EmbeddedSound::Critical),

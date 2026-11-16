@@ -482,22 +482,23 @@ fn service_banner(ui: &mut egui::Ui, link: &ServiceLink) {
         if incompatible {
             ui.label(
                 egui::RichText::new(
-                    "The background service runs a different build of AstralGauge, so its data \
-                     cannot be shown here. Restart it in Settings \u{2192} Background service.",
+                    "A background service of a different AstralGauge build (or the per-user service \
+                     of an earlier version) is running, so its data cannot be shown here. Update it \
+                     in Settings \u{2192} Background service.",
                 )
                 .color(egui::Color32::from_rgb(253, 186, 116)),
             );
             return;
         }
         ui.label(
-            egui::RichText::new("Running as a background service.")
+            egui::RichText::new("Running as a system service.")
                 .strong()
                 .color(palette::ACCENT),
         );
         ui.label(
             egui::RichText::new(
-                "Monitoring, alert sounds and the safeguard keep running with this window \
-                 closed; this window shows the service's data.",
+                "Monitoring and the safeguards run from boot, with this window closed and \
+                 nobody logged in; this window shows the service's data.",
             )
             .color(palette::TEXT),
         );
@@ -628,6 +629,12 @@ pub(crate) struct App {
     /// This computer's network addresses, offered as listen addresses
     /// (read when the settings dialog opens).
     interfaces: Vec<(String, std::net::IpAddr)>,
+    /// The revision of the system service's settings this app adopted (see
+    /// `WebData::service_settings`).
+    service_settings_rev: Option<u64>,
+    /// Install the sound agent with the service (the settings dialog's
+    /// checkbox; it follows the agent's installed state once known).
+    sound_agent: bool,
 }
 
 /// Retry spacing for the desktop app's own web server when its port was
@@ -779,7 +786,21 @@ impl App {
             web_retry_at: Instant::now(),
             title: "AstralGauge",
             interfaces: Vec::new(),
+            service_settings_rev: None,
+            sound_agent: true,
         }
+    }
+}
+
+impl App {
+    /// Persist the applied settings, and hand them to the system service
+    /// when one does the monitoring (it saves them as its own; the local
+    /// poller ignores the command). The local copy is what a later run
+    /// without the service starts from.
+    fn save_config(&self) -> Result<(), String> {
+        let stored = self.config.stored();
+        let _ = self.cmd_tx.send(Cmd::Settings(persist::to_json(&stored)));
+        persist::save(&stored)
     }
 }
 
@@ -904,7 +925,7 @@ impl eframe::App for App {
                         // (they were denied at startup or when enabled), and
                         // they must not silently ask for root again on the
                         // next run.
-                        if let Err(e) = persist::save(&self.config.stored()) {
+                        if let Err(e) = self.save_config() {
                             eprintln!("Could not save the rolled-back settings: {e}");
                         }
                         self.warning = Some(
@@ -916,6 +937,37 @@ impl eframe::App for App {
                 // Prompt still open (or helper just spawned): keep waiting.
                 AuthState::Idle => {}
             }
+        }
+        // The system service's settings are the ones in effect: adopt them
+        // when they change (first contact, or accepted elsewhere), and keep
+        // a local copy for runs without the service. A refused request is
+        // reported once.
+        if let Some((rev, json)) = data.service_settings.clone() {
+            if data.service_link.is_some() && self.service_settings_rev != Some(rev) {
+                self.service_settings_rev = Some(rev);
+                match persist::parse(&json, &Config::defaults().stored()) {
+                    Ok(stored) => {
+                        let adopted = Config {
+                            alerts: stored.alerts,
+                            poll_ms: stored.poll_ms,
+                            web_enabled: stored.web_enabled,
+                            web_port: stored.web_port,
+                            web_bind: stored.web_bind,
+                        };
+                        if adopted != self.config {
+                            println!("Using the system service's settings.");
+                            self.config = adopted;
+                            if let Err(e) = persist::save(&self.config.stored()) {
+                                eprintln!("Could not save the service's settings locally: {e}");
+                            }
+                        }
+                    }
+                    Err(e) => eprintln!("The service sent unreadable settings: {e}"),
+                }
+            }
+        }
+        if let Some(e) = data.service_error.take() {
+            add_warning(&mut self.warning, e);
         }
         data.poll_ms = self.config.poll_ms;
         data.show_graphs = self.show_graphs;
@@ -1052,7 +1104,7 @@ impl eframe::App for App {
                                 ("Service", palette::ACCENT)
                             };
                             status_pill(ui, text, color).on_hover_text(
-                                "The background service (astral-gauge.service) does the \
+                                "The system service (astral-gauge.service) does the \
                                  monitoring; this window shows its data.",
                             );
                         }
@@ -1809,6 +1861,9 @@ Apply the reset with Accept, discard it with Cancel."
                                 ui.ctx().request_repaint_after(Duration::from_millis(250));
                             }
                             let mut action: Option<ServiceAction> = None;
+                            let install = |agent: bool| {
+                                ServiceAction::Install(Box::new(current.stored()), agent)
+                            };
                             match &status {
                                 None => {
                                     ui.label(egui::RichText::new("Checking the service\u{2026}").weak());
@@ -1828,10 +1883,20 @@ Apply the reset with Accept, discard it with Cancel."
                                         (format!("Installed, {}", st.active), palette::ORANGE)
                                     };
                                     dot_label(ui, egui::RichText::new(text).color(color), color);
+                                    if st.legacy {
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "The per-user service of an earlier version is \
+        installed (it only runs while you are logged in). Installing the system service replaces \
+        it.",
+                                            )
+                                            .color(palette::ORANGE),
+                                        );
+                                    }
                                     if st.installed && !st.enabled {
                                         ui.label(
                                             egui::RichText::new(
-                                                "Not enabled: it does not start at login.",
+                                                "Not enabled: it does not start at boot.",
                                             )
                                             .color(palette::ORANGE),
                                         );
@@ -1839,8 +1904,8 @@ Apply the reset with Accept, discard it with Cancel."
                                     if st.installed && !st.current {
                                         ui.label(
                                             egui::RichText::new(
-                                                "The installed service runs another executable (or I2C \
-        bus) than this app. \"Update service\" switches it to this one.",
+                                                "The installed service is a different build (or \
+        I2C bus, or owner) than this app. \"Update service\" installs this one.",
                                             )
                                             .color(palette::ORANGE),
                                         );
@@ -1849,13 +1914,13 @@ Apply the reset with Accept, discard it with Cancel."
                                         ui.add_enabled_ui(!busy, |ui| {
                                             if !st.installed {
                                                 if ui.button("Install service").clicked() {
-                                                    action = Some(ServiceAction::Install);
+                                                    action = Some(install(self.sound_agent));
                                                 }
                                             } else {
                                                 if !st.current
                                                     && ui.button("Update service").clicked()
                                                 {
-                                                    action = Some(ServiceAction::Install);
+                                                    action = Some(install(st.sound_agent));
                                                 }
                                                 if ui.button("Restart").clicked() {
                                                     action = Some(ServiceAction::Restart);
@@ -1867,6 +1932,46 @@ Apply the reset with Accept, discard it with Cancel."
                                         });
                                         if busy {
                                             ui.spinner();
+                                        }
+                                    });
+                                    // The sound agent: chosen for the
+                                    // installation, or switched right away
+                                    // while the service is installed.
+                                    let mut agent = if st.installed {
+                                        st.sound_agent
+                                    } else {
+                                        self.sound_agent
+                                    };
+                                    ui.horizontal(|ui| {
+                                        let changed = ui
+                                            .add_enabled(
+                                                !busy,
+                                                egui::Checkbox::new(
+                                                    &mut agent,
+                                                    "Play the alert sounds while I am logged in (sound agent)",
+                                                ),
+                                            )
+                                            .changed();
+                                        if changed {
+                                            self.sound_agent = agent;
+                                            if st.installed {
+                                                action = Some(ServiceAction::SoundAgent(agent));
+                                            }
+                                        }
+                                        if st.sound_agent {
+                                            let running = st.sound_agent_active == "active";
+                                            ui.label(
+                                                egui::RichText::new(if running {
+                                                    "running".to_owned()
+                                                } else {
+                                                    st.sound_agent_active.clone()
+                                                })
+                                                .color(if running {
+                                                    palette::GREEN
+                                                } else {
+                                                    palette::ORANGE
+                                                }),
+                                            );
                                         }
                                     });
                                 }
@@ -1882,29 +1987,21 @@ Apply the reset with Accept, discard it with Cancel."
                             }
                             ui.label(
                                 egui::RichText::new(
-                                    "Runs the monitoring as a systemd user service (astral-gauge.service) \
-        that starts when you log in and keeps going while this window is closed: the pin and GPU \
-        readings, the alert sounds (through your desktop's sound output), the critical-current \
-        notification, the safeguard, the automatic power limit and, when enabled above, the web \
-        interface. It uses the settings saved here and picks up every accepted change within a \
-        second. While it runs, this window does not read the hardware itself; it shows the \
-        service's data. Installing needs no administrator rights; the options that do still ask \
-        through the desktop's authentication dialog.",
+                                    "Runs the monitoring as a system service (astral-gauge.service) \
+        that starts at boot, as root: the readings, the critical-current notification, the safeguard, \
+        the automatic power limit and, when enabled above, the web interface keep going with this \
+        window closed and with nobody logged in (say, an inference server running unattended). As \
+        root it lowers the power limit and kills processes without asking for a password. \
+        Installing asks for the administrator password once: it copies this executable to \
+        /usr/local/lib/astral-gauge and the settings in effect to /etc/astral-gauge. Settings \
+        accepted here go to the service; while it runs, this window shows its data.\n\
+        A system service has no sound output. The sound agent (astral-gauge-sound.service, a user \
+        service) plays its alert sounds whenever you are logged in; without it they play only \
+        while this window is open.",
                                 )
                                 .weak()
                                 .size(12.0),
                             );
-                            if let Ok(exe) = crate::hardware::own_exe() {
-                                let mut text = format!("Executable: {}", exe.display());
-                                if exe.components().any(|c| c.as_os_str() == "target") {
-                                    text.push_str(
-                                        "\nThis is a cargo build directory: rebuilding replaces the \
-        service's executable (restart the service to run the new build) and cargo clean removes \
-        it. An installed copy (e.g. in ~/.local/bin) is more robust.",
-                                    );
-                                }
-                                ui.label(egui::RichText::new(text).weak().size(12.0));
-                            }
                             if let Some(action) = action {
                                 service::run_action(&self.service_ctl, action, self.explicit_bus);
                             }
@@ -1999,7 +2096,7 @@ Apply the reset with Accept, discard it with Cancel."
                 // Persist the accepted settings (the applied state, after
                 // any web start/stop rollback above). Save errors surface in
                 // the same warning dialog as other Accept failures.
-                if let Err(e) = persist::save(&self.config.stored()) {
+                if let Err(e) = self.save_config() {
                     add_warning(
                         &mut self.warning,
                         format!("Settings were applied, but could not be saved: {e}"),

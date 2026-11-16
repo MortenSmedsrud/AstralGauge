@@ -29,8 +29,9 @@ When a rail goes above its thresholds it can:
 - **Kill the highest GPU-consuming processes.**
 
 Both actions are opt-in (enabled in the settings dialog). Because they need
-elevated privileges, they may prompt for administrator credentials (via
-`pkexec`) on first use.
+elevated privileges, the app asks for administrator credentials (via
+`pkexec`) on first use. The [background service](#background-service) runs
+as root and acts without asking, also when nobody is logged in.
 
 ## Building
 
@@ -101,29 +102,47 @@ Privacy & Security → Local Network.
 
 ## Background service
 
-AstralGauge can also run in the background, without its window, as a
-systemd **user** service (`astral-gauge.service`). Install or uninstall it
-from **Settings → Background service**. No administrator rights are needed.
-The service starts when you log in and runs this same executable with
-`--service`:
+AstralGauge can run in the background as a systemd **system** service
+(`astral-gauge.service`). It starts at boot, runs as root and protects the
+card whether or not anyone is logged in, for example while an inference
+server runs unattended. Install or uninstall it from **Settings →
+Background service**. Installing asks for the administrator password once.
 
-- It uses the settings saved in the app and picks up every accepted change
-  within a second.
-- It keeps the alerts, alert sounds, critical-current notification,
-  safeguards and the web interface (when enabled) running while the window
-  is closed. Sounds play through your desktop's sound server.
-- While it runs, the desktop app doesn't read the hardware itself. It shows
-  the service's data, marked with a **Service** pill and a banner with a
-  link to the web interface. The web page shows a **Service** chip.
-- It waits for what it depends on: the GPU's I2C bus, NVML, the sound
-  output and a busy web port are all retried until they become available,
-  and systemd restarts the service if it ever exits.
-- It runs the executable it was installed from. Install from a stable copy
-  (e.g. `~/.local/bin/astral-gauge`) rather than `target/release`, or
-  restart the service after rebuilding. If a different executable is
-  installed, the settings dialog offers **Update service**.
+- **What it does.** The readings, the critical-current notification, the
+  safeguards (automatic power limit, killing GPU processes) and the web
+  interface (when enabled) keep running with the window closed. Because it
+  runs as root, lowering the power limit and killing processes never wait
+  for a password. "Also kill processes of other users" still decides
+  whether processes of users other than you can be killed.
+- **What gets installed.** A root-owned copy of the executable in
+  `/usr/local/lib/astral-gauge/`, its settings in
+  `/etc/astral-gauge/settings.json` and the unit in `/etc/systemd/system/`.
+  The service never runs the build in your home directory. After
+  rebuilding, the settings dialog offers **Update service**.
+- **Settings.** The service starts with the settings in effect in the app.
+  Changes you accept in the app go to the service and apply within a
+  second. When the app starts while the service runs, it uses the
+  service's settings.
+- **The desktop app.** While the service runs, the app doesn't read the
+  hardware itself. It shows the service's data, marked with a **Service**
+  pill and a banner with a link to the web interface. The web page shows a
+  **Service** chip. Only you and root can change the service's settings or
+  power limit; other local users can only view it.
+- **Sounds.** A system service has no sound output. The optional **sound
+  agent** (`astral-gauge-sound.service`, a user service, on by default)
+  plays the service's alert sounds whenever you're logged in. Without it,
+  they play only while the app is open.
+- **Waiting for dependencies.** The GPU's I2C bus, NVML and a busy web
+  port are retried until they're available, and systemd restarts the
+  service if it ever exits.
+- **Upgrading.** If the per-user service of an earlier version is
+  installed, installing the system service replaces it.
+- **Security.** The web server then runs as root. It is confined by the
+  unit's hardening (read-only system, no access to home directories), but
+  keep it on **This computer only** or a trusted network.
 
-Logs go to the journal: `journalctl --user -u astral-gauge`.
+Logs go to the journal: `journalctl -u astral-gauge` (the service) and
+`journalctl --user -u astral-gauge-sound` (the sound agent).
 
 ## License
 

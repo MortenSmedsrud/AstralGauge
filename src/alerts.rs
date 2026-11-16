@@ -6,13 +6,16 @@
 //! which (if any) alert sound should play now. [`critical_alert_edge`] and
 //! [`kill_guard_action`] derive the latching UI notification and the
 //! critical-alert kill safeguard's actions from the same current. [`SoundPlayer`]
-//! owns a rodio output thread that plays the queued sounds, one at a time.
+//! owns a rodio output thread that plays the queued sounds, one at a time —
+//! or, in the system service (which has no sound output of its own), hands
+//! them to a [`SoundRelay`] that the logged-in user's sound agent plays from.
 
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{BufReader, Cursor};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -577,14 +580,24 @@ fn next_request(current: SoundRequest, next: SoundRequest) -> SoundRequest {
 /// Handle to the alert-sound playback thread. Sound is best-effort: `play`
 /// never blocks, and requests are dropped when no audio output exists
 /// (headless session, missing device, undecodable file). Cloning shares the
-/// one playback thread.
+/// one playback thread. A relaying player ([`SoundPlayer::relay`]) plays
+/// nothing itself: it queues the requests for listeners in the user's
+/// session (see [`SoundRelay`]).
 #[derive(Clone)]
 pub(crate) struct SoundPlayer {
-    tx: mpsc::Sender<SoundRequest>,
-    /// Set while a priority (critical-terminating) sound is playing; lets the
-    /// poller hold back the next safeguard kill instead of cutting the
-    /// previous kill's sound in on.
-    priority_playing: Arc<AtomicBool>,
+    out: PlayerOut,
+}
+
+#[derive(Clone)]
+enum PlayerOut {
+    Local {
+        tx: mpsc::Sender<SoundRequest>,
+        /// Set while a priority (critical-terminating) sound is playing;
+        /// lets the poller hold back the next safeguard kill instead of
+        /// cutting the previous kill's sound in on.
+        priority_playing: Arc<AtomicBool>,
+    },
+    Relay(Arc<SoundRelay>),
 }
 
 impl SoundPlayer {
@@ -597,34 +610,207 @@ impl SoundPlayer {
         let flag = priority_playing.clone();
         thread::spawn(move || audio_loop(rx, flag));
         SoundPlayer {
-            tx,
-            priority_playing,
+            out: PlayerOut::Local {
+                tx,
+                priority_playing,
+            },
         }
     }
 
+    /// A player that relays every request instead of playing it (the system
+    /// service: it runs outside any login session, so it has no sound
+    /// output). Listeners fetch the requests from the returned relay.
+    pub(crate) fn relay() -> (SoundPlayer, Arc<SoundRelay>) {
+        let relay = Arc::new(SoundRelay::default());
+        (
+            SoundPlayer {
+                out: PlayerOut::Relay(relay.clone()),
+            },
+            relay,
+        )
+    }
+
     /// Whether the critical-terminating (priority) sound is playing right
-    /// now. False when no audio output exists at all.
+    /// now. False when no audio output exists at all (or, relayed, when no
+    /// listener is there to play it).
     pub(crate) fn priority_sound_playing(&self) -> bool {
-        self.priority_playing.load(Ordering::SeqCst)
+        match &self.out {
+            PlayerOut::Local {
+                priority_playing, ..
+            } => priority_playing.load(Ordering::SeqCst),
+            PlayerOut::Relay(relay) => relay.priority_playing(Instant::now()),
+        }
+    }
+
+    fn request(&self, sound: Sound, priority: bool) {
+        match &self.out {
+            PlayerOut::Local { tx, .. } => {
+                let _ = tx.send(SoundRequest { sound, priority });
+            }
+            PlayerOut::Relay(relay) => relay.push(sound, priority, Instant::now()),
+        }
     }
 
     /// Queue a sound for playback. Sounds play one at a time; while one is
     /// playing, at most the most recently queued normal sound is kept (and
     /// never at the expense of a queued priority sound).
     pub(crate) fn play(&self, sound: Sound) {
-        let _ = self.tx.send(SoundRequest {
-            sound,
-            priority: false,
-        });
+        self.request(sound, false);
     }
 
     /// Queue a priority sound: it outranks every pending normal request and
     /// the sound it waits behind is never cut in on once it is playing.
     pub(crate) fn play_priority(&self, sound: Sound) {
-        let _ = self.tx.send(SoundRequest {
-            sound,
-            priority: true,
+        self.request(sound, true);
+    }
+}
+
+/// How many relayed sounds the service keeps for listeners that poll late.
+const RELAY_KEEP: usize = 16;
+/// A listener that has not polled for this long is gone.
+pub(crate) const LISTENER_TIMEOUT: Duration = Duration::from_secs(2);
+/// Relayed sounds older than this are not played any more (an alert that
+/// late would describe a state that may be over).
+pub(crate) const RELAY_MAX_AGE: Duration = Duration::from_secs(5);
+
+/// Who fetches relayed sounds: the user's sound agent (a user service that
+/// runs whenever the user is logged in), or the desktop app, which plays
+/// them only while no agent is there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Listener {
+    Agent,
+    App,
+}
+
+/// One relayed sound request, numbered in the order it was made.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct RelayedSound {
+    pub(crate) seq: u64,
+    pub(crate) sound: Sound,
+    pub(crate) priority: bool,
+    /// How long ago it was requested (when fetched).
+    pub(crate) age: Duration,
+}
+
+/// What a listener got from [`SoundRelay::fetch`].
+#[derive(Debug, PartialEq)]
+pub(crate) struct RelayFetch {
+    /// The requests from the listener's cursor on, oldest first.
+    pub(crate) sounds: Vec<RelayedSound>,
+    /// The cursor for the next fetch.
+    pub(crate) next: u64,
+    /// Whether a sound agent is listening (the desktop app then stays quiet).
+    pub(crate) agent: bool,
+}
+
+/// The system service's sound queue: the poller's requests, numbered, for
+/// the listeners in the user's session to fetch over the service link and
+/// play. It also tracks what the listeners report, so the kill safeguard's
+/// "terminating sound still playing" gate keeps working across the link.
+#[derive(Default)]
+pub(crate) struct SoundRelay {
+    state: Mutex<RelayState>,
+}
+
+#[derive(Default)]
+struct RelayState {
+    next: u64,
+    /// The latest requests with the time each was made.
+    queue: VecDeque<(RelayedSound, Instant)>,
+    agent: Option<ListenerSeen>,
+    app: Option<ListenerSeen>,
+}
+
+#[derive(Clone, Copy)]
+struct ListenerSeen {
+    at: Instant,
+    /// The listener was playing a priority sound when it last polled.
+    playing_priority: bool,
+    /// Its cursor after that poll: requests from here on are not fetched.
+    fetched: u64,
+}
+
+impl SoundRelay {
+    fn push(&self, sound: Sound, priority: bool, now: Instant) {
+        let mut st = self.state.lock().unwrap();
+        let seq = st.next;
+        st.next += 1;
+        st.queue.push_back((
+            RelayedSound {
+                seq,
+                sound,
+                priority,
+                age: Duration::ZERO,
+            },
+            now,
+        ));
+        while st.queue.len() > RELAY_KEEP {
+            st.queue.pop_front();
+        }
+    }
+
+    /// A listener's poll: `cursor` is the `next` value of its previous fetch
+    /// (`None` on its first one, which only returns the cursor: sounds from
+    /// before a listener connected are not replayed), `playing_priority`
+    /// whether it is playing a priority sound right now.
+    pub(crate) fn fetch(
+        &self,
+        who: Listener,
+        cursor: Option<u64>,
+        playing_priority: bool,
+        now: Instant,
+    ) -> RelayFetch {
+        let mut st = self.state.lock().unwrap();
+        let next = st.next;
+        let sounds = match cursor {
+            None => Vec::new(),
+            Some(c) => st
+                .queue
+                .iter()
+                .filter(|(s, _)| s.seq >= c)
+                .map(|(s, at)| RelayedSound {
+                    age: now.saturating_duration_since(*at),
+                    ..s.clone()
+                })
+                .collect(),
+        };
+        let seen = Some(ListenerSeen {
+            at: now,
+            playing_priority,
+            fetched: next,
         });
+        match who {
+            Listener::Agent => st.agent = seen,
+            Listener::App => st.app = seen,
+        }
+        let agent = st
+            .agent
+            .is_some_and(|a| now.saturating_duration_since(a.at) < LISTENER_TIMEOUT);
+        RelayFetch {
+            sounds,
+            next,
+            agent,
+        }
+    }
+
+    /// Whether the listener that plays the sounds (the agent if one is
+    /// there, otherwise the desktop app) is playing a priority sound or has
+    /// a recent one still to fetch. False without any listener: then nothing
+    /// plays, and nothing should hold the safeguard back.
+    fn priority_playing(&self, now: Instant) -> bool {
+        let st = self.state.lock().unwrap();
+        let live = |l: &Option<ListenerSeen>| {
+            l.filter(|l| now.saturating_duration_since(l.at) < LISTENER_TIMEOUT)
+        };
+        let Some(player) = live(&st.agent).or(live(&st.app)) else {
+            return false;
+        };
+        player.playing_priority
+            || st.queue.iter().any(|(s, at)| {
+                s.priority
+                    && s.seq >= player.fetched
+                    && now.saturating_duration_since(*at) < LISTENER_TIMEOUT
+            })
     }
 }
 
@@ -778,6 +964,50 @@ mod tests {
             Sound::File(PathBuf::from("n2.wav"))
         );
         assert!(next_request(priority(), priority()).priority);
+    }
+
+    #[test]
+    fn relay_hands_sounds_to_listeners() {
+        let (player, relay) = SoundPlayer::relay();
+        let t0 = Instant::now();
+        // Nobody listens: nothing holds the safeguard back.
+        player.play_priority(Sound::Embedded(EmbeddedSound::CriticalTerminating));
+        assert!(!player.priority_sound_playing());
+        // A first fetch only takes the cursor (no replay of old sounds).
+        let first = relay.fetch(Listener::Agent, None, false, t0);
+        assert!(first.sounds.is_empty());
+        assert!(first.agent);
+        player.play(Sound::Embedded(EmbeddedSound::Critical));
+        player.play_priority(Sound::Embedded(EmbeddedSound::CriticalTerminating));
+        // Not fetched yet: counts as playing for the kill gate.
+        assert!(player.priority_sound_playing());
+        let got = relay.fetch(Listener::Agent, Some(first.next), false, Instant::now());
+        assert_eq!(got.sounds.len(), 2);
+        assert!(!got.sounds[0].priority && got.sounds[1].priority);
+        assert_eq!(got.next, first.next + 2);
+        // Fetched; the agent reports it playing, then finished.
+        assert!(!player.priority_sound_playing());
+        relay.fetch(Listener::Agent, Some(got.next), true, Instant::now());
+        assert!(player.priority_sound_playing());
+        let idle = relay.fetch(Listener::Agent, Some(got.next), false, Instant::now());
+        assert!(idle.sounds.is_empty());
+        assert!(!player.priority_sound_playing());
+        // The app sees the agent and stays quiet; once the agent is gone
+        // it is the one that plays.
+        let later = Instant::now() + LISTENER_TIMEOUT + Duration::from_millis(10);
+        assert!(
+            relay
+                .fetch(Listener::App, None, false, Instant::now())
+                .agent
+        );
+        assert!(!relay.fetch(Listener::App, None, false, later).agent);
+        // Only the newest RELAY_KEEP sounds are kept.
+        for _ in 0..RELAY_KEEP + 5 {
+            player.play(Sound::Embedded(EmbeddedSound::Attention));
+        }
+        let all = relay.fetch(Listener::App, Some(0), false, Instant::now());
+        assert_eq!(all.sounds.len(), RELAY_KEEP);
+        assert_eq!(all.sounds.last().unwrap().seq, all.next - 1);
     }
 
     #[test]

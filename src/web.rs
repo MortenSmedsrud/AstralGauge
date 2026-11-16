@@ -187,6 +187,15 @@ pub(crate) struct WebData {
     /// limit lowered by an alert and not restored yet). Published by the
     /// poller after every sample; shown as a banner in both UIs.
     pub(crate) power_down: Option<PowerDown>,
+    /// The system service's settings document (persisted JSON) with a
+    /// revision that grows whenever the service applies changed settings:
+    /// in the service its own, in the desktop app the copy received over the
+    /// link (the app adopts it; the service's settings are the ones in
+    /// effect).
+    pub(crate) service_settings: Option<(u64, String)>,
+    /// A request the service refused or failed (settings not saved, power
+    /// limit not allowed, ...): the desktop app shows it once and clears it.
+    pub(crate) service_error: Option<String>,
 }
 
 /// The automatic power limit's lowering in effect (see
@@ -214,7 +223,8 @@ pub(crate) struct ServiceLink {
     /// (port busy, invalid port); it keeps retrying.
     pub(crate) web_error: Option<String>,
     /// Set when the running service is a different build that speaks
-    /// another link protocol: its data cannot be shown until it restarts.
+    /// another link protocol (or the per-user service of an earlier
+    /// version): its data cannot be shown until it is updated.
     pub(crate) incompatible: Option<String>,
 }
 
@@ -245,6 +255,8 @@ impl WebData {
             service_link: None,
             local_monitor: false,
             power_down: None,
+            service_settings: None,
+            service_error: None,
         };
         // Pre-reserve history for the default 1 Hz sample rate so the common
         // case never reallocates; a faster slider setting just grows the vecs.

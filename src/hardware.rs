@@ -17,7 +17,7 @@ use std::process::{Child, Command, Stdio};
 use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -138,6 +138,10 @@ pub(crate) enum Cmd {
     /// clears its own `WebData::critical_alert`; this only matters when a
     /// background service owns that flag (the poller ignores it).
     AckCritical,
+    /// The settings were accepted (the persisted JSON document): only the
+    /// system service needs them sent (see `service::spawn_monitor`); the
+    /// local poller gets its settings through `WebData` and ignores this.
+    Settings(String),
 }
 
 /// Handle to a running poller thread (see [`spawn_poller`]).
@@ -206,6 +210,10 @@ pub(crate) struct KillOutcome {
 /// over stdin/stdout and nothing else.
 pub(crate) struct PowerHelper {
     child: Option<Child>,
+    /// `Some` when this process already runs as root (the system service):
+    /// the helper's commands then run in-process, without pkexec or any
+    /// prompt (the inner value is the helper's own NVML handle).
+    direct: Option<Option<nvml::Nvml>>,
     /// Short human-readable status (latest helper result or failure), kept by
     /// the reader thread and mirrored into [`WebData::power_note`] by the
     /// poller.
@@ -220,8 +228,11 @@ pub(crate) struct PowerHelper {
 
 impl PowerHelper {
     pub(crate) fn new() -> PowerHelper {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let root = unsafe { libc::geteuid() } == 0;
         PowerHelper {
             child: None,
+            direct: root.then_some(None),
             status: Arc::new(Mutex::new(None)),
             auth: Arc::new(Mutex::new(AuthState::Idle)),
             kill_outcome: Arc::new(Mutex::new(None)),
@@ -294,21 +305,7 @@ process kill requested — please confirm in the authentication dialog."
             let kill_outcome = self.kill_outcome.clone();
             thread::spawn(move || {
                 for line in BufReader::new(out).lines().map_while(Result::ok) {
-                    // Any reply proves the helper is up as root (an ERR is a
-                    // helper/NVML failure, not an authentication one).
-                    *auth.lock().unwrap() = AuthState::Active;
-                    if line.starts_with("KILL ") {
-                        // A safeguard-kill outcome: consumed by the poller,
-                        // not part of the limit-centric status note.
-                        *kill_outcome.lock().unwrap() = Some(parse_kill_line(&line));
-                        continue;
-                    }
-                    match line.strip_prefix("ERR ") {
-                        Some(msg) => *status.lock().unwrap() = Some(format!("Power helper: {msg}")),
-                        None => {
-                            *status.lock().unwrap() = Some("Privileged power helper active.".into())
-                        }
-                    }
+                    take_reply(&line, &status, &auth, &kill_outcome);
                 }
                 // The helper is gone: without it privileged changes fail.
                 *auth.lock().unwrap() = AuthState::Failed;
@@ -334,6 +331,20 @@ process kill requested — please confirm in the authentication dialog."
     /// whether the command reached the helper (it died in the meantime if
     /// not; the next request respawns and re-prompts it).
     fn request(&mut self, line: &str) -> bool {
+        if let Some(nvml) = self.direct.as_mut() {
+            // Already root: answer the command right here.
+            if let Some(reply) = helper_reply(line, nvml) {
+                take_reply(&reply, &self.status, &self.auth, &self.kill_outcome);
+                if reply == "OK" {
+                    self.set_status(
+                        "Running with administrator rights (system service): power limits and \
+                         process kills apply directly."
+                            .into(),
+                    );
+                }
+            }
+            return true;
+        }
         if !self.ensure_running() {
             return false;
         }
@@ -378,6 +389,28 @@ process kill requested — please confirm in the authentication dialog."
     }
 }
 
+/// Fold one helper reply line into the helper's shared state cells.
+fn take_reply(
+    line: &str,
+    status: &Mutex<Option<String>>,
+    auth: &Mutex<AuthState>,
+    kill_outcome: &Mutex<Option<KillOutcome>>,
+) {
+    // Any reply proves the helper is up as root (an ERR is a helper/NVML
+    // failure, not an authentication one).
+    *auth.lock().unwrap() = AuthState::Active;
+    if line.starts_with("KILL ") {
+        // A safeguard-kill outcome: consumed by the poller, not part of the
+        // limit-centric status note.
+        *kill_outcome.lock().unwrap() = Some(parse_kill_line(line));
+        return;
+    }
+    *status.lock().unwrap() = Some(match line.strip_prefix("ERR ") {
+        Some(msg) => format!("Power helper: {msg}"),
+        None => "Privileged power helper active.".into(),
+    });
+}
+
 impl Drop for PowerHelper {
     fn drop(&mut self) {
         if let Some(child) = self.child.as_mut() {
@@ -419,42 +452,51 @@ pub(crate) fn run_power_helper() -> i32 {
         if line.is_empty() {
             continue;
         }
-        let reply = if line == "PING" {
-            "OK".to_owned()
-        } else if line == "EXIT" {
+        let Some(reply) = helper_reply(&line, &mut nvml) else {
             break;
-        } else if let Some(rest) = line.strip_prefix("SET ") {
-            match rest.trim().parse::<u32>() {
-                Ok(watts) if (100..=1000).contains(&watts) => {
-                    if nvml.is_none() {
-                        nvml = nvml::Nvml::new();
-                    }
-                    match nvml.as_ref().map(|n| n.set_power_limit(watts)) {
-                        Some(Ok(())) => format!("Power limit set to {watts} W"),
-                        Some(Err(e)) => format!("ERR setting {watts} W failed: {e}"),
-                        None => "ERR NVML unavailable (libnvidia-ml.so.1?)".to_owned(),
-                    }
-                }
-                Ok(_) => "ERR watts out of range".to_owned(),
-                Err(_) => "ERR watts is not a number".to_owned(),
-            }
-        } else if let Some(rest) = line.strip_prefix("KILL ") {
-            match rest.trim().parse::<u32>() {
-                Ok(pid) if pid != 0 => match kill_process(pid) {
-                    Ok(()) => format!("KILL OK {pid}"),
-                    Err(e) => format!("KILL ERR {pid} {e}"),
-                },
-                Ok(_) => "KILL ERR 0 pid must be at least 1".to_owned(),
-                Err(_) => "KILL ERR 0 pid is not a number".to_owned(),
-            }
-        } else {
-            "ERR unknown command".to_owned()
         };
         if writeln!(out, "{reply}").and_then(|()| out.flush()).is_err() {
             break;
         }
     }
     0
+}
+
+/// The helper's answer to one command line (`None`: `EXIT`). Shared by the
+/// pkexec helper process and the in-process helper of a root service.
+fn helper_reply(line: &str, nvml: &mut Option<nvml::Nvml>) -> Option<String> {
+    let line = line.trim();
+    Some(if line == "PING" {
+        "OK".to_owned()
+    } else if line == "EXIT" {
+        return None;
+    } else if let Some(rest) = line.strip_prefix("SET ") {
+        match rest.trim().parse::<u32>() {
+            Ok(watts) if (100..=1000).contains(&watts) => {
+                if nvml.is_none() {
+                    *nvml = nvml::Nvml::new();
+                }
+                match nvml.as_ref().map(|n| n.set_power_limit(watts)) {
+                    Some(Ok(())) => format!("Power limit set to {watts} W"),
+                    Some(Err(e)) => format!("ERR setting {watts} W failed: {e}"),
+                    None => "ERR NVML unavailable (libnvidia-ml.so.1?)".to_owned(),
+                }
+            }
+            Ok(_) => "ERR watts out of range".to_owned(),
+            Err(_) => "ERR watts is not a number".to_owned(),
+        }
+    } else if let Some(rest) = line.strip_prefix("KILL ") {
+        match rest.trim().parse::<u32>() {
+            Ok(pid) if pid != 0 => match kill_process(pid) {
+                Ok(()) => format!("KILL OK {pid}"),
+                Err(e) => format!("KILL ERR {pid} {e}"),
+            },
+            Ok(_) => "KILL ERR 0 pid must be at least 1".to_owned(),
+            Err(_) => "KILL ERR 0 pid is not a number".to_owned(),
+        }
+    } else {
+        "ERR unknown command".to_owned()
+    })
 }
 
 #[derive(Debug, Clone, Default)]
@@ -816,7 +858,7 @@ pub(crate) fn spawn_poller(
                                 ));
                             }
                         } else {
-                            match kill_process(p.pid) {
+                            match kill_own_process(p.pid) {
                                 Ok(()) => {
                                     terminated = true;
                                     println!(
@@ -957,7 +999,7 @@ fn handle_cmd(
             *mirrored_auth = state;
         }
         Cmd::Interval(ms) => *poll_ms = ms,
-        Cmd::AckCritical => {}
+        Cmd::AckCritical | Cmd::Settings(_) => {}
     }
 }
 
@@ -1023,6 +1065,33 @@ fn open_i2c(bus_number: Option<u32>) -> Result<File, String> {
 /// (the app runs as the user, which is exactly the right blast radius for a
 /// safeguard); called as root by the privileged helper when
 /// `Settings::kill_other_users_processes` routes the kill through it.
+/// The user whose processes the safeguard kills by default (without
+/// `kill_other_users_processes`): the system service's owner (`--owner=`),
+/// otherwise the user this process runs as.
+static SAFEGUARD_USER: OnceLock<u32> = OnceLock::new();
+
+/// Set the safeguard's default kill scope (the system service, at startup).
+pub(crate) fn set_safeguard_user(uid: u32) {
+    let _ = SAFEGUARD_USER.set(uid);
+}
+
+/// The safeguard's default kill: only a process of [`SAFEGUARD_USER`]. As a
+/// normal user the kernel enforces that (others answer EPERM); a system
+/// service runs as root, so it checks the owner of `/proc/<pid>` itself and
+/// answers the same EPERM for other users' processes.
+fn kill_own_process(pid: u32) -> io::Result<()> {
+    // SAFETY: geteuid/getuid have no preconditions and cannot fail.
+    if unsafe { libc::geteuid() } == 0 {
+        use std::os::unix::fs::MetadataExt;
+        let user = *SAFEGUARD_USER.get_or_init(|| unsafe { libc::getuid() });
+        let owner = std::fs::metadata(format!("/proc/{pid}"))?.uid();
+        if owner != user {
+            return Err(io::Error::from_raw_os_error(libc::EPERM));
+        }
+    }
+    kill_process(pid)
+}
+
 fn kill_process(pid: u32) -> io::Result<()> {
     let target = single_process_pid(pid).ok_or_else(|| {
         io::Error::new(

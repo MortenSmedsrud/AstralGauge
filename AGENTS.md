@@ -18,9 +18,11 @@ rails of an **ASUS RTX 5090 ROG Astral** GPU:
   devices; graphs support hover readouts everywhere. Its listen address is
   a setting (`web_bind`: `0.0.0.0` = every network, the default;
   `127.0.0.1` = this computer only; or one of the machine's addresses).
-- Optionally it runs as a **background service** (systemd user unit,
-  installed from the settings dialog); the desktop app then shows the
-  service's data instead of reading the hardware itself.
+- Optionally it runs as a **background service**: a systemd *system* unit
+  running as root from boot (protection with nobody logged in), installed
+  from the settings dialog with one pkexec prompt, plus an optional per-user
+  **sound agent** that plays its alerts in the login session. The desktop
+  app then shows the service's data instead of reading the hardware itself.
 
 Target platform is Linux only (i2c-dev ioctls, `/sys/bus/i2c`, NVML).
 
@@ -28,7 +30,10 @@ Target platform is Linux only (i2c-dev ioctls, `/sys/bus/i2c`, NVML).
 
 ```sh
 cargo run -- [i2c-bus-number]   # e.g. cargo run -- 15
-cargo run -- --service [bus]    # headless service mode (what the unit runs)
+cargo run -- --service [bus]    # headless service mode (what the unit runs;
+                                # as a normal user only with the dev
+                                # overrides below)
+cargo run -- --sound-agent      # the per-user sound agent
 cargo test                      # unit tests (no GPU/display required)
 cargo check
 sh licenses.sh                  # regenerate the embedded license text
@@ -36,6 +41,13 @@ sh licenses.sh                  # regenerate the embedded license text
                                 # Cargo.lock changes; --check = CI mode)
 ```
 
+- Development overrides: `ASTRAL_GAUGE_SOCKET=<abs path>` points the
+  service, the desktop app and the sound agent at another link socket
+  (default `/run/astral-gauge/link.sock`; the app then also skips the
+  legacy per-user socket), `ASTRAL_GAUGE_SETTINGS=<abs path>` the service at
+  another settings file (default `/etc/astral-gauge/settings.json`). With
+  both, `--service` runs fine as a normal user. Keep the socket path short
+  (`sun_path` is 108 bytes).
 - Without an argument the I2C bus is auto-detected (scans
   `/sys/bus/i2c/devices/*/name` for `"NVIDIA i2c adapter 1 at <PCI>"`, then
   probes candidates for a sane 10–14 V reading). No fallback bus: without
@@ -79,9 +91,11 @@ src/main.rs      Entry point: parse the optional explicit I2C bus, create
                  the shared Arc<Mutex<WebData>>, spawn the sound player +
                  `service::spawn_monitor` (local poller or service link),
                  build ui::App and run eframe. Also dispatches
-                 `--power-helper` (privileged helper mode) and `--service`
-                 (background service mode) before anything else. Keep this
-                 file thin.
+                 `--power-helper` (privileged helper mode),
+                 `--install-system-service` / `--uninstall-system-service`
+                 (installer modes, run as root through pkexec), `--service`
+                 (background service mode) and `--sound-agent` before
+                 anything else. Keep this file thin.
 src/hardware.rs  HARDWARE POLLING. IT8915 constants + raw i2c-dev/SMBus
                  ioctls (block read of all 24 registers, byte-read
                  fallback), bus auto-detection/probing, `PinReading`,
@@ -99,10 +113,14 @@ src/hardware.rs  HARDWARE POLLING. IT8915 constants + raw i2c-dev/SMBus
                  own and pid 0 excluded).
                  Also the privileged power helper: `PowerHelper` (spawns
                  this same binary as root through pkexec; `KILL <pid>` is
-                 the safeguard's cross-user kill) and
+                 the safeguard's cross-user kill; when this process already
+                 is root — the system service — it answers the same
+                 commands in-process via `helper_reply`, no pkexec) and
                  `run_power_helper()` (the helper mode), plus `kill_process`
-                 (the safeguard's SIGKILL: unprivileged by default, called
-                 as root by the helper for the opt-in cross-user kill).
+                 (the safeguard's SIGKILL) and `kill_own_process` (the
+                 default kill: as root it checks that `/proc/<pid>` belongs
+                 to `SAFEGUARD_USER`, the service's owner, and answers EPERM
+                 otherwise, so the default stays "own processes only").
 src/alerts.rs    LIMIT CHECKING + SOUNDS. `Settings` (limits + sound
                  config + `auto_min_power` mode + the `kill_top_process_on_`
                  `red` / `kill_other_users_processes` safeguard flags),
@@ -119,7 +137,9 @@ src/alerts.rs    LIMIT CHECKING + SOUNDS. `Settings` (limits + sound
                  machine), `SoundPlayer` (rodio playback thread, priority-
                  aware for the critical-terminating sound, with
                  `priority_sound_playing()` so the safeguard never cuts in on
-                 the kill sound) and the shipped-sound default paths.
+                 the kill sound; `SoundPlayer::relay()` gives the service a
+                 player that queues into a `SoundRelay` instead) and the
+                 shipped-sound default paths.
 src/web.rs       WEB SERVER + SHARED STATE. `WebData` (latest sample —
                  including the top GPU processes, served as the JSON
                  `processes` array — histories, mirrored UI settings),
@@ -130,17 +150,23 @@ src/web.rs       WEB SERVER + SHARED STATE. `WebData` (latest sample —
                  `POST /ack` → acknowledge the critical alert),
                  hand-rolled JSON serialization, and `INDEX_HTML`
                  (the whole single-page web UI, JS included).
-src/service.rs   BACKGROUND SERVICE. Unit management (`install`,
-                 `uninstall`, `restart`, `unit_status`, `unit_text`; the
-                 settings dialog runs them off the GUI thread via
+src/service.rs   BACKGROUND SERVICE. Unit files (`system_unit_text`,
+                 `sound_unit_text`), the root installer modes
+                 (`run_install` / `run_uninstall` → `install_files` /
+                 `remove_files`), the user-side actions (`install`,
+                 `uninstall`, `restart`, `set_sound_agent`, `unit_status`;
+                 the settings dialog runs them off the GUI thread via
                  `ServiceControl` / `run_action` / `refresh_status`), the
                  headless service mode `run_service` (poller + web server
-                 from the settings file, re-read when it changes), the link
-                 socket server, the SYNC state encoding (`sync_reply`,
-                 `encode_sync`, `decode_sync`, `apply_sync`), and the
-                 desktop side `spawn_monitor` (local poller while no
-                 service runs, service link while one does). See
-                 "Background service" below.
+                 from its settings file, re-read when it changes), the link
+                 socket server (`link_client`, owner check via
+                 `SO_PEERCRED`), the SYNC state encoding (`sync_reply`,
+                 `encode_sync`, `decode_sync`, `apply_sync`) and the SOUNDS
+                 relay encoding (`encode_sounds`, `decode_sounds`), the
+                 sound agent (`run_sound_agent`), and the desktop side
+                 `spawn_monitor` (local poller while no service runs,
+                 service link while one does). See "Background service"
+                 below.
 src/persist.rs   SETTINGS PERSISTENCE. The applied `ui::Config` is stored as
                  a small hand-written JSON document at
                  `$XDG_CONFIG_HOME/astral-gauge/settings.json` (falling back
@@ -223,8 +249,12 @@ critical sections are short — keep them that way:
    second; once one answers it stops the poller (`Poller::stop`, joined, so
    nothing records after it), clears `WebData::local_monitor` and mirrors
    the service via SYNC every 200 ms, forwarding `SetLimit` / `GrantPower`
-   `Access` / `AckCritical` (as `LIMIT` / `AUTH` / `ACK`). A broken link
-   brings the local poller straight back.
+   `Access` / `AckCritical` / `Settings` (as `LIMIT` / `AUTH` / `ACK` /
+   `SETTINGS`; an `err` reply lands in `WebData::service_error`, shown
+   once). Each cycle it also fetches the service's relayed sounds (`SOUNDS
+   … app`) and plays them with the app's own `SoundPlayer` while no sound
+   agent is listening. A broken link brings the local poller straight
+   back.
 1. **Poller thread** (`hardware::spawn_poller`): opens I2C + NVML (retrying
    what is missing with a backoff), loops (one poll per interval, measured
    from each poll's start so the read time does not stretch the spacing;
@@ -259,7 +289,8 @@ critical sections are short — keep them that way:
    not drain within the sound's length + `SOUND_STALL_MARGIN` is dropped and
    reopened). `SoundPlayer` is `Clone` (one shared thread). Plays **one sound at a time**;
    when a sound finishes it drops stale queued requests and plays the
-   newest. Never blocks the caller.
+   newest. Never blocks the caller. The system service has no audio
+   thread: its player relays (see "Background service").
 3. **Privileged power helper** (`hardware::PowerHelper`): the app runs as a
    normal user but NVML's limit setter (and the safeguard's cross-user kill)
    needs root. On demand (manual Apply, the automatic min-power feature,
@@ -289,7 +320,9 @@ critical sections are short — keep them that way:
    keeps them. One authentication serves both (enabling both at once never
    asks twice); the same happens at startup when either was saved enabled.
    Auth is asked once per app run; a denied/absent agent degrades to an
-   error note, never a crash.
+   error note, never a crash. The system service already runs as root:
+   its `PowerHelper` answers the same commands in-process (no pkexec, no
+   prompt, `power_auth` straight to `Active`).
 4. **Web server thread(s)** (`web::web_serve` + one thread per connection):
    `try_lock` with retry → 503 on contention so a GUI frame can never
    deadlock against the server-thread join at shutdown (both `/data` and
@@ -314,46 +347,96 @@ critical sections are short — keep them that way:
 
 ## Background service (`service.rs`)
 
-- **Unit**: `astral-gauge.service`, a systemd **user** unit in
-  `$XDG_CONFIG_HOME/systemd/user` (`~/.config/systemd/user`): no root to
-  install, starts at login (`WantedBy=default.target`), `Restart=always`
-  with `RestartSec=5` and `StartLimitIntervalSec=0`, ordered `After=` the
-  PipeWire/WirePlumber user units (ordering only). `ExecStart` is this
-  executable (`hardware::own_exe`, systemd-quoted) with `--service` and the
-  explicit bus if the app got one. A user unit (not a system one) is what
-  lets the service play sounds through the session's sound server and show
-  polkit prompts through the session's agent. The settings dialog's
-  "Background service" section installs (write unit → `daemon-reload` →
-  `enable` → `restart`), updates (when the unit differs from what this
-  executable would write), restarts and uninstalls (`disable --now` →
-  remove → `daemon-reload` → `reset-failed`); actions apply immediately,
-  outside the Accept/Cancel draft.
+Why a **system** service: the protection must not depend on a login. With
+nobody logged in, a user service does not run (no linger), cannot open the
+I2C bus (here `/dev/i2c-*` access comes from a `uaccess` ACL that only the
+active seat session gets) and cannot use pkexec (no polkit agent), so
+neither the power-down nor the cross-user kill would work — e.g. for an
+unattended inference server.
+
+- **System unit**: `/etc/systemd/system/astral-gauge.service`, root,
+  `WantedBy=multi-user.target`, `Restart=always`, `RestartSec=2`,
+  `StartLimitIntervalSec=0`, `RuntimeDirectory=astral-gauge` (the socket's
+  directory), ordered `After=` systemd-modules-load / nvidia-persistenced
+  (ordering only; the poller retries the hardware). Hardening:
+  `ProtectSystem=full` + `ReadWritePaths=-/etc/astral-gauge`,
+  `ProtectHome=yes`, `PrivateTmp=yes`, `NoNewPrivileges=yes`. `ExecStart` is
+  the root-owned copy `/usr/local/lib/astral-gauge/astral-gauge --service
+  --owner=<uid> [bus]` — never the user-writable build (anything running as
+  the user could otherwise swap the binary root runs at boot).
+- **Install** (settings dialog, `service::install`): stops a legacy
+  per-user `astral-gauge.service` (earlier versions), then runs `pkexec
+  <own exe> --install-system-service --owner=<uid> [bus]` with the applied
+  settings (persist JSON) on stdin — one administrator prompt. `run_install`
+  (root) validates the settings, copies `/proc/self/exe` to the install dir
+  (mode 0755, atomic), writes `/etc/astral-gauge/settings.json` and the
+  unit, then `daemon-reload` → `enable` → `restart`. On success the legacy
+  unit is removed (on failure it is started again) and the sound agent's
+  unit installed or removed per the checkbox. "Update service" appears when
+  the unit text or the installed binary (`same_file`: a content compare,
+  cached by size + mtime) differs from what this executable would install.
+  Uninstall removes the agent, then runs `pkexec …
+  --uninstall-system-service` (`disable --now`, remove the unit, the binary
+  and `/etc/astral-gauge`, `daemon-reload`, `reset-failed`). Restart asks
+  over the link (`RESTART`: the service exits, systemd starts it again; no
+  prompt) and falls back to `systemctl restart` (which prompts itself).
 - **Service mode** (`--service`, `run_service`): `WebData::service_mode`
-  (web JSON `service`, the page's "Service" chip), the regular poller and
-  sound player, settings from `persist` re-read whenever the file's mtime
-  changes (every second; persist writes atomically): limits/sounds,
-  interval, web server (busy port or a listen address that is not up yet
-  retried every `WEB_RETRY`; the address/port it serves on is published as
-  `ServiceLink::web_bind`/`web_port`, link lines `web_bind`/`web_port`), and newly
-  enabled privileged options authenticate the helper at once. The service
-  never rolls settings back itself (a denied prompt at login just means the
-  next privileged action asks again); the desktop app's pending-auth logic
-  still applies when it is open. Exits with 1 if another service already
-  answers on the socket.
-- **Link**: Unix socket `$XDG_RUNTIME_DIR/astral-gauge.sock` (fallback
-  `/run/user/<uid>`), line protocol, `LINK_VERSION` handshake (`HELLO`). A
-  different version shows a "restart needed" banner/pill instead of data
-  (and still no local monitoring). `SYNC <since>` returns the scalars, the
-  latest sample (pins, processes) and every history point with
-  `t > since`; times are printed with `{}` (shortest exact form) so the
-  next `since` matches bit for bit. The first (full) sync moves the app's
-  `WebData::start` onto the service's clock, so all service timestamps
-  apply unchanged; replies that predate a pending `ACK`/`AUTH` keep the
-  local flag/state (`apply_sync`'s `keep_ack`/`keep_auth`).
+  (web JSON `service`, the page's "Service" chip), the regular poller, a
+  relaying `SoundPlayer`, settings from `service_settings_path()` re-read
+  whenever the file's mtime changes (every second; writes are atomic):
+  limits/sounds, interval, web server (busy port or a listen address that
+  is not up yet retried every `WEB_RETRY`; the address/port it serves on is
+  published as `ServiceLink::web_bind`/`web_port`). Every applied change
+  bumps a revision, published with the JSON as `WebData::service_settings`.
+  As root, `PowerHelper` works in-process (auth is `Active` at once) and the
+  default kill is limited to the owner's processes (`set_safeguard_user`).
+  Exits with 1 if another service already answers on the socket or the
+  socket cannot be created (a service without its link would monitor
+  unseen next to a desktop app doing the same).
+- **Link**: Unix socket `/run/astral-gauge/link.sock`, mode 0666, line
+  protocol, `LINK_VERSION` (2) handshake (`HELLO`). Reading (`HELLO`,
+  `SYNC`, `SOUNDS`, `PING`) and `ACK` are open to every local user; `LIMIT`,
+  `AUTH`, `SETTINGS`, `RESTART` only to root and the owner (`peer_uid`,
+  `SO_PEERCRED`; others get `err only the service's owner can do that`).
+  Request lines are capped at 2 × `MAX_SETTINGS_BYTES`. A different
+  version shows an "update it" banner/pill instead of data (and still no
+  local monitoring). `SYNC <since> <settings rev>` returns the scalars, the
+  latest sample (pins, processes), every history point with `t > since`,
+  and `settings <rev> <json>` when the client's revision differs; times are
+  printed with `{}` (shortest exact form) so the next `since` matches bit
+  for bit. The first (full) sync moves the app's `WebData::start` onto the
+  service's clock, so all service timestamps apply unchanged; replies that
+  predate a pending `ACK`/`AUTH` keep the local flag/state (`apply_sync`'s
+  `keep_ack`/`keep_auth`). The app also tries the legacy per-user socket
+  (`$XDG_RUNTIME_DIR/astral-gauge.sock`, link version 1) so it never runs a
+  local poller next to an old service, and switches over as soon as the
+  system socket answers.
+- **Settings**: the service's settings are the ones in effect. The app
+  adopts `WebData::service_settings` whenever its revision changes (first
+  contact included) and saves them as its local copy; Accept (and the
+  pending-auth rollback) go through `App::save_config`, which saves locally
+  and sends `Cmd::Settings` (forwarded as `SETTINGS`; the service validates
+  it with `persist::parse` and writes its file, which the settings loop
+  then applies).
+- **Sounds** (`alerts::SoundRelay`): the service's player numbers each
+  request and keeps the last `RELAY_KEEP` (16). Listeners poll `SOUNDS
+  <cursor>|- <playing 0|1> agent|app` (a first `-` only returns the cursor:
+  nothing is replayed) and skip requests older than `RELAY_MAX_AGE` (5 s).
+  The sound agent (`--sound-agent`; user unit `astral-gauge-sound.service`
+  in `~/.config/systemd/user`, `WantedBy=default.target`, after PipeWire,
+  running the installed binary) polls every 150 ms; the desktop app plays
+  them only while no agent polled within `LISTENER_TIMEOUT` (2 s). The kill
+  safeguard's "terminating sound still playing" gate becomes "the playing
+  listener reports a priority sound, or has not fetched a recent one yet";
+  with no listener it never holds a kill back. Sound files are opened by
+  the listener (the user), never by root.
 - **Desktop indication**: a "Service" pill next to the status pill, a
-  banner below the header ("Running as a background service", with a link
-  to the service's web interface or its error), and the web-server row in
-  the settings says "served by the service on port N".
+  banner below the header ("Running as a system service", with a link to
+  the service's web interface or its error), and the web-server row in the
+  settings says "served by the service on …". The settings dialog's
+  "Background service" section shows the system unit's state, the legacy
+  notice, Install / Update / Restart / Uninstall and the sound-agent
+  checkbox (applied at once while the service is installed).
 
 ## Alert sound rules (implemented in `alerts::over_limit_sound`)
 
@@ -398,7 +481,9 @@ Optional (`Settings::kill_top_process_on_red`, default off, settings dialog
   repeat only ever follows a kill this excursion already started.
 - Unprivileged by default: `kill()` only reaches processes of the app's
   own user (others answer EPERM — logged, not fatal), which deliberately
-  bounds the blast radius. Opt-in `Settings::kill_other_users_processes`
+  bounds the blast radius. The system service runs as root, so
+  `kill_own_process` enforces the same bound itself: only processes of the
+  service's owner (`--owner=`), EPERM for the rest. Opt-in `Settings::kill_other_users_processes`
   (settings dialog, only checkable while the safeguard is on): the SIGKILL
   goes through the privileged power helper instead, so other users'
   (root's) processes — e.g. an inference service — can be terminated too.
@@ -546,7 +631,7 @@ Optional (`Settings::auto_min_power` = Off / On yellow / On red):
 
 ## Tests
 
-`cargo test` (44 tests, no GPU/display needed):
+`cargo test` (48 tests, no GPU/display needed):
 
 - `alerts::tests`: settings defaults; embedded WAVs decode; alert edge
   triggering; 15 s repeat-while-exceeded behavior; powering-down sound
@@ -555,7 +640,8 @@ Optional (`Settings::auto_min_power` = Off / On yellow / On red):
   gating; critical-notification red-edge triggering; priority requests
   outranking normal playback requests; the sensor-fault sound (once, after
   the grace period, re-armed by recovery); the pending-kill sound hold and
-  reply timeout.
+  reply timeout; the sound relay (cursor, no replay, priority gate, agent
+  presence, bounded queue).
 - `hardware::tests`: process ranking (utilization/memory/pid order,
   compositors last, truncation, own + zero pid exclusion), the 5 s
   utilization averaging, `/proc` name fallback, the
@@ -568,10 +654,13 @@ Optional (`Settings::auto_min_power` = Off / On yellow / On red):
   order repair, rejection of invalid values, and corrupt-document detection.
 - `service::tests`: full and incremental SYNC round trips into a fresh
   `WebData` (histories, sample, processes with escaped names, flags, clock
-  alignment, gaps, pending ACK/AUTH kept), malformed replies rejected,
-  unknown lines tolerated, the unit file's quoted `ExecStart`, line
-  escaping. (Never call `install`/`uninstall` in a test: they drive the
-  real user manager.)
+  alignment, gaps, pending ACK/AUTH kept), settings carried only to
+  clients with another revision, malformed replies rejected, unknown lines
+  tolerated, the SOUNDS encoding round trip, the unit files' quoted
+  `ExecStart`, the installer's files under a temporary root
+  (`install_files` / `remove_files`), line escaping. (Never call `install`,
+  `uninstall`, `restart`, `run_install` or `run_uninstall` in a test: they
+  drive pkexec and the real service managers.)
 - `ui::tests`: the live alert summary (worst range, pins named, red over
   yellow); embedded license-text sanity (the generated `licenses.txt` is
   non-empty, lists one "Used by:" section per license, and has no template

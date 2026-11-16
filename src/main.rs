@@ -7,8 +7,8 @@
 //! - [`alerts`]: current-limit checking and rodio alert sounds
 //! - [`web`]: shared sample/history store and the HTTP server
 //! - [`ui`]: the eframe/egui desktop UI
-//! - [`service`]: the background (systemd user) service and the desktop
-//!   app's link to it
+//! - [`service`]: the background (systemd system) service, its installer,
+//!   the per-user sound agent and the desktop app's link to the service
 
 mod alerts;
 mod hardware;
@@ -32,17 +32,31 @@ fn main() {
         std::process::exit(hardware::run_power_helper());
     }
 
-    // An explicit IT8915 bus number (`astral-gauge [--service] 15`). Without
+    // An explicit IT8915 bus number (`astral-gauge [--service] 15`; flags
+    // such as `--owner=1000` never parse as one). Without
     // one the poller auto-detects the bus, and keeps retrying while none is
     // found. There is no fallback bus: guessing (say, bus 0) would read
     // whatever device answers at the IT8915's address there and could pass
     // garbage off as pin currents.
     let explicit_bus: Option<u32> = std::env::args().skip(1).find_map(|a| a.parse().ok());
 
-    // Background-service mode: the same monitoring without a window, run by
-    // the systemd user unit the settings dialog installs (see `service`).
-    if std::env::args().any(|a| a == service::SERVICE_ARG) {
+    // The other modes of this binary (see `service`): the installer and
+    // uninstaller (run as root through pkexec by the settings dialog), the
+    // background service (the same monitoring without a window, run by the
+    // systemd system unit) and the sound agent (the user unit that plays the
+    // service's alert sounds in the login session).
+    let has = |flag: &str| std::env::args().any(|a| a == flag);
+    if has(service::INSTALL_ARG) {
+        std::process::exit(service::run_install(explicit_bus));
+    }
+    if has(service::UNINSTALL_ARG) {
+        std::process::exit(service::run_uninstall());
+    }
+    if has(service::SERVICE_ARG) {
         std::process::exit(service::run_service(explicit_bus));
+    }
+    if has(service::SOUND_AGENT_ARG) {
+        std::process::exit(service::run_sound_agent());
     }
 
     // The single shared state: the poller records samples into it, the GUI
