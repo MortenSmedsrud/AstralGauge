@@ -972,10 +972,11 @@ Apply the reset with Accept, discard it with Cancel."
                             ui.label(
                                 egui::RichText::new(
                                     "As a last resort, the first process of the \"Top GPU processes\" list \
-        (is ranked by utilization, then VRAM usage) is killed with SIGKILL the moment a pin current \
-        first reaches the red limit. It fires once per excursion, never while the limit merely stays \
-        exceeded, and the app itself is never a target. The killed process gets no chance to save \
-        its work. Disabled by default. When a process is terminated, the terminating sound below \
+        (ranked by utilization, then VRAM usage) is killed with SIGKILL the moment a pin current \
+        reaches the red limit. While the current stays red it keeps going: every 5 seconds the \
+        process then at the top of the list is killed too, until the current drops below red. Any \
+        process can be a target, including your desktop compositor or display server; only the app \
+        itself is never one. Killed processes get no chance to save their work. Disabled by default. When a process is terminated, the terminating sound below \
         plays: it cannot be interrupted and it replaces the critical alert sound of that same \
         excursion.\nBy default only processes of your own user can be killed. With the option above, the \
         SIGKILL goes through the privileged helper instead, so processes of other users — for \
