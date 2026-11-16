@@ -39,6 +39,15 @@ const TOTAL_BYTES: usize = NUM_PINS * BYTES_PER_PIN;
 const VOLTAGE_SANITY_MIN: u32 = 10_000;
 const VOLTAGE_SANITY_MAX: u32 = 14_000;
 
+// Plausibility bounds for every polled pin reading. Beyond them the reading
+// is treated as a sensor fault, never as a real current: a glitched or torn
+// transfer (an all-ones register reads 65.535) must not trigger the red
+// alert, the automatic power limit or the kill safeguard. Both sit far above
+// anything a 12 V-2x6 pin can carry for long (a melting pin has been measured
+// at ~20-25 A); the ceiling is not a lower threshold for real faults.
+const MAX_PLAUSIBLE_CURRENT_A: f64 = 50.0;
+const MAX_PLAUSIBLE_VOLTAGE_V: f64 = 20.0;
+
 // Linux i2c-dev ioctl constants
 const I2C_SLAVE: libc::c_ulong = 0x0703;
 const I2C_SMBUS: libc::c_ulong = 0x0720;
@@ -534,6 +543,7 @@ pub(crate) fn spawn_poller(
                         }
                     }
                     read.map_err(|e| format!("I2C read failed: {e}"))
+                        .and_then(|pins| check_plausible(&pins).map(|()| pins))
                 }
                 Err(reason) => Err(reason.clone()),
             };
@@ -764,6 +774,23 @@ pub(crate) fn spawn_poller(
         }
     });
     cmd_tx
+}
+
+/// Reject physically impossible pin readings (see
+/// [`MAX_PLAUSIBLE_CURRENT_A`]): `Err` names the first offending pin and is
+/// reported as a sensor fault instead of being judged against the limits.
+fn check_plausible(pins: &[PinReading]) -> Result<(), String> {
+    for (i, p) in pins.iter().enumerate() {
+        let ok = (0.0..=MAX_PLAUSIBLE_CURRENT_A).contains(&p.current)
+            && (0.0..=MAX_PLAUSIBLE_VOLTAGE_V).contains(&p.voltage);
+        if !ok {
+            return Err(format!(
+                "Implausible sensor reading (pin {i}: {:.3} V, {:.3} A)",
+                p.voltage, p.current
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Open the IT8915's I2C bus and address the chip. `Err` carries a
@@ -1502,6 +1529,23 @@ mod tests {
         assert_eq!(process_name(u32::MAX), "pid 4294967295");
         // The current process always has a readable /proc/comm.
         assert!(!process_name(std::process::id()).is_empty());
+    }
+
+    #[test]
+    fn implausible_readings_are_sensor_faults() {
+        let pin = |voltage: f64, current: f64| PinReading { voltage, current };
+        let mut pins = vec![pin(12.1, 8.4); NUM_PINS];
+        assert!(check_plausible(&pins).is_ok());
+        // A genuinely dangerous but physical current is a reading, not a
+        // fault: it must reach the red alert and the safeguard.
+        pins[2] = pin(11.9, 25.0);
+        assert!(check_plausible(&pins).is_ok());
+        // An all-ones register (65.535) in either field is a glitch.
+        pins[2] = pin(12.1, 65.535);
+        let err = check_plausible(&pins).unwrap_err();
+        assert!(err.contains("pin 2"), "{err}");
+        pins[2] = pin(65.535, 8.4);
+        assert!(check_plausible(&pins).is_err());
     }
 
     #[test]

@@ -370,6 +370,10 @@ Optional (`Settings::auto_min_power` = Off / On yellow / On red):
   (byte-reads take the GPU's I2C bus lock and can stutter games); the
   byte-read fallback exists for kernels without block support and for
   probing.
+- Every polled reading passes `check_plausible` (≤ 50 A, ≤ 20 V per pin):
+  an impossible value (e.g. an all-ones register, 65.535) is a sensor fault,
+  never a red current, so a glitch cannot kill a process. The ceiling is far
+  above real failures (~20–25 A on a melting pin) — don't lower it.
 - Rail→pin mapping is reversed: rail `r` at offset `r*4` maps to pin
   `NUM_PINS - 1 - r` (see `read_pins`).
 
