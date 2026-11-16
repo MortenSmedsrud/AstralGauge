@@ -31,20 +31,20 @@ fn main() {
 
     let bus_arg: Option<String> = std::env::args().nth(1);
 
-    let bus_number = match bus_arg
+    // No fallback bus: guessing (say, bus 0) would read whatever device
+    // answers at the IT8915's address there and could pass garbage off as
+    // pin currents. Without a bus the sensor is reported as unavailable.
+    let bus_number = bus_arg
         .as_ref()
         .and_then(|s| s.parse::<u32>().ok())
-        .or_else(find_i2c_bus)
-    {
-        Some(bus) => bus,
+        .or_else(find_i2c_bus);
+    match bus_number {
+        Some(bus) => println!("Using I2C bus: {bus}"),
         None => {
-            eprintln!("Warning: auto-detect failed. Defaulting to bus 0.");
+            eprintln!("Warning: IT8915 auto-detect failed; pin currents will NOT be monitored.");
             eprintln!("Pass the bus number explicitly, e.g.: astral-gauge 15");
-            0
         }
-    };
-
-    println!("Using I2C bus: {bus_number}");
+    }
 
     // The single shared state: the poller records samples into it, the GUI
     // renders from it and the web server serves it.

@@ -40,6 +40,11 @@ pub(crate) const AUTO_POWER_RESTORE_DELAY: Duration = Duration::from_secs(30);
 /// critical-terminating sound of the previous kill.
 pub(crate) const KILL_REPEAT_COOLDOWN: Duration = Duration::from_secs(5);
 
+/// How long the pin readings must stay unavailable (I2C read failures, no
+/// chip found) before the sensor fault plays its alert sound: a single
+/// failed transfer is retried on the next poll without a sound.
+pub(crate) const SENSOR_FAULT_GRACE: Duration = Duration::from_secs(3);
+
 /// When the power management limit should be automatically lowered to its
 /// hardware minimum (requires the privileged power helper, see
 /// [`crate::hardware::PowerHelper`]).
@@ -353,6 +358,47 @@ pub(crate) fn critical_alert_edge(
     let rising = over_red && !state.latched_red;
     state.latched_red = over_red;
     rising
+}
+
+/// Sensor-fault alert state carried across poll samples: since when the pin
+/// readings have been unavailable, and whether this fault already alerted.
+#[derive(Default)]
+pub(crate) struct SensorFaultState {
+    failing_since: Option<Instant>,
+    alerted: bool,
+}
+
+/// Fold one poll's sensor health into the fault state and return the sound
+/// to play now, if any.
+///
+/// Without pin readings the current limits cannot be checked at all, so an
+/// unreadable sensor must not stay silent: once the readings have been
+/// missing for [`SENSOR_FAULT_GRACE`], the alert sound plays **once** per
+/// fault (a permanently missing chip does not nag every few seconds; the UI
+/// banner stays up). Readings coming back re-arm it. It uses the yellow
+/// (attention) sound when that is enabled, otherwise the red one when that
+/// is enabled — anyone who enabled an alert sound hears a lost sensor.
+pub(crate) fn sensor_fault_sound(
+    state: &mut SensorFaultState,
+    readings_ok: bool,
+    s: &Settings,
+) -> Option<Sound> {
+    if readings_ok {
+        *state = SensorFaultState::default();
+        return None;
+    }
+    let since = *state.failing_since.get_or_insert_with(Instant::now);
+    if state.alerted || since.elapsed() < SENSOR_FAULT_GRACE {
+        return None;
+    }
+    state.alerted = true;
+    if s.yellow_sound_enabled {
+        Some(s.yellow_sound.clone())
+    } else if s.red_sound_enabled {
+        Some(s.red_sound.clone())
+    } else {
+        None
+    }
 }
 
 /// Automatic-power-limit state carried across poll samples: the limit to
@@ -834,6 +880,43 @@ mod tests {
 
         // A fresh excursion is a fresh trigger.
         assert!(critical_alert_edge(&mut state, red, &s));
+    }
+
+    #[test]
+    fn sensor_fault_alerts_once_after_grace() {
+        let mut s = Settings {
+            red_sound_enabled: true,
+            ..Default::default()
+        };
+        let mut st = SensorFaultState::default();
+        // Healthy readings: silence. A fresh fault waits out the grace.
+        assert_eq!(sensor_fault_sound(&mut st, true, &s), None);
+        assert_eq!(sensor_fault_sound(&mut st, false, &s), None);
+        // Grace over: one alert (only red is enabled, so the red sound)...
+        st.failing_since = Some(Instant::now() - SENSOR_FAULT_GRACE);
+        assert_eq!(
+            sensor_fault_sound(&mut st, false, &s),
+            Some(s.red_sound.clone())
+        );
+        // ... and no nagging while the same fault lasts.
+        st.failing_since = Some(Instant::now() - SENSOR_FAULT_GRACE * 10);
+        assert_eq!(sensor_fault_sound(&mut st, false, &s), None);
+        // Readings back re-arm it; the yellow sound is preferred if enabled.
+        assert_eq!(sensor_fault_sound(&mut st, true, &s), None);
+        s.yellow_sound_enabled = true;
+        assert_eq!(sensor_fault_sound(&mut st, false, &s), None);
+        st.failing_since = Some(Instant::now() - SENSOR_FAULT_GRACE);
+        assert_eq!(
+            sensor_fault_sound(&mut st, false, &s),
+            Some(s.yellow_sound.clone())
+        );
+        // With every alert sound disabled a fault stays silent (UI only).
+        let quiet = Settings::default();
+        let mut st = SensorFaultState {
+            failing_since: Some(Instant::now() - SENSOR_FAULT_GRACE),
+            alerted: false,
+        };
+        assert_eq!(sensor_fault_sound(&mut st, false, &quiet), None);
     }
 
     #[test]

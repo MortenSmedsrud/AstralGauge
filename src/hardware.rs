@@ -22,8 +22,9 @@ use std::thread;
 use std::time::Duration;
 
 use crate::alerts::{
-    auto_power_action, critical_alert_edge, kill_guard_action, over_limit_sound, AlertState,
-    AutoPowerState, CriticalAlertState, KillGuardState, Sound, SoundPlayer,
+    auto_power_action, critical_alert_edge, kill_guard_action, over_limit_sound,
+    sensor_fault_sound, AlertState, AutoPowerState, CriticalAlertState, KillGuardState,
+    SensorFaultState, Sound, SoundPlayer,
 };
 use crate::web::WebData;
 
@@ -74,6 +75,10 @@ struct I2cSmbusIoctlData {
 /// One poll sample: per-pin I2C readings plus NVML data.
 #[derive(Clone, Default)]
 pub(crate) struct Sample {
+    /// Either [`NUM_PINS`] readings (index 0 = pin 0) or empty when there is
+    /// no valid reading: before the first poll, or while the IT8915 cannot
+    /// be read (see `WebData::sensor_error`). Never zeros standing in for a
+    /// missing reading — those would look like a healthy idle card.
     pub(crate) pins: Vec<PinReading>,
     pub(crate) power_w: Option<f64>, // from NVML, same source as nvidia-smi
     pub(crate) limit_w: Option<u32>, // current power management limit
@@ -401,39 +406,27 @@ pub(crate) struct PinReading {
 /// monitoring keeps working while the window is minimized and the web
 /// server never depends on the GUI drawing frames), and plays alert sounds
 /// when the current limits are exceeded.
+///
+/// `bus_number` is `None` when no IT8915 bus was given or found: the app
+/// then runs without pin readings and reports the sensor as unavailable.
 pub(crate) fn spawn_poller(
-    bus_number: u32,
+    bus_number: Option<u32>,
     data: Arc<Mutex<WebData>>,
     player: SoundPlayer,
 ) -> mpsc::Sender<Cmd> {
     let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
     thread::spawn(move || {
         // I2C is best-effort: if the device is unavailable, the app keeps
-        // running with zero pin readings.
-        let mut file: Option<File> = None;
-        let i2c_path = format!("/dev/i2c-{}", bus_number);
-        match OpenOptions::new().read(true).write(true).open(&i2c_path) {
-            Ok(f) => {
-                // Set slave address
-                if unsafe {
-                    libc::ioctl(f.as_raw_fd(), I2C_SLAVE, I2C_SLAVE_ADDR as libc::c_uint) < 0
-                } {
-                    eprintln!("I2C_SLAVE failed: {}", io::Error::last_os_error());
-                } else {
-                    // Fail fast on a bad transfer instead of letting the
-                    // kernel retry (retries multiply worst-case latency).
-                    let _ =
-                        unsafe { libc::ioctl(f.as_raw_fd(), I2C_RETRIES, 0usize as libc::c_ulong) };
-                    file = Some(f);
-                }
-            }
-            Err(e) => {
-                eprintln!("Cannot open {i2c_path}: {e}. Run as root or add user to i2c group.");
-            }
+        // running without pin readings, and the reason is shown as a sensor
+        // fault in both UIs (never as zero, i.e. green, currents).
+        let i2c = open_i2c(bus_number);
+        if let Err(reason) = &i2c {
+            eprintln!("{reason}. Pin currents are NOT monitored.");
         }
-        if file.is_none() {
-            eprintln!("Continuing without I2C (pin readings will be zero).");
-        }
+        // Whether the previous poll had no valid pin readings (log only the
+        // transitions, not every failing poll).
+        let mut sensor_failing = false;
+        let mut sensor_fault = SensorFaultState::default();
 
         let nvml = nvml::Nvml::new();
         if nvml.is_none() {
@@ -521,33 +514,41 @@ pub(crate) fn spawn_poller(
                 .as_ref()
                 .map_or_else(Vec::new, |n| n.processes(TOP_PROCESSES));
 
-            let pins =
-                match file.as_ref() {
-                    Some(f) => {
-                        let t = std::time::Instant::now();
-                        match read_pins(f) {
-                            Some(pins) => {
-                                let el = t.elapsed().as_millis() as u64;
-                                polls += 1;
-                                poll_sum_ms += el;
-                                poll_max_ms = poll_max_ms.max(el);
-                                if polls == 50 || polls.is_multiple_of(500) {
-                                    eprintln!(
-                                    "I2C read batch: avg {} ms per poll, worst {} ms (polls 1..{})",
-                                    poll_sum_ms / polls, poll_max_ms, polls
-                                );
-                                }
-                                pins
-                            }
-                            None => {
-                                eprintln!("Read error");
-                                thread::sleep(Duration::from_millis(poll_ms));
-                                continue;
-                            }
+            // Pin readings, or why there are none this poll.
+            let pins: Result<Vec<PinReading>, String> = match &i2c {
+                Ok(f) => {
+                    let t = std::time::Instant::now();
+                    let read = read_pins(f);
+                    if read.is_ok() {
+                        let el = t.elapsed().as_millis() as u64;
+                        polls += 1;
+                        poll_sum_ms += el;
+                        poll_max_ms = poll_max_ms.max(el);
+                        if polls == 50 || polls.is_multiple_of(500) {
+                            eprintln!(
+                                "I2C read batch: avg {} ms per poll, worst {} ms (polls 1..{})",
+                                poll_sum_ms / polls,
+                                poll_max_ms,
+                                polls
+                            );
                         }
                     }
-                    None => vec![PinReading::default(); NUM_PINS],
-                };
+                    read.map_err(|e| format!("I2C read failed: {e}"))
+                }
+                Err(reason) => Err(reason.clone()),
+            };
+            match (&pins, sensor_failing) {
+                (Err(e), false) if i2c.is_ok() => {
+                    eprintln!("{e}. Pin currents are NOT monitored until reads succeed again.")
+                }
+                (Ok(_), true) => eprintln!("I2C reads recovered."),
+                _ => {}
+            }
+            sensor_failing = pins.is_err();
+            let (pins, sensor_error) = match pins {
+                Ok(pins) => (pins, None),
+                Err(e) => (Vec::new(), Some(e)),
+            };
 
             let sample = Sample {
                 pins,
@@ -566,12 +567,17 @@ pub(crate) fn spawn_poller(
             let top_process = sample.processes.first().cloned();
 
             // Limit checking runs here, on the poller's cadence: the newest
-            // settings are mirrored into the shared data by the UI.
-            let max_current = sample
-                .pins
-                .iter()
-                .map(|p| p.current)
-                .fold(f64::NEG_INFINITY, f64::max);
+            // settings are mirrored into the shared data by the UI. Without
+            // pin readings there is no current to judge: the alert, kill and
+            // automatic-power state machines are skipped (frozen) rather
+            // than fed a made-up value, and the sensor fault alerts instead.
+            let max_current = (!sample.pins.is_empty()).then(|| {
+                sample
+                    .pins
+                    .iter()
+                    .map(|p| p.current)
+                    .fold(f64::NEG_INFINITY, f64::max)
+            });
             // Mirror the helper's status so the GUI can show what happened
             // with privileged limit changes (and revert auto power if the
             // authentication it needs was not granted).
@@ -581,6 +587,7 @@ pub(crate) fn spawn_poller(
                 let mut d = data.lock().unwrap();
                 let settings = d.settings.clone();
                 d.record(sample);
+                d.sensor_error = sensor_error;
                 d.power_note = power_note;
                 d.power_auth = power_auth;
                 settings
@@ -588,12 +595,24 @@ pub(crate) fn spawn_poller(
             // Limit checking decides which alert sound this sample earns, but
             // it is only played below: a termination on this same red edge
             // replaces the critical alert (see the priority sound below).
-            let alert_sound = over_limit_sound(&mut alert_state, max_current, &settings);
+            let alert_sound = match max_current {
+                Some(current) => over_limit_sound(&mut alert_state, current, &settings),
+                None => None,
+            };
+            // A sensor that stays unreadable alerts once (see
+            // alerts::sensor_fault_sound); readings coming back re-arm it.
+            let alert_sound = alert_sound.or(sensor_fault_sound(
+                &mut sensor_fault,
+                max_current.is_some(),
+                &settings,
+            ));
 
             // The red rising edge also arms the latching critical-current
             // notification (flashing banner in both UIs). It only ever gets
             // cleared by a user acknowledgment, never by the current dropping.
-            if critical_alert_edge(&mut critical_state, max_current, &settings) {
+            if max_current
+                .is_some_and(|current| critical_alert_edge(&mut critical_state, current, &settings))
+            {
                 data.lock().unwrap().critical_alert = true;
             }
 
@@ -653,12 +672,14 @@ pub(crate) fn spawn_poller(
                     }
                     None => pending_kill = Some(p), // reply still missing
                 }
-            } else if kill_guard_action(
-                &mut kill_guard,
-                max_current,
-                &settings,
-                player.priority_sound_playing(),
-            ) {
+            } else if max_current.is_some_and(|current| {
+                kill_guard_action(
+                    &mut kill_guard,
+                    current,
+                    &settings,
+                    player.priority_sound_playing(),
+                )
+            }) {
                 kill_guard.note_kill_attempt();
                 match top_process {
                     Some(p) => {
@@ -733,13 +754,9 @@ pub(crate) fn spawn_poller(
             // Automatic minimum power limit (see alerts::auto_power_action);
             // applying it goes through the privileged helper (kept last so a
             // first-time pkexec spawn can never delay the sounds above).
-            if let Some(watts) = auto_power_action(
-                &mut auto_power,
-                max_current,
-                limit_w,
-                limit_min_w,
-                &settings,
-            ) {
+            if let Some(watts) = max_current.and_then(|current| {
+                auto_power_action(&mut auto_power, current, limit_w, limit_min_w, &settings)
+            }) {
                 println!("Automatic power limit: applying {watts} W");
                 power_helper.set(watts);
             }
@@ -747,6 +764,36 @@ pub(crate) fn spawn_poller(
         }
     });
     cmd_tx
+}
+
+/// Open the IT8915's I2C bus and address the chip. `Err` carries a
+/// user-facing reason, shown as the sensor fault in both UIs.
+fn open_i2c(bus_number: Option<u32>) -> Result<File, String> {
+    let Some(bus) = bus_number else {
+        return Err(
+            "No IT8915 I2C bus found (auto-detect failed; pass the bus number, \
+                    e.g. astral-gauge 15)"
+                .to_owned(),
+        );
+    };
+    let i2c_path = format!("/dev/i2c-{bus}");
+    let f = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&i2c_path)
+        .map_err(|e| {
+            format!("Cannot open {i2c_path}: {e} (run as root or add your user to the i2c group)")
+        })?;
+    if unsafe { libc::ioctl(f.as_raw_fd(), I2C_SLAVE, I2C_SLAVE_ADDR as libc::c_uint) } < 0 {
+        return Err(format!(
+            "Cannot address the IT8915 on {i2c_path}: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    // Fail fast on a bad transfer instead of letting the kernel retry
+    // (retries multiply worst-case latency).
+    let _ = unsafe { libc::ioctl(f.as_raw_fd(), I2C_RETRIES, 0usize as libc::c_ulong) };
+    Ok(f)
 }
 
 /// SIGKILL a process (the critical-alert safeguard). Called unprivileged by
@@ -861,10 +908,10 @@ fn smbus_read_block(fd: RawFd, reg: u8, data: &mut I2cSmbusData) -> io::Result<u
 static BLOCK_FALLBACK_WARNED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Read all 6 pins. Returns readings in pin order 1-6 (index 0 = pin 1).
+/// Read all 6 pins. Returns readings in pin order (index 0 = pin 0).
 /// Register layout: rail `r` lives at offset `r * 4` and maps to pin
-/// `NUM_PINS - r` (rail 0 = pin 6, rail 5 = pin 1 — reversed order).
-fn read_pins(file: &File) -> Option<Vec<PinReading>> {
+/// `NUM_PINS - 1 - r` (rail 0 = pin 5, rail 5 = pin 0 — reversed order).
+fn read_pins(file: &File) -> io::Result<Vec<PinReading>> {
     let fd = file.as_raw_fd();
 
     let mut raw = [0u8; TOTAL_BYTES];
@@ -886,7 +933,7 @@ fn read_pins(file: &File) -> Option<Vec<PinReading>> {
             eprintln!("I2C block read unavailable; using 24 byte reads per poll.");
         }
         for (offset, byte) in raw.iter_mut().enumerate() {
-            *byte = smbus_read_byte(fd, REG_POWER + offset as u8).ok()?;
+            *byte = smbus_read_byte(fd, REG_POWER + offset as u8)?;
         }
     }
 
@@ -901,7 +948,7 @@ fn read_pins(file: &File) -> Option<Vec<PinReading>> {
             current: current_ma / 1000.0,
         };
     }
-    Some(pins)
+    Ok(pins)
 }
 
 /// Find the i2c bus for the GPU's IT8915.

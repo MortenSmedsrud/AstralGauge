@@ -27,6 +27,14 @@ const WEB_MAX_PTS: usize = 600;
 /// Keep a little more history than the largest horizon
 pub(crate) const HISTORY_SECS: f64 = 60.0 * 60.0 + 120.0;
 
+/// Age (seconds) after which the last pin reading counts as stale: three
+/// sample intervals, but at least 3 s. Checked by the GUI and the web page
+/// themselves, so a hung or dead poller thread shows up too. Mirrored as
+/// `staleAfter` in the web page's JS.
+pub(crate) fn stale_after_secs(poll_ms: u64) -> f64 {
+    (3.0 * poll_ms as f64 / 1000.0).max(3.0)
+}
+
 /// The data shared between the GUI and the web server: the latest sample,
 /// the history buffers, the permanent y ranges and a few mirrored UI
 /// settings. Both sides take one mutex; the critical sections are short.
@@ -69,6 +77,14 @@ pub(crate) struct WebData {
     /// `POST /ack` on the web page. The current returning to normal never
     /// clears it; the next red excursion arms it again.
     pub(crate) critical_alert: bool,
+    /// Why the latest sample has no pin readings (no IT8915 bus, I2C device
+    /// not accessible, read failure); `None` while the readings are fine.
+    /// Shown as a sensor-fault banner in both UIs.
+    pub(crate) sensor_error: Option<String>,
+    /// When (seconds since `start`) the last valid pin readings were
+    /// recorded; `None` before the first one. Drives the staleness warning
+    /// (see [`stale_after_secs`]).
+    pub(crate) pins_at: Option<f64>,
 }
 
 impl WebData {
@@ -90,6 +106,8 @@ impl WebData {
             power_auth: AuthState::Idle,
             kill_note: None,
             critical_alert: false,
+            sensor_error: None,
+            pins_at: None,
         };
         // Pre-reserve history for the default 1 Hz sample rate so the common
         // case never reallocates; a faster slider setting just grows the vecs.
@@ -109,19 +127,25 @@ impl WebData {
     /// keeps flowing while the GUI window is minimized or not drawing.
     pub(crate) fn record(&mut self, sample: Sample) {
         let now = self.start.elapsed().as_secs_f64();
-        for i in 0..NUM_PINS {
-            self.history[i].push((now, sample.pins[i].current));
+        // Without valid pin readings (see `Sample::pins`) the pin histories
+        // get a gap instead of made-up zeros.
+        let pins_valid = sample.pins.len() == NUM_PINS;
+        if pins_valid {
+            for (hist, pin) in self.history.iter_mut().zip(&sample.pins) {
+                hist.push((now, pin.current));
+            }
+            self.pins_at = Some(now);
         }
         // Power: prefer NVML, fall back to the estimated pin sum so the
         // graph still has data when NVML is unavailable.
         let power_val = sample.power_w.or_else(|| {
-            Some(
+            pins_valid.then(|| {
                 sample
                     .pins
                     .iter()
                     .map(|p| p.voltage * p.current)
-                    .sum::<f64>(),
-            )
+                    .sum::<f64>()
+            })
         });
         if let Some(p) = power_val {
             self.power_history.push((now, p));
@@ -362,6 +386,14 @@ fn web_json(data: &WebData, window_secs: f64) -> String {
     out.push_str(if data.show_graphs { "true" } else { "false" });
     out.push_str(",\"critical_alert\":");
     out.push_str(if data.critical_alert { "true" } else { "false" });
+    out.push_str(",\"sensor_error\":");
+    match &data.sensor_error {
+        Some(e) => json_string(&mut out, e),
+        None => out.push_str("null"),
+    }
+    // Age of the last valid pin reading (null: none yet).
+    out.push_str(",\"pins_age\":");
+    json_opt_f(&mut out, data.pins_at.map(|t| now - t), 1);
     out.push_str(",\"sample\":{\"pins\":[");
     for (i, p) in s.pins.iter().enumerate() {
         if i > 0 {
@@ -530,6 +562,7 @@ const INDEX_HTML: &str = r###"<!DOCTYPE html>
   .name { font-weight: 700; font-size: 13px; margin-bottom: 2px; }
   canvas { display: block; width: 100%; height: 150px; background: #232323; border: 1px solid #3a3a3a; }
   #err { display: none; color: #f03c3c; margin-top: 12px; }
+  #sensor { display: none; color: #f0a028; font-weight: 700; font-size: 15px; margin: 6px 0; }
   @media (max-width: 800px) { .grid { grid-template-columns: repeat(2, 1fr); } .tables { gap: 24px; } }
 </style>
 </head>
@@ -542,6 +575,7 @@ const INDEX_HTML: &str = r###"<!DOCTYPE html>
     <span id="temp"></span>
     <span id="vram"></span>
   </div>
+  <div id="sensor"></div>
   <div id="limit" class="line"></div>
   <div id="interval" class="line dim"></div>
   <div class="tables">
@@ -757,7 +791,8 @@ function drawHover(ctx, w, h, vis, t0, win, xOf, yOf, idx) {
 }
 
 function pinLabel(pin, value) {
-  return 'Pin ' + String(pin).padStart(2) + ': ' + value.toFixed(3).padStart(7);
+  const v = value == null ? '\u2014' : value.toFixed(3);
+  return 'Pin ' + String(pin).padStart(2) + ': ' + v.padStart(7);
 }
 
 // Latching critical-current alert: shown while the poller has it armed,
@@ -768,13 +803,32 @@ document.getElementById('ackbtn').addEventListener('click', function () {
   fetch('/ack', { method: 'POST' }).catch(function () {});
 });
 
+// Mirrors web::stale_after_secs: three sample intervals, at least 3 s.
+function staleAfter(pollMs) { return Math.max(3 * pollMs / 1000, 3); }
+
 function render(d) {
   const s = d.sample;
+  const pinsOk = s.pins.length === 6;
 
   alertEl.style.display = d.critical_alert ? 'inline-flex' : 'none';
 
+  // Sensor fault / stale readings: the pin currents are not being checked.
+  const sensorEl = document.getElementById('sensor');
+  let sensorMsg = '';
+  if (d.sensor_error != null) {
+    sensorMsg = '\u26a0 SENSOR UNAVAILABLE: ' + d.sensor_error + ' \u2014 pin currents are NOT monitored!';
+  } else if (d.pins_age == null ? d.now > staleAfter(d.poll_ms) : d.pins_age > staleAfter(d.poll_ms)) {
+    sensorMsg = '\u26a0 Pin readings are stale' +
+      (d.pins_age == null ? '' : ' (last update ' + d.pins_age.toFixed(0) + ' s ago)') +
+      ' \u2014 monitoring may have stopped!';
+  }
+  sensorEl.textContent = sensorMsg;
+  sensorEl.style.display = sensorMsg ? 'block' : 'none';
+
   if (s.power_w != null) {
     document.getElementById('power').textContent = 'Total power: ' + s.power_w.toFixed(1) + ' W';
+  } else if (!pinsOk) {
+    document.getElementById('power').textContent = 'Total power: \u2014';
   } else {
     let sum = 0;
     for (const p of s.pins) sum += p[0] * p[1];
@@ -828,8 +882,8 @@ function render(d) {
       '<span class="g">● < ' + limits[0] + 'A</span>';
   }
 
-  // tables (skip until the first sample with all pins has arrived)
-  if (s.pins.length === 6) {
+  // tables (dashes while there are no valid pin readings)
+  {
     const volt = document.getElementById('volt');
     const curr = document.getElementById('curr');
     volt.innerHTML = '';
@@ -839,11 +893,11 @@ function render(d) {
       const cr = curr.insertRow();
       for (let c = 0; c < 3; c++) {
         const pin = row * 3 + c;
-        vr.insertCell().textContent = pinLabel(pin, s.pins[pin][0]);
+        vr.insertCell().textContent = pinLabel(pin, pinsOk ? s.pins[pin][0] : null);
         const cell = cr.insertCell();
-        const cur = s.pins[pin][1];
+        const cur = pinsOk ? s.pins[pin][1] : null;
         cell.textContent = pinLabel(pin, cur);
-        cell.className = cur < limits[0] ? 'g' : (cur < limits[1] ? 'y' : 'r');
+        cell.className = cur == null ? 'dim' : (cur < limits[0] ? 'g' : (cur < limits[1] ? 'y' : 'r'));
       }
     }
   }
@@ -985,6 +1039,8 @@ mod tests {
         assert!(json.contains("\"mem_total_gb\":32.0"));
         assert!(json.contains("\"show_graphs\":true"));
         assert!(json.contains("\"critical_alert\":true"));
+        assert!(json.contains("\"sensor_error\":null"));
+        assert!(json.contains("\"pins_age\":null"));
         assert!(json.contains("\"poll_ms\":1000"));
         assert!(json.contains("\"limits\":[9.2,10.0]"));
         // Top process entry, with the process name JSON-escaped.
@@ -1030,6 +1086,43 @@ mod tests {
         assert_eq!(d.temp_range_max, Some(108.0));
         assert_eq!(d.mem_range_max, Some(32.0));
         assert_eq!(d.sample.limit_w, Some(575));
+    }
+
+    #[test]
+    fn record_without_pins_leaves_a_gap_not_zeros() {
+        let mut d = WebData::new();
+        let good = Sample {
+            pins: vec![
+                PinReading {
+                    voltage: 12.0,
+                    current: 5.0,
+                };
+                NUM_PINS
+            ],
+            ..Default::default()
+        };
+        d.record(good);
+        let first_at = d.pins_at.expect("valid readings are timestamped");
+        // A sensor fault: no pin readings, no NVML power either.
+        d.sensor_error = Some("I2C read failed: boom".to_owned());
+        d.record(Sample::default());
+        // No zero currents and no 0 W estimate enter the histories, and the
+        // last-good timestamp stays where it was (so the UIs can go stale).
+        assert_eq!(d.history[0].len(), 1);
+        assert_eq!(d.power_history.len(), 1);
+        assert_eq!(d.pins_at, Some(first_at));
+        let json = web_json(&d, 60.0);
+        assert!(json.contains("\"sensor_error\":\"I2C read failed: boom\""));
+        assert!(json.contains("\"pins\":[]"));
+        assert!(json.contains("\"pins_age\":"));
+        assert!(!json.contains("\"pins_age\":null"));
+    }
+
+    #[test]
+    fn stale_threshold_follows_the_interval() {
+        assert_eq!(stale_after_secs(100), 3.0);
+        assert_eq!(stale_after_secs(1000), 3.0);
+        assert_eq!(stale_after_secs(5000), 15.0);
     }
 
     #[test]

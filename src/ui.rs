@@ -15,7 +15,7 @@ use std::time::Duration;
 use crate::alerts::{AutoMinPower, EmbeddedSound, Settings, Sound, MAX_LIMIT_A, MIN_LIMIT_A};
 use crate::hardware::{AuthState, Cmd, DEFAULT_POLL_MS};
 use crate::persist;
-use crate::web::{WebData, WebServer, WebState, DEFAULT_WEB_PORT};
+use crate::web::{stale_after_secs, WebData, WebServer, WebState, DEFAULT_WEB_PORT};
 
 pub(crate) const HORIZONS_MIN: [u32; 6] = [1, 5, 10, 15, 30, 60];
 
@@ -42,6 +42,37 @@ fn current_color(current: f64, s: &Settings) -> egui::Color32 {
         egui::Color32::from_rgb(240, 210, 40)
     } else {
         egui::Color32::from_rgb(240, 60, 60)
+    }
+}
+
+/// The sensor warning to show, if the pin currents are not being monitored
+/// right now: the poller's sensor fault (no chip, no access, read failures),
+/// or readings older than [`stale_after_secs`] — judged here on the GUI
+/// thread, so a hung or dead poller is caught as well. `now` is seconds since
+/// `WebData::start`.
+fn sensor_warning(
+    sensor_error: Option<&str>,
+    pins_at: Option<f64>,
+    now: f64,
+    poll_ms: u64,
+) -> Option<String> {
+    if let Some(e) = sensor_error {
+        return Some(format!(
+            "\u{26a0} SENSOR UNAVAILABLE: {e} \u{2014} pin currents are NOT monitored!"
+        ));
+    }
+    let stale_after = stale_after_secs(poll_ms);
+    match pins_at {
+        // Nothing yet: give the first poll the same allowance.
+        None if now > stale_after => {
+            Some("\u{26a0} No pin readings yet \u{2014} pin currents are NOT monitored!".to_owned())
+        }
+        Some(t) if now - t > stale_after => Some(format!(
+            "\u{26a0} Pin readings are stale (last update {:.0} s ago) \u{2014} monitoring may \
+             have stopped!",
+            now - t
+        )),
+        _ => None,
     }
 }
 
@@ -422,6 +453,7 @@ impl eframe::App for App {
             // fall back to the sum of pin V*A
             let power_text = match data.sample.power_w {
                 Some(w) => format!("Total power: {:.1} W", w),
+                None if data.sample.pins.is_empty() => "Total power: \u{2014}".to_owned(),
                 None => {
                     let est: f64 = data.sample.pins.iter().map(|p| p.voltage * p.current).sum();
                     format!("Total power: {:.1} W (estimated)", est)
@@ -456,6 +488,22 @@ impl eframe::App for App {
                     }
                 }
             });
+
+            // Sensor fault or stale readings: the limits are not being
+            // checked, which must never look like a quiet, green card.
+            if let Some(warning) = sensor_warning(
+                data.sensor_error.as_deref(),
+                data.pins_at,
+                now,
+                self.config.poll_ms,
+            ) {
+                ui.label(
+                    egui::RichText::new(warning)
+                        .strong()
+                        .color(egui::Color32::from_rgb(240, 160, 40))
+                        .size(15.0),
+                );
+            }
 
             // GPU temperature and VRAM (NVML)
             let mut gpu_texts: Vec<String> = Vec::new();
@@ -1542,7 +1590,24 @@ fn add_metric_graph(
 
 #[cfg(test)]
 mod tests {
-    use super::{pin_text, ABOUT_TEXT};
+    use super::{pin_text, sensor_warning, ABOUT_TEXT};
+
+    #[test]
+    fn sensor_warning_covers_faults_and_staleness() {
+        // Fresh readings: no warning.
+        assert_eq!(sensor_warning(None, Some(99.0), 100.0, 1000), None);
+        // A reported fault always wins, with its reason.
+        let w = sensor_warning(Some("Cannot open /dev/i2c-15"), Some(99.0), 100.0, 1000).unwrap();
+        assert!(w.contains("SENSOR UNAVAILABLE") && w.contains("/dev/i2c-15"));
+        // Older than the stale threshold (3 s at 1 s polling): stale.
+        let w = sensor_warning(None, Some(90.0), 100.0, 1000).unwrap();
+        assert!(w.contains("stale") && w.contains("10 s ago"));
+        // Slow polling stretches the threshold (3 x 5 s).
+        assert_eq!(sensor_warning(None, Some(90.0), 100.0, 5000), None);
+        // No reading ever: fine right after start, a warning after that.
+        assert_eq!(sensor_warning(None, None, 1.0, 1000), None);
+        assert!(sensor_warning(None, None, 10.0, 1000).is_some());
+    }
 
     #[test]
     fn pin_text_shows_values_and_dashes() {

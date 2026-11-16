@@ -32,10 +32,18 @@ sh licenses.sh                  # regenerate the embedded license text
 
 - Without an argument the I2C bus is auto-detected (scans
   `/sys/bus/i2c/devices/*/name` for `"NVIDIA i2c adapter 1 at <PCI>"`, then
-  probes candidates for a sane 10–14 V reading); falls back to bus 0.
+  probes candidates for a sane 10–14 V reading). No fallback bus: without
+  one the sensor is reported unavailable (guessing would read garbage).
 - Reading the chip needs permission on `/dev/i2c-N` (root or `i2c` group).
-  Everything degrades gracefully: no I2C → zero pin readings; no NVML →
-  power estimated as Σ(V·A) of the pins.
+  Everything degrades gracefully but visibly: no I2C / failed reads → a
+  sample with **empty** `pins` (never zeros, which would look green) plus
+  `WebData::sensor_error`, a "SENSOR UNAVAILABLE" banner in both UIs, and
+  the alert/kill/auto-power state machines skipped for that poll;
+  `alerts::sensor_fault_sound` plays an enabled alert sound once after
+  `SENSOR_FAULT_GRACE` (3 s). Both UIs also flag readings older than
+  `web::stale_after_secs` (3 intervals, ≥ 3 s) from `WebData::pins_at`, which
+  catches a hung or dead poller. No NVML → power estimated as Σ(V·A) of the
+  pins.
 - The shipped alert WAVs are **embedded into the executable** with
   `include_bytes!` (see `alerts::EmbeddedSound`): `attention.wav` /
   `critical.wav` (yellow/red alerts), their `-powering-down.wav` variants,

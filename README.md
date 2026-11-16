@@ -70,12 +70,16 @@ app's own arguments.)
 
 - Without an argument the I2C bus is auto-detected (it scans
   `/sys/bus/i2c/devices/*/name` for the NVIDIA adapter and probes candidates
-  for a sane 10–14 V reading); it falls back to bus 0.
+  for a sane 10–14 V reading). There is no fallback bus: if nothing is
+  found, pin monitoring is off and the app says so.
 - Reading the chip needs permission on `/dev/i2c-N` (run as root, or add
   your user to the `i2c` group).
-- Everything degrades gracefully: with no I2C access you get zero pin
-  readings, and with no NVML the total power is estimated as Σ(V·A) of the
-  pins.
+- Everything degrades gracefully, but never silently: without I2C access
+  (or when reads fail) both UIs show a "SENSOR UNAVAILABLE" banner with the
+  reason instead of pin values, readings older than three sample intervals
+  are flagged as stale, and an enabled alert sound plays once when the
+  sensor stays unreadable for 3 s. With no NVML the total power is estimated
+  as Σ(V·A) of the pins.
 
 ## License
 
