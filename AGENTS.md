@@ -192,7 +192,11 @@ critical sections are short — keep them that way:
    `Settings::kill_other_users_processes` it goes through the power helper
    (`KILL <pid>`), so the outcome arrives on the next poll and the
    excursion's alert sound is held back until a termination (which plays
-   the critical-terminating sound) or a failure (which plays it) is known.
+   the critical-terminating sound) or a failure (which plays it) is known —
+   but never longer than `alerts::KILL_SOUND_HOLD` (2 s; e.g. a password
+   prompt is open), and a reply missing for `KILL_REPLY_TIMEOUT` (30 s)
+   counts as a failed kill so the safeguard can fire again
+   (`alerts::kill_reply_wait`).
    The outcome lands in `WebData::kill_note`, GUI-only → play: a successful
    termination sends the critical-terminating sound via
    `SoundPlayer::play_priority` (replacing that excursion's red alert);

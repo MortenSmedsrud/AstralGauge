@@ -19,12 +19,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::alerts::{
-    auto_power_action, critical_alert_edge, kill_guard_action, over_limit_sound,
+    auto_power_action, critical_alert_edge, kill_guard_action, kill_reply_wait, over_limit_sound,
     sensor_fault_sound, AlertState, AutoPowerState, CriticalAlertState, KillGuardState,
-    SensorFaultState, Sound, SoundPlayer,
+    KillReplyWait, SensorFaultState, Sound, SoundPlayer,
 };
 use crate::web::WebData;
 
@@ -453,11 +453,13 @@ pub(crate) fn spawn_poller(
         let mut power_helper = PowerHelper::new();
         let mut auto_power = AutoPowerState::default();
         let mut kill_guard = KillGuardState::default();
-        // A cross-user kill dispatched through the helper, awaiting its
-        // reply (resolved on the next poll); and the alert sound the current
-        // excursion earned, held back until that reply is known (a
-        // termination replaces it with the critical-terminating sound).
-        let mut pending_kill: Option<GpuProcess> = None;
+        // A cross-user kill dispatched through the helper (with when it was
+        // sent), awaiting its reply (usually resolved on the next poll); and
+        // the alert sound the current excursion earned, held back for at most
+        // `KILL_SOUND_HOLD` while that reply is outstanding (a termination
+        // replaces it with the critical-terminating sound). A reply missing
+        // for `KILL_REPLY_TIMEOUT` counts as a failed kill.
+        let mut pending_kill: Option<(GpuProcess, Instant)> = None;
         let mut held_sound: Option<Sound> = None;
         let mut critical_state = CriticalAlertState::default();
 
@@ -638,7 +640,7 @@ pub(crate) fn spawn_poller(
             // The outcome goes to stderr and (freshly) into the desktop UI.
             let mut terminated = false;
             let mut kill_note: Option<String> = None;
-            if let Some(p) = pending_kill.take() {
+            if let Some((p, sent)) = pending_kill.take() {
                 // A cross-user kill was dispatched on an earlier poll:
                 // resolve it before anything else kill-related.
                 match power_helper.take_kill_outcome() {
@@ -665,9 +667,9 @@ pub(crate) fn spawn_poller(
                         });
                     }
                     Some(_) => {
-                        // Stray reply for an already-resolved kill: drop it
-                        // and keep waiting for the pending one's.
-                        pending_kill = Some(p);
+                        // Stray reply for an already-resolved (or given-up)
+                        // kill: drop it and keep waiting for the pending one's.
+                        pending_kill = Some((p, sent));
                     }
                     None if power_helper.auth_state() == AuthState::Failed => {
                         // The helper is gone and no reply will come.
@@ -680,7 +682,22 @@ pub(crate) fn spawn_poller(
                             p.name, p.pid
                         ));
                     }
-                    None => pending_kill = Some(p), // reply still missing
+                    None if kill_reply_wait(sent.elapsed()) == KillReplyWait::GiveUp => {
+                        // The helper took the command but never answered
+                        // (hung, or a password prompt left open): stop
+                        // waiting so the safeguard can fire again.
+                        eprintln!(
+                            "Critical-alert safeguard: cannot kill {} (pid {}): no reply from the privileged helper.",
+                            p.name, p.pid
+                        );
+                        kill_note = Some(format!(
+                            "Critical-alert safeguard: could not kill {} (pid {}): no reply from the privileged helper within {} s.",
+                            p.name,
+                            p.pid,
+                            crate::alerts::KILL_REPLY_TIMEOUT.as_secs()
+                        ));
+                    }
+                    None => pending_kill = Some((p, sent)), // reply still missing
                 }
             } else if max_current.is_some_and(|current| {
                 kill_guard_action(
@@ -694,9 +711,12 @@ pub(crate) fn spawn_poller(
                 match top_process {
                     Some(p) => {
                         if settings.kill_other_users_processes {
+                            // Drop a late reply to an earlier, given-up kill
+                            // so it cannot pass for this one's outcome.
+                            let _ = power_helper.take_kill_outcome();
                             if power_helper.kill(p.pid) {
                                 // Outcome + sound follow the helper's reply.
-                                pending_kill = Some(p);
+                                pending_kill = Some((p, Instant::now()));
                             } else {
                                 eprintln!(
                                     "Critical-alert safeguard: cannot kill {} (pid {}): privileged helper not running.",
@@ -747,17 +767,20 @@ pub(crate) fn spawn_poller(
             // nothing interrupts it once playing); a failed kill leaves the
             // regular red alert sound, which is what this excursion earned.
             // While a cross-user kill awaits its reply the alert sound is
-            // held back: a termination replaces it, a failure plays it now.
+            // held back, for at most KILL_SOUND_HOLD: a termination within it
+            // replaces the sound; a failure, or a reply that takes longer
+            // (password prompt open, hung helper), plays it.
+            let holding = pending_kill.as_ref().is_some_and(|(_, sent)| {
+                kill_reply_wait(sent.elapsed()) == KillReplyWait::HoldSound
+            });
             if terminated {
                 player.play_priority(settings.terminating_sound.clone());
                 held_sound = None;
-            } else if pending_kill.is_some() {
+            } else if holding {
                 if let Some(sound) = alert_sound {
                     held_sound = Some(sound);
                 }
-            } else if let Some(sound) = held_sound.take() {
-                player.play(sound);
-            } else if let Some(sound) = alert_sound {
+            } else if let Some(sound) = held_sound.take().or(alert_sound) {
                 player.play(sound);
             }
 

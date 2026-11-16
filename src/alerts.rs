@@ -40,6 +40,43 @@ pub(crate) const AUTO_POWER_RESTORE_DELAY: Duration = Duration::from_secs(30);
 /// critical-terminating sound of the previous kill.
 pub(crate) const KILL_REPEAT_COOLDOWN: Duration = Duration::from_secs(5);
 
+/// How long the alert sound of a red excursion is held back while a
+/// cross-user kill (sent through the privileged helper) awaits its reply: a
+/// termination within it replaces the alert with the critical-terminating
+/// sound. Past it the alert plays anyway — the helper may be stuck behind an
+/// open password prompt or hung, and a red current must never stay silent.
+pub(crate) const KILL_SOUND_HOLD: Duration = Duration::from_secs(2);
+
+/// How long a cross-user kill waits for the helper's reply before it is
+/// given up (reported as failed), so a hung helper cannot block the
+/// safeguard's further kills forever. A late reply is discarded when the
+/// next kill is sent.
+pub(crate) const KILL_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// What to do about a cross-user kill still awaiting the helper's reply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum KillReplyWait {
+    /// Keep waiting, and keep the excursion's alert sound held back.
+    HoldSound,
+    /// Keep waiting for the outcome, but play alert sounds normally again.
+    PlaySound,
+    /// Stop waiting: report the kill as failed and re-enable the safeguard.
+    GiveUp,
+}
+
+/// Decide, from how long the reply has been outstanding, how a pending
+/// cross-user kill is treated (see [`KILL_SOUND_HOLD`],
+/// [`KILL_REPLY_TIMEOUT`]).
+pub(crate) fn kill_reply_wait(waited: Duration) -> KillReplyWait {
+    if waited >= KILL_REPLY_TIMEOUT {
+        KillReplyWait::GiveUp
+    } else if waited >= KILL_SOUND_HOLD {
+        KillReplyWait::PlaySound
+    } else {
+        KillReplyWait::HoldSound
+    }
+}
+
 /// How long the pin readings must stay unavailable (I2C read failures, no
 /// chip found) before the sensor fault plays its alert sound: a single
 /// failed transfer is retried on the next poll without a sound.
@@ -858,6 +895,25 @@ mod tests {
         state.last_kill = Some(Instant::now() - KILL_REPEAT_COOLDOWN);
         s.kill_top_process_on_red = false;
         assert!(!kill_guard_action(&mut state, red, &s, false));
+    }
+
+    #[test]
+    fn pending_kill_never_mutes_the_alert_for_long() {
+        let ms = Duration::from_millis;
+        assert_eq!(kill_reply_wait(ms(0)), KillReplyWait::HoldSound);
+        assert_eq!(
+            kill_reply_wait(KILL_SOUND_HOLD - ms(1)),
+            KillReplyWait::HoldSound
+        );
+        // A slow reply (password prompt open, hung helper): sounds resume.
+        assert_eq!(kill_reply_wait(KILL_SOUND_HOLD), KillReplyWait::PlaySound);
+        assert_eq!(
+            kill_reply_wait(KILL_REPLY_TIMEOUT - ms(1)),
+            KillReplyWait::PlaySound
+        );
+        // No reply at all: give up so the safeguard can act again.
+        assert_eq!(kill_reply_wait(KILL_REPLY_TIMEOUT), KillReplyWait::GiveUp);
+        assert!(KILL_SOUND_HOLD < KILL_REPLY_TIMEOUT);
     }
 
     #[test]
