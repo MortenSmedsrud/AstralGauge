@@ -1505,7 +1505,8 @@ Apply the reset with Accept, discard it with Cancel."
                             ui.label(
                                 egui::RichText::new(
                                     "As a last resort, the first process of the \"Top GPU processes\" list \
-        (ranked by utilization, then VRAM usage) is killed with SIGKILL the moment a pin current \
+        (ranked by utilization averaged over 5 seconds, then VRAM usage; display servers and \
+        compositors such as kwin_wayland come after every other process) is killed with SIGKILL the moment a pin current \
         reaches the red limit. While the current stays red it keeps going: every 5 seconds the \
         process then at the top of the list is killed too, until the current drops below red. Any \
         process can be a target, including your desktop compositor or display server; only the app \

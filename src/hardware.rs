@@ -1058,25 +1058,105 @@ fn parse_kill_line(line: &str) -> KillOutcome {
     }
 }
 
-/// Rank GPU processes for the display list and the kill safeguard: highest
-/// SM utilization first, ties broken by VRAM usage, then by pid (stable
+/// Display servers and Wayland compositors, by `/proc/<pid>/comm` (at most
+/// 15 characters). They present every other process's frames, and the
+/// driver charges part of that work to them: with a game running, its SM
+/// utilization keeps flipping between the game and the compositor sample
+/// by sample, so the compositor would often look like the top GPU user.
+/// They rank after every other process (see [`rank_named`]).
+const COMPOSITORS: &[&str] = &[
+    "kwin_wayland",
+    "kwin_x11",
+    "Xwayland",
+    "Xorg",
+    "X",
+    "gnome-shell",
+    "mutter",
+    "sway",
+    "Hyprland",
+    "weston",
+    "labwc",
+    "niri",
+    "wayfire",
+    "river",
+    "cosmic-comp",
+];
+
+fn is_compositor(name: &str) -> bool {
+    COMPOSITORS.contains(&name)
+}
+
+/// Rank GPU processes for the display list and the kill safeguard (see
+/// [`rank_named`]), resolving their names first.
+fn rank_processes(mut procs: Vec<GpuProcess>, top: usize) -> Vec<GpuProcess> {
+    for p in &mut procs {
+        p.name = process_name(p.pid);
+    }
+    rank_named(procs, top)
+}
+
+/// Rank named GPU processes: display servers and compositors (see
+/// [`COMPOSITORS`]) after all others — still listed, and still the
+/// safeguard's target once nothing else uses the GPU — then highest SM
+/// utilization first, ties broken by VRAM usage, then by pid (stable
 /// order). Drops pid 0 (NVML placeholders) and the app's own pid: an eframe
 /// window holds a small GPU context and must never be the safeguard's victim.
-fn rank_processes(mut procs: Vec<GpuProcess>, top: usize) -> Vec<GpuProcess> {
+fn rank_named(mut procs: Vec<GpuProcess>, top: usize) -> Vec<GpuProcess> {
     let own = std::process::id();
     procs.retain(|p| p.pid != 0 && p.pid != own);
     procs.sort_by(|a, b| {
-        b.util_percent
-            .cmp(&a.util_percent)
+        is_compositor(&a.name)
+            .cmp(&is_compositor(&b.name))
+            .then(b.util_percent.cmp(&a.util_percent))
             .then(b.mem_bytes.cmp(&a.mem_bytes))
             .then(a.pid.cmp(&b.pid))
     });
     procs.truncate(top);
-    // Resolve names only for what is displayed.
-    for p in &mut procs {
-        p.name = process_name(p.pid);
-    }
     procs
+}
+
+/// How long per-process utilization samples count (see [`UtilWindow`]).
+const UTIL_WINDOW: Duration = Duration::from_secs(5);
+
+/// Per-process SM utilization averaged over the driver samples of the last
+/// [`UTIL_WINDOW`]. The driver samples every process at the same instants
+/// but reports a process only when it was busy at that instant, and
+/// attributes the work coarsely, so single samples swing between processes
+/// and are often missing: the newest sample alone made the ranking (and so
+/// the safeguard's target) flip from poll to poll. A process without a
+/// sample at an instant counts as 0 % there.
+#[derive(Default)]
+pub(crate) struct UtilWindow {
+    /// (arrival, driver timestamp, pid, SM utilization %).
+    samples: std::collections::VecDeque<(Instant, u64, u32, u32)>,
+}
+
+impl UtilWindow {
+    /// Add the samples that arrived now and return each sampled process's
+    /// average over the window.
+    fn update(
+        &mut self,
+        now: Instant,
+        fresh: impl IntoIterator<Item = (u64, u32, u32)>,
+    ) -> HashMap<u32, u32> {
+        self.samples.extend(
+            fresh
+                .into_iter()
+                .map(|(ts, pid, util)| (now, ts, pid, util)),
+        );
+        self.samples
+            .retain(|(arrived, ..)| now.saturating_duration_since(*arrived) <= UTIL_WINDOW);
+        let instants: std::collections::HashSet<u64> =
+            self.samples.iter().map(|(_, ts, ..)| *ts).collect();
+        let n = instants.len().max(1) as u64;
+        let mut sums: HashMap<u32, u64> = HashMap::new();
+        for (_, _, pid, util) in &self.samples {
+            *sums.entry(*pid).or_default() += u64::from(*util);
+        }
+        sums.into_iter()
+            .map(|(pid, sum)| (pid, ((sum + n / 2) / n).min(100) as u32))
+            .collect()
+    }
 }
 
 /// Human-readable process name: `/proc/<pid>/comm` (the executable's name),
@@ -1349,6 +1429,8 @@ mod nvml {
         /// Newest utilization sample timestamp consumed by
         /// [`Nvml::process_utilization`], so each poll reads only new samples.
         last_util_ts: AtomicU64,
+        /// The recent samples the utilization is averaged over.
+        util_window: Mutex<UtilWindow>,
     }
 
     // The dlopen handle is shared between threads; NVML is thread-safe.
@@ -1462,6 +1544,7 @@ mod nvml {
                 get_graphics_procs,
                 get_process_util,
                 last_util_ts: AtomicU64::new(0),
+                util_window: Mutex::new(UtilWindow::default()),
             })
         }
 
@@ -1623,46 +1706,46 @@ mod nvml {
                 .collect()
         }
 
-        /// Newest SM utilization percent per process. `lastSeenTimeStamp = 0`
-        /// means "since the last call" on current drivers, but a timestamp
-        /// cursor is kept anyway so each poll consumes each recorded sample
-        /// exactly once regardless of how the driver interprets 0.
+        /// SM utilization percent per process, averaged over the recent
+        /// samples (see [`UtilWindow`]). `lastSeenTimeStamp = 0` means
+        /// "since the last call" on current drivers, but a timestamp cursor
+        /// is kept anyway so each poll consumes each recorded sample exactly
+        /// once regardless of how the driver interprets 0.
         fn process_utilization(&self) -> HashMap<u32, u32> {
-            let get = match self.get_process_util {
-                Some(f) => f,
-                None => return HashMap::new(),
+            let fresh = self.new_utilization_samples();
+            self.util_window
+                .lock()
+                .unwrap()
+                .update(Instant::now(), fresh)
+        }
+
+        /// The utilization samples recorded since the last call, as
+        /// (timestamp, pid, SM %); empty when there are none or on errors.
+        fn new_utilization_samples(&self) -> Vec<(u64, u32, u32)> {
+            let Some(get) = self.get_process_util else {
+                return Vec::new();
             };
             let cursor = self.last_util_ts.load(Ordering::Relaxed);
             let mut count: u32 = 0;
             let rc = unsafe { (get)(self.device, ptr::null_mut(), &mut count, cursor) };
             if rc == NVML_SUCCESS || rc != NVML_ERROR_INSUFFICIENT_SIZE {
-                return HashMap::new();
+                return Vec::new();
             }
             let cap = count.saturating_mul(2).saturating_add(5).clamp(1, 4096);
             let mut buf = vec![NvmlProcessUtilizationSample::default(); cap as usize];
             let mut n = cap;
             if unsafe { (get)(self.device, buf.as_mut_ptr(), &mut n, cursor) } != NVML_SUCCESS {
-                return HashMap::new();
+                return Vec::new();
             }
-            let mut newest_ts = cursor;
-            let mut newest: HashMap<u32, (u64, u32)> = HashMap::new();
-            for s in buf.iter().take((n as usize).min(cap as usize)) {
-                newest_ts = newest_ts.max(s.time_stamp);
-                newest
-                    .entry(s.pid)
-                    .and_modify(|(ts, u)| {
-                        if s.time_stamp >= *ts {
-                            *ts = s.time_stamp;
-                            *u = s.sm_util;
-                        }
-                    })
-                    .or_insert((s.time_stamp, s.sm_util));
-            }
-            self.last_util_ts.store(newest_ts, Ordering::Relaxed);
-            newest
-                .into_iter()
-                .map(|(pid, (_ts, util))| (pid, util))
-                .collect()
+            let samples: Vec<(u64, u32, u32)> = buf
+                .iter()
+                .take((n as usize).min(cap as usize))
+                .filter(|s| s.time_stamp > cursor)
+                .map(|s| (s.time_stamp, s.pid, s.sm_util.min(100)))
+                .collect();
+            let newest = samples.iter().map(|s| s.0).max().unwrap_or(cursor);
+            self.last_util_ts.store(newest, Ordering::Relaxed);
+            samples
         }
     }
 
@@ -1702,6 +1785,44 @@ mod tests {
         let top = rank_processes(procs, 3);
         let pids: Vec<u32> = top.iter().map(|p| p.pid).collect();
         assert_eq!(pids, vec![12, 13, 11]);
+    }
+
+    #[test]
+    fn compositors_rank_after_other_processes() {
+        // The driver charges presenting the game's frames to the
+        // compositor; it must not become the safeguard's target while the
+        // game still runs, but stays listed (and last in line).
+        let named = |pid, name: &str, util, mem| GpuProcess {
+            name: name.to_owned(),
+            ..proc(pid, util, mem)
+        };
+        let procs = vec![
+            named(20, "kwin_wayland", 34, 100),
+            named(21, "Diablo IV.exe", 8, 13_000),
+            named(22, "Xwayland", 50, 10),
+            named(23, "vivaldi-bin", 0, 900),
+        ];
+        let pids: Vec<u32> = rank_named(procs, 4).iter().map(|p| p.pid).collect();
+        assert_eq!(pids, vec![21, 23, 22, 20]);
+        // With nothing else left, the compositor is the target.
+        let only = rank_named(vec![named(20, "kwin_wayland", 34, 100)], 3);
+        assert_eq!(only[0].pid, 20);
+    }
+
+    #[test]
+    fn utilization_is_averaged_over_recent_samples() {
+        let mut w = UtilWindow::default();
+        let t0 = Instant::now();
+        // Samples flip between two processes; a missing one counts as 0.
+        let u = w.update(t0, [(1, 20, 34), (2, 21, 30), (3, 21, 25), (3, 20, 4)]);
+        assert_eq!(u[&20], 13); // (34 + 0 + 4) / 3
+        assert_eq!(u[&21], 18); // (0 + 30 + 25) / 3
+                                // A poll without new samples keeps the window's average...
+        assert_eq!(w.update(t0 + Duration::from_secs(1), []), u);
+        // ...until the samples expire.
+        assert!(w
+            .update(t0 + UTIL_WINDOW + Duration::from_secs(1), [])
+            .is_empty());
     }
 
     #[test]

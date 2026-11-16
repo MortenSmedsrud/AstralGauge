@@ -92,7 +92,9 @@ src/hardware.rs  HARDWARE POLLING. IT8915 constants + raw i2c-dev/SMBus
                  process list (compute + graphics per-process VRAM, and
                  per-process SM utilization from `nvmlDeviceGetProcessUtilization`;
                  names come from `/proc/<pid>/comm`) and `rank_processes`
-                 (utilization, then VRAM, then pid; own and pid 0 excluded).
+                 (compositors/display servers last, then utilization
+                 averaged over 5 s by `UtilWindow`, then VRAM, then pid;
+                 own and pid 0 excluded).
                  Also the privileged power helper: `PowerHelper` (spawns
                  this same binary as root through pkexec; `KILL <pid>` is
                  the safeguard's cross-user kill) and
@@ -370,7 +372,12 @@ critical sections are short — keep them that way:
 ## Top GPU processes & critical-alert kill safeguard
 
 Every sample carries NVML's `top 3 GPU-using processes` (`TOP_PROCESSES`),
-ranked by SM utilization, then VRAM usage, then pid; the app's own pid and
+ranked with display servers / compositors (`COMPOSITORS`: kwin_wayland,
+Xwayland, gnome-shell, ...) after every other process, then by SM
+utilization averaged over the last 5 s (`UtilWindow`: all driver samples of
+the window, a missing sample counting as 0 — single samples flip between the
+game and the compositor, which the driver charges for presenting the game's
+frames), then VRAM usage, then pid; the app's own pid and
 pid 0 are never listed (the eframe window itself holds a small GPU
 context). Shown in the main window and the web page.
 
@@ -510,7 +517,7 @@ Optional (`Settings::auto_min_power` = Off / On yellow / On red):
 
 ## Tests
 
-`cargo test` (40 tests, no GPU/display needed):
+`cargo test` (42 tests, no GPU/display needed):
 
 - `alerts::tests`: settings defaults; embedded WAVs decode; alert edge
   triggering; 15 s repeat-while-exceeded behavior; powering-down sound
@@ -521,7 +528,8 @@ Optional (`Settings::auto_min_power` = Off / On yellow / On red):
   the grace period, re-armed by recovery); the pending-kill sound hold and
   reply timeout.
 - `hardware::tests`: process ranking (utilization/memory/pid order,
-  truncation, own + zero pid exclusion), `/proc` name fallback, the
+  compositors last, truncation, own + zero pid exclusion), the 5 s
+  utilization averaging, `/proc` name fallback, the
   privileged helper's `KILL` reply parsing, the pin-reading plausibility
   check, and the single-process pid guard in front of `kill()` (tested on
   the pure conversion — never call `kill_process` with a bad pid in a test).
