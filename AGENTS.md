@@ -15,7 +15,9 @@ rails of an **ASUS RTX 5090 ROG Astral** GPU:
 - Per-pin **current limits** (yellow/red ranges) drive the green/yellow/red
   color coding everywhere and optional **alert sounds** (rodio).
 - A built-in **web server** mirrors the whole UI (page + JSON API) for other
-  devices; graphs support hover readouts everywhere.
+  devices; graphs support hover readouts everywhere. Its listen address is
+  a setting (`web_bind`: `0.0.0.0` = every network, the default;
+  `127.0.0.1` = this computer only; or one of the machine's addresses).
 - Optionally it runs as a **background service** (systemd user unit,
   installed from the settings dialog); the desktop app then shows the
   service's data instead of reading the hardware itself.
@@ -330,7 +332,9 @@ critical sections are short — keep them that way:
   (web JSON `service`, the page's "Service" chip), the regular poller and
   sound player, settings from `persist` re-read whenever the file's mtime
   changes (every second; persist writes atomically): limits/sounds,
-  interval, web server (busy port retried every `WEB_RETRY`), and newly
+  interval, web server (busy port or a listen address that is not up yet
+  retried every `WEB_RETRY`; the address/port it serves on is published as
+  `ServiceLink::web_bind`/`web_port`, link lines `web_bind`/`web_port`), and newly
   enabled privileged options authenticate the helper at once. The service
   never rolls settings back itself (a denied prompt at login just means the
   next privileged action asks again); the desktop app's pending-auth logic
@@ -542,7 +546,7 @@ Optional (`Settings::auto_min_power` = Off / On yellow / On red):
 
 ## Tests
 
-`cargo test` (43 tests, no GPU/display needed):
+`cargo test` (44 tests, no GPU/display needed):
 
 - `alerts::tests`: settings defaults; embedded WAVs decode; alert edge
   triggering; 15 s repeat-while-exceeded behavior; powering-down sound
@@ -577,7 +581,8 @@ Optional (`Settings::auto_min_power` = Off / On yellow / On red):
   the latching `critical_alert` flag, `safeguard`, `service`, `sensor_error`, `pins_age`),
   `record()` history append/prune/range caching and gaps (no zeros) for
   samples without pins, M4 graph downsampling (spikes kept, complete
-  buckets unchanged while the window slides), the stale threshold, query-param parsing, HTTP server serve/404/busy-port/restart and
+  buckets unchanged while the window slides), the stale threshold, query-param parsing, the listen-address parsing and
+  local URL (plus a loopback-only server), HTTP server serve/404/busy-port/restart and
   the `POST /ack` dismissal.
 
 Tests that bind ports use `free_port()` (bind :0, drop, reuse).
@@ -598,6 +603,15 @@ Tests that bind ports use `free_port()` (bind :0, drop, reuse).
   poll, first at 50) — don't remove it; it's the canary for I2C bus
   contention.
 - Web `/data` `window` param is clamped to 60..=3600 s server-side.
+- The web server listens on `web::web_target(web_bind, web_port)`; the
+  settings dialog offers `0.0.0.0`, `127.0.0.1`, the machine's own
+  addresses (`web::interface_addresses`: getifaddrs, up + running, no
+  loopback or IPv6 link-local) and a free-form IP. Links opened from this
+  computer go through `web::local_url` (`localhost` for an unspecified
+  address). Moving the server on Accept stops the old one first (same
+  port, new address) and restarts it there if the new address fails. The
+  page has no authentication: `0.0.0.0` exposes the readings and `POST
+  /ack` to the whole network.
 - eframe 0.36 / egui 0.36 API. `eframe::App`'s entry point is
   `fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame)` — the app
   receives a margin-less root `Ui` (panels are built on it; in 0.36

@@ -8,7 +8,7 @@
 
 use std::io;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -19,6 +19,81 @@ use crate::hardware::{AuthState, Sample, DEFAULT_POLL_MS, NUM_PINS};
 
 /// Default port for the web interface (editable in the UI).
 pub(crate) const DEFAULT_WEB_PORT: u16 = 8666;
+/// Default listen address: every IPv4 interface, so other devices on the
+/// local network can open the page (editable in the UI, e.g. `127.0.0.1`
+/// for this computer only).
+pub(crate) const DEFAULT_WEB_BIND: &str = "0.0.0.0";
+
+/// The socket address to serve on, from the settings' listen-address and
+/// port fields; `Err` says what is wrong with them.
+pub(crate) fn web_target(bind: &str, port: &str) -> Result<SocketAddr, String> {
+    let bind = bind.trim();
+    let ip: IpAddr = bind.parse().map_err(|_| {
+        format!("\"{bind}\" is not an IP address (e.g. 0.0.0.0, 127.0.0.1 or 10.0.0.12)")
+    })?;
+    match port.trim().parse::<u16>() {
+        Ok(port) if port != 0 => Ok(SocketAddr::new(ip, port)),
+        _ => Err("the port must be a number between 1 and 65535".to_owned()),
+    }
+}
+
+/// The URL that opens a server listening on `addr` from this computer:
+/// `localhost` when it listens on every interface.
+pub(crate) fn local_url(addr: SocketAddr) -> String {
+    let host = match addr.ip() {
+        ip if ip.is_unspecified() => "localhost".to_owned(),
+        IpAddr::V6(v6) => format!("[{v6}]"),
+        ip => ip.to_string(),
+    };
+    format!("http://{host}:{}/", addr.port())
+}
+
+/// This computer's own network addresses (interfaces that are up with a
+/// link, without
+/// loopback and IPv6 link-local ones, which need a scope to bind), with
+/// their interface names: the choices for the listen address.
+pub(crate) fn interface_addresses() -> Vec<(String, IpAddr)> {
+    let mut out = Vec::new();
+    let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
+    if unsafe { libc::getifaddrs(&mut ifap) } != 0 {
+        return out;
+    }
+    let mut cur = ifap;
+    while !cur.is_null() {
+        // SAFETY: getifaddrs returned a valid list, freed below.
+        let ifa = unsafe { &*cur };
+        cur = ifa.ifa_next;
+        // Up and with a link (a cable plugged in, a bridge with members).
+        let running = (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_uint;
+        if ifa.ifa_addr.is_null() || ifa.ifa_flags & running != running {
+            continue;
+        }
+        let family = i32::from(unsafe { (*ifa.ifa_addr).sa_family });
+        let ip = match family {
+            libc::AF_INET => {
+                let sin = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in) };
+                IpAddr::V4(Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr)))
+            }
+            libc::AF_INET6 => {
+                let sin6 = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in6) };
+                IpAddr::V6(Ipv6Addr::from(sin6.sin6_addr.s6_addr))
+            }
+            _ => continue,
+        };
+        let link_local_v6 = matches!(ip, IpAddr::V6(v6) if v6.segments()[0] & 0xffc0 == 0xfe80);
+        if ip.is_loopback() || link_local_v6 {
+            continue;
+        }
+        let name = unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) }
+            .to_string_lossy()
+            .into_owned();
+        if !out.contains(&(name.clone(), ip)) {
+            out.push((name, ip));
+        }
+    }
+    unsafe { libc::freeifaddrs(ifap) };
+    out
+}
 
 /// Time buckets per series sent to a web client (see [`m4_downsample`]: at
 /// most 4 points each). About one per canvas pixel, so the browser can't
@@ -133,6 +208,8 @@ pub(crate) struct PowerDown {
 pub(crate) struct ServiceLink {
     /// Port of the service's web interface while it is serving.
     pub(crate) web_port: Option<u16>,
+    /// The address it listens on (`None` from an older service: all).
+    pub(crate) web_bind: Option<IpAddr>,
     /// Why the service's web interface is not serving although enabled
     /// (port busy, invalid port); it keeps retrying.
     pub(crate) web_error: Option<String>,
@@ -253,7 +330,8 @@ pub(crate) enum WebState {
 }
 
 pub(crate) struct WebServer {
-    pub(crate) port: u16,
+    /// Where it listens (address and port).
+    pub(crate) addr: SocketAddr,
     stop: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
 }
@@ -261,8 +339,8 @@ pub(crate) struct WebServer {
 impl WebServer {
     /// Bind the port synchronously so a busy port is reported to the UI
     /// before the checkbox is accepted, then spawn the serve thread.
-    pub(crate) fn start(port: u16, data: Arc<Mutex<WebData>>) -> io::Result<WebServer> {
-        let listener = TcpListener::bind(("0.0.0.0", port))?;
+    pub(crate) fn start(addr: SocketAddr, data: Arc<Mutex<WebData>>) -> io::Result<WebServer> {
+        let listener = TcpListener::bind(addr)?;
         listener.set_nonblocking(true)?;
         let local = listener.local_addr()?;
         let stop = Arc::new(AtomicBool::new(false));
@@ -270,7 +348,7 @@ impl WebServer {
         let handle = thread::spawn(move || web_serve(listener, data, thread_stop));
         println!("Web interface listening on http://{local}/");
         Ok(WebServer {
-            port,
+            addr: local,
             stop,
             handle: Some(handle),
         })
@@ -283,7 +361,7 @@ impl WebServer {
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
-        println!("Web interface stopped (port {})", self.port);
+        println!("Web interface stopped ({})", self.addr);
     }
 }
 
@@ -1556,16 +1634,42 @@ mod tests {
     }
 
     #[test]
+    fn listen_address_settings_parse_and_link() {
+        let v4 = web_target(" 10.0.0.12 ", "8666").unwrap();
+        assert_eq!(v4.to_string(), "10.0.0.12:8666");
+        assert_eq!(local_url(v4), "http://10.0.0.12:8666/");
+        assert_eq!(
+            local_url(web_target("0.0.0.0", "8666").unwrap()),
+            "http://localhost:8666/"
+        );
+        assert_eq!(
+            local_url(web_target("::1", "80").unwrap()),
+            "http://[::1]:80/"
+        );
+        assert!(web_target("", "8666").is_err());
+        assert!(web_target("my-pc", "8666").is_err());
+        assert!(web_target("0.0.0.0", "0").is_err());
+        // Loopback only: reachable here, not bound to other interfaces.
+        let port = free_port();
+        let local = web_target("127.0.0.1", &port.to_string()).unwrap();
+        let server = WebServer::start(local, test_data()).unwrap();
+        assert!(http_get(port, "/").starts_with("HTTP/1.1 200 OK"));
+        drop(server);
+    }
+
+    #[test]
     fn web_server_serves_and_rejects_busy_port() {
         let port = free_port();
         let data = test_data();
 
         // A port already taken must be reported as an error, not started.
         let blocker = TcpListener::bind(("127.0.0.1", port)).unwrap();
-        assert!(WebServer::start(port, data.clone()).is_err());
+        let all = web_target(DEFAULT_WEB_BIND, &port.to_string()).unwrap();
+        assert!(WebServer::start(all, data.clone()).is_err());
         drop(blocker);
 
-        let server = WebServer::start(port, data.clone()).unwrap();
+        let server = WebServer::start(all, data.clone()).unwrap();
+        assert_eq!(server.addr, all);
         let page = http_get(port, "/");
         assert!(page.starts_with("HTTP/1.1 200 OK"));
         assert!(page.contains("AstralGauge"));

@@ -42,7 +42,8 @@ use crate::hardware::{
 };
 use crate::persist;
 use crate::web::{
-    PowerDown, ServiceLink, WebData, WebServer, WebState, DEFAULT_WEB_PORT, HISTORY_SECS,
+    web_target, PowerDown, ServiceLink, WebData, WebServer, WebState, DEFAULT_WEB_BIND,
+    DEFAULT_WEB_PORT, HISTORY_SECS,
 };
 
 /// Command-line flag that runs this binary as the background service.
@@ -77,6 +78,7 @@ fn default_settings() -> persist::StoredSettings {
         poll_ms: DEFAULT_POLL_MS,
         web_enabled: false,
         web_port: DEFAULT_WEB_PORT.to_string(),
+        web_bind: DEFAULT_WEB_BIND.to_owned(),
     }
 }
 
@@ -459,35 +461,33 @@ fn supervise_settings(data: &Arc<Mutex<WebData>>, tx: &mpsc::Sender<Cmd>) -> ! {
         let settings = applied.as_ref().unwrap_or(&defaults);
 
         // The web server follows the saved settings; a busy port (the
-        // desktop app may still be letting go of it) is retried.
-        let port = settings
-            .web_port
-            .trim()
-            .parse::<u16>()
-            .ok()
-            .filter(|p| *p != 0);
-        match (settings.web_enabled, port) {
+        // desktop app may still be letting go of it) or a listen address
+        // that is not up yet (network still starting) is retried.
+        match (
+            settings.web_enabled,
+            web_target(&settings.web_bind, &settings.web_port),
+        ) {
             (false, _) => {
                 if matches!(web, WebState::Running(_)) {
                     web = WebState::Stopped;
                 }
                 web_error = None;
             }
-            (true, None) => {
+            (true, Err(e)) => {
                 web = WebState::Stopped;
-                web_error = Some(format!("invalid port \"{}\"", settings.web_port));
+                web_error = Some(e);
             }
-            (true, Some(port)) => {
-                let serving = matches!(&web, WebState::Running(s) if s.port == port);
+            (true, Ok(addr)) => {
+                let serving = matches!(&web, WebState::Running(s) if s.addr == addr);
                 if !serving && Instant::now() >= web_retry_at {
                     web = WebState::Stopped;
-                    match WebServer::start(port, data.clone()) {
+                    match WebServer::start(addr, data.clone()) {
                         Ok(server) => {
                             web = WebState::Running(server);
                             web_error = None;
                         }
                         Err(e) => {
-                            let msg = format!("port {port} is not available: {e}");
+                            let msg = format!("cannot listen on {addr}: {e}");
                             if web_error.as_ref() != Some(&msg) {
                                 eprintln!("Web interface: {msg} (retrying).");
                             }
@@ -499,9 +499,9 @@ fn supervise_settings(data: &Arc<Mutex<WebData>>, tx: &mpsc::Sender<Cmd>) -> ! {
             }
         }
         if let Some(link) = data.lock().unwrap().service_link.as_mut() {
-            link.web_port = match &web {
-                WebState::Running(server) => Some(server.port),
-                WebState::Stopped => None,
+            (link.web_port, link.web_bind) = match &web {
+                WebState::Running(server) => (Some(server.addr.port()), Some(server.addr.ip())),
+                WebState::Stopped => (None, None),
             };
             link.web_error = web_error.clone();
         }
@@ -590,6 +590,7 @@ struct SyncReply {
     kill_note: Option<(f64, String)>,
     sensor_error: Option<String>,
     web_port: Option<u16>,
+    web_bind: Option<std::net::IpAddr>,
     web_error: Option<String>,
     power_down: Option<PowerDown>,
     sample: Sample,
@@ -621,6 +622,7 @@ fn sync_reply(d: &WebData, since: Option<f64>) -> SyncReply {
         kill_note: d.kill_note.clone(),
         sensor_error: d.sensor_error.clone(),
         web_port: link.web_port,
+        web_bind: link.web_bind,
         web_error: link.web_error,
         power_down: d.power_down.clone(),
         sample: d.sample.clone(),
@@ -692,6 +694,9 @@ fn encode_sync(r: &SyncReply) -> String {
     }
     if let Some(port) = r.web_port {
         let _ = writeln!(o, "web_port {port}");
+    }
+    if let Some(bind) = r.web_bind {
+        let _ = writeln!(o, "web_bind {bind}");
     }
     if let Some(e) = &r.web_error {
         let _ = writeln!(o, "web_error {}", escape(e));
@@ -797,6 +802,7 @@ fn decode_sync(lines: &[String]) -> Result<SyncReply, String> {
             }
             "sensor_error" => r.sensor_error = Some(unescape(rest)),
             "web_port" => r.web_port = num(words.next()).map_err(bad)?,
+            "web_bind" => r.web_bind = num(words.next()).map_err(bad)?,
             "web_error" => r.web_error = Some(unescape(rest)),
             "power_down" => {
                 let saved_w = num(words.next())
@@ -926,6 +932,7 @@ fn apply_sync(d: &mut WebData, r: SyncReply, full: bool, keep_ack: bool, keep_au
     d.power_down = r.power_down;
     d.service_link = Some(ServiceLink {
         web_port: r.web_port,
+        web_bind: r.web_bind,
         web_error: r.web_error,
         incompatible: None,
     });
@@ -1158,6 +1165,7 @@ mod tests {
         });
         d.service_link = Some(ServiceLink {
             web_port: Some(8666),
+            web_bind: Some("10.0.0.12".parse().unwrap()),
             web_error: None,
             incompatible: None,
         });
@@ -1194,7 +1202,9 @@ mod tests {
         assert_eq!(app.power_auth, AuthState::Failed);
         assert_eq!(app.kill_note, service.kill_note);
         assert_eq!(app.power_down, service.power_down);
-        assert_eq!(app.service_link.as_ref().unwrap().web_port, Some(8666));
+        let link = app.service_link.as_ref().unwrap();
+        assert_eq!(link.web_port, Some(8666));
+        assert_eq!(link.web_bind, Some("10.0.0.12".parse().unwrap()));
         // The app's clock now runs on the service's.
         let skew = app.start.elapsed().as_secs_f64() - service.start.elapsed().as_secs_f64();
         assert!(skew.abs() < 0.05, "clock skew {skew}");

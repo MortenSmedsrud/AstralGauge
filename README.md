@@ -81,6 +81,24 @@ app's own arguments.)
   sensor stays unreadable for 3 s. With no NVML the total power is estimated
   as Σ(V·A) of the pins.
 
+## Web interface
+
+Enable it in **Settings → Web server**. **Listen on** controls who can open
+it:
+
+- **All networks (0.0.0.0)**, the default: other devices on your local
+  network open `http://<this PC's address>:<port>/`. The settings dialog
+  lists those URLs.
+- **This computer only (127.0.0.1).**
+- One of this PC's own addresses, to serve only that network, or any other
+  IP address.
+
+The page has no password. Anyone who can reach it sees the readings and can
+acknowledge the critical alert. If another device can't connect, check the
+firewall (e.g. `sudo ufw allow from 10.0.0.0/24 to any port 8666
+proto tcp`). On macOS, also allow the browser under System Settings →
+Privacy & Security → Local Network.
+
 ## Background service
 
 AstralGauge can also run in the background, without its window, as a

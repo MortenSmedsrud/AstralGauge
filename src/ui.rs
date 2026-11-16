@@ -20,8 +20,8 @@ use crate::hardware::{PinReading, Sample};
 use crate::persist;
 use crate::service::{self, ServiceAction, ServiceControl};
 use crate::web::{
-    m4_downsample, stale_after_secs, PowerDown, ServiceLink, WebData, WebServer, WebState,
-    DEFAULT_WEB_PORT,
+    interface_addresses, local_url, m4_downsample, stale_after_secs, web_target, PowerDown,
+    ServiceLink, WebData, WebServer, WebState, DEFAULT_WEB_BIND, DEFAULT_WEB_PORT,
 };
 
 /// Fallback repaint interval while no new sample arrives (new samples
@@ -503,17 +503,20 @@ fn service_banner(ui: &mut egui::Ui, link: &ServiceLink) {
         );
         match (link.web_port, &link.web_error) {
             (Some(port), _) => {
+                let bind = link
+                    .web_bind
+                    .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+                let url = local_url(std::net::SocketAddr::new(bind, port));
                 if ui
                     .link(
                         egui::RichText::new(format!("Web interface (port {port})"))
                             .color(palette::ACCENT)
                             .underline(),
                     )
-                    .on_hover_text(format!("Open http://localhost:{port}/ in the browser"))
+                    .on_hover_text(format!("Open {url} in the browser"))
                     .clicked()
                 {
-                    ui.ctx()
-                        .open_url(egui::OpenUrl::new_tab(format!("http://localhost:{port}/")));
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(url));
                 }
             }
             (None, Some(e)) => {
@@ -622,6 +625,9 @@ pub(crate) struct App {
     web_retry_at: Instant,
     /// The window title last set (it carries the alert state).
     title: &'static str,
+    /// This computer's network addresses, offered as listen addresses
+    /// (read when the settings dialog opens).
+    interfaces: Vec<(String, std::net::IpAddr)>,
 }
 
 /// Retry spacing for the desktop app's own web server when its port was
@@ -650,6 +656,9 @@ struct Config {
     web_enabled: bool,
     /// Web server port.
     web_port: String,
+    /// Web server listen address (an IP address; `0.0.0.0` = every
+    /// network, `127.0.0.1` = this computer only).
+    web_bind: String,
 }
 
 impl Config {
@@ -661,6 +670,7 @@ impl Config {
             poll_ms: DEFAULT_POLL_MS,
             web_enabled: false,
             web_port: DEFAULT_WEB_PORT.to_string(),
+            web_bind: DEFAULT_WEB_BIND.to_owned(),
         }
     }
 
@@ -671,6 +681,7 @@ impl Config {
             poll_ms: self.poll_ms,
             web_enabled: self.web_enabled,
             web_port: self.web_port.clone(),
+            web_bind: self.web_bind.clone(),
         }
     }
 }
@@ -702,6 +713,7 @@ impl App {
             poll_ms: stored.poll_ms,
             web_enabled: stored.web_enabled,
             web_port: stored.web_port,
+            web_bind: stored.web_bind,
         };
         let mut warning = None;
         let mut config = match persist::load(&defaults) {
@@ -725,16 +737,15 @@ impl App {
         // A saved "web server enabled" starts the server as soon as this app
         // knows it monitors locally (with a background service running, the
         // service serves the page; see the reconcile in `ui`). Only an
-        // invalid port is rejected right here.
-        if config.web_enabled
-            && !matches!(config.web_port.trim().parse::<u16>(), Ok(port) if port != 0)
-        {
-            add_warning(
-                &mut warning,
-                "The saved web-server port is invalid; the web interface was not started."
-                    .to_owned(),
-            );
-            config.web_enabled = false;
+        // invalid address or port is rejected right here.
+        if config.web_enabled {
+            if let Err(e) = web_target(&config.web_bind, &config.web_port) {
+                add_warning(
+                    &mut warning,
+                    format!("The saved web-server settings are invalid ({e}); the web interface was not started."),
+                );
+                config.web_enabled = false;
+            }
         }
         // Saved privileged options (automatic power limit, killing other
         // users' processes) need root: ask for the credentials now, at
@@ -767,6 +778,7 @@ impl App {
             web_error: None,
             web_retry_at: Instant::now(),
             title: "AstralGauge",
+            interfaces: Vec::new(),
         }
     }
 }
@@ -924,14 +936,14 @@ impl eframe::App for App {
                 self.web_error = None;
             }
             (WebState::Stopped, true) if Instant::now() >= self.web_retry_at => {
-                if let Ok(port) = self.config.web_port.trim().parse::<u16>() {
-                    match WebServer::start(port, self.data.clone()) {
+                if let Ok(addr) = web_target(&self.config.web_bind, &self.config.web_port) {
+                    match WebServer::start(addr, self.data.clone()) {
                         Ok(server) => {
                             self.web = WebState::Running(server);
                             self.web_error = None;
                         }
                         Err(e) => {
-                            let msg = format!("port {port} is not available: {e}");
+                            let msg = format!("cannot listen on {addr}: {e}");
                             if self.web_error.as_ref() != Some(&msg) {
                                 eprintln!("Web interface: {msg} (retrying).");
                             }
@@ -999,6 +1011,7 @@ impl eframe::App for App {
                             && self.draft.is_none()
                         {
                             self.draft = Some(self.config.clone());
+                            self.interfaces = interface_addresses();
                         }
                         // In this right-to-left row the next item sits left of
                         // the gear.
@@ -1684,30 +1697,99 @@ Apply the reset with Accept, discard it with Cancel."
                                         .collect();
                                 }
                                 ui.checkbox(&mut draft.web_enabled, "Enable");
-                                if draft.web_enabled {
-                                    if let Some(link) = &service_link {
-                                        // The background service serves it.
-                                        let text = match (link.web_port, &link.web_error) {
-                                            (Some(port), _) => {
-                                                format!("served by the service on port {port}")
-                                            }
-                                            (None, Some(e)) => format!("service: {e}"),
-                                            (None, None) => "served by the service".to_owned(),
-                                        };
-                                        ui.label(egui::RichText::new(text).weak());
-                                    } else if let WebState::Running(server) = &self.web {
-                                        ui.label(
-                                            egui::RichText::new(format!("active on port {}", server.port))
-                                                .weak(),
-                                        );
-                                    } else if let Some(e) = &self.web_error {
-                                        ui.label(
-                                            egui::RichText::new(format!("{e} (retrying)"))
-                                                .color(palette::ORANGE),
-                                        );
-                                    }
+                            });
+
+                            // Which network interfaces the server listens on.
+                            ui.horizontal(|ui| {
+                                ui.label("Listen on:");
+                                let current = draft.web_bind.trim().to_owned();
+                                let presets: Vec<(String, String)> = [
+                                    ("0.0.0.0".to_owned(), "All networks (0.0.0.0)".to_owned()),
+                                    ("127.0.0.1".to_owned(), "This computer only (127.0.0.1)".to_owned()),
+                                ]
+                                .into_iter()
+                                .chain(
+                                    self.interfaces
+                                        .iter()
+                                        .map(|(name, ip)| (ip.to_string(), format!("{ip} ({name})"))),
+                                )
+                                .collect();
+                                let listed = presets.iter().any(|(value, _)| *value == current);
+                                let selected = presets
+                                    .iter()
+                                    .find(|(value, _)| *value == current)
+                                    .map_or("Other address".to_owned(), |(_, label)| label.clone());
+                                egui::ComboBox::from_id_salt("web_bind")
+                                    .selected_text(selected)
+                                    .width(230.0)
+                                    .show_ui(ui, |ui| {
+                                        for (value, label) in &presets {
+                                            ui.selectable_value(&mut draft.web_bind, value.clone(), label);
+                                        }
+                                        if ui.selectable_label(!listed, "Other address\u{2026}").clicked()
+                                            && listed
+                                        {
+                                            // An empty field to type into.
+                                            draft.web_bind.clear();
+                                        }
+                                    });
+                                if !listed {
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut draft.web_bind)
+                                            .hint_text("IP address")
+                                            .desired_width(130.0),
+                                    );
                                 }
                             });
+                            // What runs right now (or why not), on its own
+                            // line: an error message must not widen the dialog.
+                            if draft.web_enabled {
+                                if let Some(link) = &service_link {
+                                    // The background service serves it.
+                                    let text = match (link.web_port, &link.web_error) {
+                                        (Some(port), _) => match link.web_bind {
+                                            Some(bind) => format!(
+                                                "served by the service on {}",
+                                                std::net::SocketAddr::new(bind, port)
+                                            ),
+                                            None => format!("served by the service on port {port}"),
+                                        },
+                                        (None, Some(e)) => format!("service: {e}"),
+                                        (None, None) => "served by the service".to_owned(),
+                                    };
+                                    ui.label(egui::RichText::new(text).weak());
+                                } else if let WebState::Running(server) = &self.web {
+                                    ui.label(
+                                        egui::RichText::new(format!("active on {}", server.addr))
+                                            .weak(),
+                                    );
+                                } else if let Some(e) = &self.web_error {
+                                    ui.label(
+                                        egui::RichText::new(format!("{e} (retrying)"))
+                                            .color(palette::ORANGE),
+                                    );
+                                }
+                            }
+                            // Where other devices find the page.
+                            let lan: Vec<String> = match draft.web_bind.trim().parse::<std::net::IpAddr>() {
+                                Ok(ip) if ip.is_unspecified() => self
+                                    .interfaces
+                                    .iter()
+                                    .filter(|(_, a)| a.is_ipv4() == ip.is_ipv4() || ip.is_ipv6())
+                                    .map(|(_, a)| local_url(std::net::SocketAddr::new(*a, draft.web_port.trim().parse().unwrap_or(DEFAULT_WEB_PORT))))
+                                    .collect(),
+                                Ok(ip) if !ip.is_loopback() => vec![local_url(std::net::SocketAddr::new(ip, draft.web_port.trim().parse().unwrap_or(DEFAULT_WEB_PORT)))],
+                                _ => Vec::new(),
+                            };
+                            let mut help = "All networks lets other devices on your network open the page; \
+        This computer only keeps it on this PC; an address of this PC limits it to that network. The \
+        page has no password: whoever can reach it sees the readings and can acknowledge the critical \
+        alert."
+                                .to_owned();
+                            if !lan.is_empty() {
+                                help.push_str(&format!("\nFrom other devices: {}", lan.join("  ")));
+                            }
+                            ui.label(egui::RichText::new(help).weak().size(12.0));
 
                             ui.separator();
                             // Install / uninstall the systemd user service that
@@ -1847,50 +1929,65 @@ Apply the reset with Accept, discard it with Cancel."
                 // tears down a server that is already running. While the
                 // background service monitors, it serves the page instead
                 // (from the saved settings): nothing to start here.
-                let port_ok = matches!(draft.web_port.trim().parse::<u16>(), Ok(port) if port != 0);
+                let target = web_target(&draft.web_bind, &draft.web_port);
                 if !local_monitor {
-                    if draft.web_enabled && !port_ok {
-                        self.warning =
-                            Some("Port must be a number between 1 and 65535.".to_owned());
+                    if let (true, Err(e)) = (draft.web_enabled, &target) {
+                        self.warning = Some(format!("Web server: {e}."));
                         draft.web_enabled = false;
                     }
                 } else {
-                    let running_port = match &self.web {
-                        WebState::Running(server) => Some(server.port),
+                    let running = match &self.web {
+                        WebState::Running(server) => Some(server.addr),
                         WebState::Stopped => None,
                     };
-                    match (draft.web_enabled, draft.web_port.trim().parse::<u16>()) {
+                    match (draft.web_enabled, target) {
                         (false, _) => {
-                            if running_port.is_some() {
+                            if running.is_some() {
                                 self.web = WebState::Stopped;
                             }
                         }
-                        (true, Ok(port)) if port != 0 => {
-                            if running_port != Some(port) {
-                                match WebServer::start(port, self.data.clone()) {
+                        (true, Ok(addr)) => {
+                            if running != Some(addr) {
+                                // Stop the old server first (it frees the
+                                // port, which the new address may reuse);
+                                // if the new address fails, go back to it.
+                                let previous =
+                                    match std::mem::replace(&mut self.web, WebState::Stopped) {
+                                        WebState::Running(server) => Some(server.addr),
+                                        WebState::Stopped => None,
+                                    };
+                                match WebServer::start(addr, self.data.clone()) {
                                     Ok(server) => {
                                         self.web = WebState::Running(server);
                                         self.web_error = None;
                                     }
                                     Err(e) => {
                                         self.warning = Some(format!(
-                                            "Port {port} is not available: {e}\n\nThe web interface was not started.",
+                                            "Cannot listen on {addr}: {e}\n\nThe web interface was not started there.",
                                         ));
+                                        if let Some(old) = previous {
+                                            if let Ok(server) =
+                                                WebServer::start(old, self.data.clone())
+                                            {
+                                                self.web = WebState::Running(server);
+                                            }
+                                        }
                                     }
                                 }
                             }
                         }
-                        (true, _) => {
-                            self.warning =
-                                Some("Port must be a number between 1 and 65535.".to_owned());
+                        (true, Err(e)) => {
+                            self.warning = Some(format!("Web server: {e}."));
                         }
                     }
                     // The applied config mirrors what actually runs: a failed
-                    // start is not "enabled", and the port is the live one.
+                    // start is not "enabled", and address and port are the
+                    // live ones.
                     if matches!(self.web, WebState::Stopped) {
                         draft.web_enabled = false;
                     } else if let WebState::Running(server) = &self.web {
-                        draft.web_port = server.port.to_string();
+                        draft.web_port = server.addr.port().to_string();
+                        draft.web_bind = server.addr.ip().to_string();
                     }
                 }
                 // The cross-user kill only exists while the safeguard itself

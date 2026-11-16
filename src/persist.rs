@@ -27,6 +27,8 @@ pub(crate) struct StoredSettings {
     pub(crate) poll_ms: u64,
     pub(crate) web_enabled: bool,
     pub(crate) web_port: String,
+    /// The web server's listen address (an IP address, as text).
+    pub(crate) web_bind: String,
 }
 
 /// Where the settings live: `$XDG_CONFIG_HOME/astral-gauge/settings.json`,
@@ -128,6 +130,8 @@ fn to_json(stored: &StoredSettings) -> String {
     let _ = writeln!(out, "  \"web_enabled\": {},", stored.web_enabled);
     out.push_str("  \"web_port\": ");
     write_string(&mut out, &stored.web_port);
+    out.push_str(",\n  \"web_bind\": ");
+    write_string(&mut out, &stored.web_bind);
     out.push('\n');
     out.push('}');
     out.push('\n');
@@ -271,12 +275,25 @@ fn from_json(root: &Json, defaults: &StoredSettings) -> Result<StoredSettings, S
         }
         Some(_) => return Err("web_port must be a string".to_owned()),
     };
+    let web_bind = match root.get("web_bind") {
+        // Older files: the address the server always listened on.
+        None => defaults.web_bind.clone(),
+        Some(Json::Str(text)) => {
+            let text = text.trim();
+            match text.parse::<std::net::IpAddr>() {
+                Ok(_) => text.to_owned(),
+                Err(_) => return Err(format!("web_bind must be an IP address, got \"{text}\"")),
+            }
+        }
+        Some(_) => return Err("web_bind must be a string".to_owned()),
+    };
 
     Ok(StoredSettings {
         alerts,
         poll_ms,
         web_enabled,
         web_port,
+        web_bind,
     })
 }
 
@@ -587,7 +604,7 @@ fn utf8_seq_len(first: u8) -> usize {
 mod tests {
     use super::*;
     use crate::hardware::DEFAULT_POLL_MS;
-    use crate::web::DEFAULT_WEB_PORT;
+    use crate::web::{DEFAULT_WEB_BIND, DEFAULT_WEB_PORT};
 
     fn defaults() -> StoredSettings {
         StoredSettings {
@@ -595,6 +612,7 @@ mod tests {
             poll_ms: DEFAULT_POLL_MS,
             web_enabled: false,
             web_port: DEFAULT_WEB_PORT.to_string(),
+            web_bind: DEFAULT_WEB_BIND.to_owned(),
         }
     }
 
@@ -620,6 +638,7 @@ mod tests {
             poll_ms: 250,
             web_enabled: true,
             web_port: "9001".to_owned(),
+            web_bind: "10.0.0.12".to_owned(),
         };
         let parsed = round_trip(&to_json(&stored)).unwrap();
         assert_eq!(parsed, stored);
@@ -636,6 +655,7 @@ mod tests {
         assert_eq!(loaded.poll_ms, 500);
         assert!(!loaded.web_enabled);
         assert_eq!(loaded.web_port, d.web_port);
+        assert_eq!(loaded.web_bind, "0.0.0.0");
     }
 
     #[test]
@@ -654,6 +674,8 @@ mod tests {
             r#"{ "poll_ms": "fast" }"#,
             r#"{ "auto_min_power": "sometimes" }"#,
             r#"{ "web_port": "0" }"#,
+            r#"{ "web_bind": "my-pc" }"#,
+            r#"{ "web_bind": 127 }"#,
             r#"{ "web_enabled": "yes" }"#,
             r#"{ "yellow_sound": "/plain/path.wav" }"#,
             r#"{ "yellow_sound": "embedded:who_hummed_this" }"#,
@@ -680,6 +702,7 @@ mod tests {
             poll_ms: 777,
             web_enabled: true,
             web_port: "9999".to_owned(),
+            web_bind: "::".to_owned(),
         };
         save(&stored).expect("save");
         assert!(settings_path()
