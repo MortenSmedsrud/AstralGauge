@@ -351,6 +351,14 @@ Optional (`Settings::auto_min_power` = Off / On yellow / On red):
 
 ## Cross-cutting conventions
 
+- Commit messages are a single line in Conventional Commits form
+  (`fix: …`, `feat: …`, `docs: …`, `refactor: …`, `test: …`, `chore: …`):
+  no body and no trailers — in particular no `Co-Authored-By` (or other
+  attribution) lines. One logical change per commit.
+- Never commit unless the user asks for it. Leave changes uncommitted in
+  the working tree until the user has tested them: broken commits are
+  unwanted, so nothing gets committed just because it builds or the unit
+  tests pass.
 - Module visibility uses `pub(crate)` liberally (binary crate; the modules
   are one cohesive app, not a public API).
 - Module dependency direction: `main → {hardware, alerts, web, ui}`,
