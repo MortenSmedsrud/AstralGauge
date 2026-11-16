@@ -180,7 +180,8 @@ One `Arc<Mutex<WebData>>` (created in `main`) is the single sync point; all
 critical sections are short — keep them that way:
 
 1. **Poller thread** (`hardware::spawn_poller`): opens I2C + NVML once,
-   loops: drain `Cmd` channel (`SetLimit`/`Interval`) → read NVML + pins +
+   loops (one poll per interval, measured from each poll's start so the
+   read time does not stretch the spacing): drain `Cmd` channel (`SetLimit`/`Interval`) → read NVML + pins +
    top GPU processes → lock the data, read `settings`, `record(sample)` →
    run `alerts::over_limit_sound` outside the lock (evaluated, not played
    yet) → on a red rising edge, set `WebData::critical_alert` (the latching
@@ -243,8 +244,14 @@ critical sections are short — keep them that way:
    `App::new` loads the saved settings (see `persist`); if the automatic
    min-power was saved enabled it sends `GrantPowerAccess` right away — the
    root prompt shows at startup — and a denial turns the option back off
-   (`auto_power_pending_auth`), persisting the rollback. Redraws at the
-   poll interval when idle.
+   (`auto_power_pending_auth`), persisting the rollback. Repaints are
+   driven by the data: the poller calls `WebData::on_sample` (a
+   `request_repaint` installed in `main`) after every recorded sample, and
+   the graphs end at `WebData::sampled_at` (the newest sample) instead of
+   the wall clock, so they scroll exactly one sample per sample. A
+   fallback timer (`IDLE_REPAINT_MS`, 1 s, or the poll interval if slower;
+   250 ms while the critical alert flashes) keeps time-based text moving
+   when samples stop.
 
 ## Alert sound rules (implemented in `alerts::over_limit_sound`)
 

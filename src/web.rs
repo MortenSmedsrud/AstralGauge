@@ -86,6 +86,15 @@ pub(crate) struct WebData {
     /// recorded; `None` before the first one. Drives the staleness warning
     /// (see [`stale_after_secs`]).
     pub(crate) pins_at: Option<f64>,
+    /// When (seconds since `start`) the newest sample of any kind was
+    /// recorded; `None` before the first one. The desktop graphs scroll by
+    /// this time, not the wall clock, so they move exactly one sample per
+    /// sample instead of by however much time passed between repaints.
+    pub(crate) sampled_at: Option<f64>,
+    /// Called by the poller (outside the lock) after each recorded sample:
+    /// the GUI sets it to request a repaint, so frames follow the data
+    /// instead of a separate timer that drifts against the poll cadence.
+    pub(crate) on_sample: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl WebData {
@@ -109,6 +118,8 @@ impl WebData {
             critical_alert: false,
             sensor_error: None,
             pins_at: None,
+            sampled_at: None,
+            on_sample: None,
         };
         // Pre-reserve history for the default 1 Hz sample rate so the common
         // case never reallocates; a faster slider setting just grows the vecs.
@@ -128,6 +139,7 @@ impl WebData {
     /// keeps flowing while the GUI window is minimized or not drawing.
     pub(crate) fn record(&mut self, sample: Sample) {
         let now = self.start.elapsed().as_secs_f64();
+        self.sampled_at = Some(now);
         // Without valid pin readings (see `Sample::pins`) the pin histories
         // get a gap instead of made-up zeros.
         let pins_valid = sample.pins.len() == NUM_PINS;

@@ -67,9 +67,16 @@ fn main() {
     // The app loads the settings saved on the previous run (see
     // `persist`), re-applies them, and authenticates the privileged power
     // helper when the saved automatic power limit needs it.
-    let app = ui::App::new(cmd_tx, data);
+    let app = ui::App::new(cmd_tx, data.clone());
 
-    if let Err(e) = eframe::run_native("AstralGauge", options, Box::new(|_cc| Ok(Box::new(app)))) {
+    let creator = Box::new(move |cc: &eframe::CreationContext<'_>| {
+        // Repaint as soon as the poller records a sample (see
+        // `WebData::on_sample`).
+        let ctx = cc.egui_ctx.clone();
+        data.lock().unwrap().on_sample = Some(Arc::new(move || ctx.request_repaint()));
+        Ok(Box::new(app) as Box<dyn eframe::App>)
+    });
+    if let Err(e) = eframe::run_native("AstralGauge", options, creator) {
         eprintln!("eframe error: {e}");
         std::process::exit(1);
     }

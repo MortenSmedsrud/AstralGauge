@@ -17,6 +17,10 @@ use crate::hardware::{AuthState, Cmd, DEFAULT_POLL_MS};
 use crate::persist;
 use crate::web::{m4_downsample, stale_after_secs, WebData, WebServer, WebState, DEFAULT_WEB_PORT};
 
+/// Fallback repaint interval while no new sample arrives (new samples
+/// repaint on their own, see `WebData::on_sample`).
+const IDLE_REPAINT_MS: u64 = 1000;
+
 pub(crate) const HORIZONS_MIN: [u32; 6] = [1, 5, 10, 15, 30, 60];
 
 /// License text (this software + third-party crates) for the About dialog,
@@ -415,6 +419,10 @@ impl eframe::App for App {
             data.settings = self.config.alerts.clone();
         }
         let now = data.start.elapsed().as_secs_f64();
+        // The graphs end at the newest sample, not at the wall clock: they
+        // then scroll exactly one sample per sample, however the frame
+        // happened to be timed (see `WebData::sampled_at`).
+        let graph_now = data.sampled_at.unwrap_or(now);
         // Captured for the settings panel (the data lock is held here).
         let power_auth = data.power_auth;
 
@@ -695,7 +703,7 @@ impl eframe::App for App {
                                     ui,
                                     pin,
                                     &data.history[pin],
-                                    now,
+                                    graph_now,
                                     window_secs,
                                     graph_size,
                                     &self.config.alerts,
@@ -706,7 +714,7 @@ impl eframe::App for App {
                                         ui,
                                         "Power (W)",
                                         &data.power_history,
-                                        now,
+                                        graph_now,
                                         window_secs,
                                         graph_size,
                                         egui::Color32::from_rgb(255, 165, 0),
@@ -717,7 +725,7 @@ impl eframe::App for App {
                                         ui,
                                         "Temp (°C)",
                                         &data.temp_history,
-                                        now,
+                                        graph_now,
                                         window_secs,
                                         graph_size,
                                         egui::Color32::from_rgb(255, 90, 70),
@@ -728,7 +736,7 @@ impl eframe::App for App {
                                         ui,
                                         "VRAM (GB)",
                                         &data.mem_history,
-                                        now,
+                                        graph_now,
                                         window_secs,
                                         graph_size,
                                         egui::Color32::from_rgb(140, 190, 255),
@@ -1241,14 +1249,16 @@ Apply the reset with Accept, discard it with Cancel."
             });
         self.about_open = about_open;
 
-        // Redraw about as fast as the data arrives when idle, and fast
-        // enough to keep the critical alert's flash animating while it shows.
-        // Input events (slider drags, checkbox, window moves) still trigger
-        // immediate repaints, so the UI stays fully responsive.
+        // New samples repaint immediately: the poller calls
+        // `WebData::on_sample` (installed in `main`), so frames follow the
+        // data. The timer here is only a fallback that keeps time-based
+        // text (the staleness warning, note expiry) moving when samples
+        // stop, plus the critical alert's flash while it shows. Input events
+        // (slider drags, checkbox, window moves) still repaint immediately.
         let idle_ms = if data.critical_alert {
             self.config.poll_ms.min(ALERT_REPAINT_MS)
         } else {
-            self.config.poll_ms
+            self.config.poll_ms.max(IDLE_REPAINT_MS)
         };
         ui.ctx()
             .request_repaint_after(Duration::from_millis(idle_ms));

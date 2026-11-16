@@ -476,6 +476,10 @@ pub(crate) fn spawn_poller(
         let mut critical_state = CriticalAlertState::default();
 
         loop {
+            // Start of this poll: the sleep at the end only waits out the
+            // rest of the interval, so samples stay evenly spaced instead of
+            // drifting by however long the reads took.
+            let poll_start = Instant::now();
             // Handle UI commands
             while let Ok(cmd) = cmd_rx.try_recv() {
                 match cmd {
@@ -607,15 +611,19 @@ pub(crate) fn spawn_poller(
             // authentication it needs was not granted).
             let power_note = power_helper.status.lock().unwrap().clone();
             let power_auth = power_helper.auth_state();
-            let settings = {
+            let (settings, on_sample) = {
                 let mut d = data.lock().unwrap();
                 let settings = d.settings.clone();
                 d.record(sample);
                 d.sensor_error = sensor_error;
                 d.power_note = power_note;
                 d.power_auth = power_auth;
-                settings
+                (settings, d.on_sample.clone())
             };
+            // Wake the GUI for this sample (after the lock is released).
+            if let Some(wake) = on_sample {
+                wake();
+            }
             // Limit checking decides which alert sound this sample earns, but
             // it is only played below: a termination on this same red edge
             // replaces the critical alert (see the priority sound below).
@@ -805,7 +813,7 @@ pub(crate) fn spawn_poller(
                 println!("Automatic power limit: applying {watts} W");
                 power_helper.set(watts);
             }
-            thread::sleep(Duration::from_millis(poll_ms));
+            thread::sleep(Duration::from_millis(poll_ms).saturating_sub(poll_start.elapsed()));
         }
     });
     cmd_tx
