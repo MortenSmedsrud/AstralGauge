@@ -45,6 +45,15 @@ fn current_color(current: f64, s: &Settings) -> egui::Color32 {
     }
 }
 
+/// One pin cell of the voltage/current tables: `Pin  i:   1.234`, or a dash
+/// when there is no reading for that pin.
+fn pin_text(pin: usize, value: Option<f64>) -> String {
+    match value {
+        Some(v) => format!("Pin {pin:>2}: {v:>7.3}"),
+        None => format!("Pin {pin:>2}: {:>7}", "—"),
+    }
+}
+
 pub(crate) struct App {
     cmd_tx: mpsc::Sender<Cmd>,
     pending_limit: Option<u32>,
@@ -539,24 +548,18 @@ impl eframe::App for App {
 
             ui.separator();
 
-            // Voltage table - 2 rows x 3 columns
+            // Voltage table - 2 rows x 3 columns. A sample without pin
+            // readings (none recorded yet, or the sensor is unavailable)
+            // shows dashes instead of numbers.
             ui.strong("Voltage (V)");
-            ui.horizontal(|ui| {
-                for i in 0..3 {
-                    ui.monospace(format!(
-                        "Pin {:>2}: {:>7.3}",
-                        i, data.sample.pins[i].voltage
-                    ));
-                }
-            });
-            ui.horizontal(|ui| {
-                for i in 3..6 {
-                    ui.monospace(format!(
-                        "Pin {:>2}: {:>7.3}",
-                        i, data.sample.pins[i].voltage
-                    ));
-                }
-            });
+            for row in 0..2 {
+                ui.horizontal(|ui| {
+                    for i in row * 3..row * 3 + 3 {
+                        let voltage = data.sample.pins.get(i).map(|p| p.voltage);
+                        ui.monospace(pin_text(i, voltage));
+                    }
+                });
+            }
 
             ui.separator();
 
@@ -566,14 +569,12 @@ impl eframe::App for App {
             for row in 0..2 {
                 ui.horizontal(|ui| {
                     for i in row * 3..row * 3 + 3 {
-                        let color = current_color(data.sample.pins[i].current, &self.config.alerts);
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "Pin {:>2}: {:>7.3}",
-                                i, data.sample.pins[i].current
-                            ))
-                            .color(color),
-                        );
+                        let current = data.sample.pins.get(i).map(|p| p.current);
+                        let color = match current {
+                            Some(c) => current_color(c, &self.config.alerts),
+                            None => ui.visuals().weak_text_color(),
+                        };
+                        ui.label(egui::RichText::new(pin_text(i, current)).color(color));
                     }
                     if row == 0 {
                         let y = self.config.alerts.yellow_limit_a;
@@ -1541,7 +1542,15 @@ fn add_metric_graph(
 
 #[cfg(test)]
 mod tests {
-    use super::ABOUT_TEXT;
+    use super::{pin_text, ABOUT_TEXT};
+
+    #[test]
+    fn pin_text_shows_values_and_dashes() {
+        assert_eq!(pin_text(3, Some(9.5)), "Pin  3:   9.500");
+        // No reading (before the first sample or with the sensor down): a
+        // dash in the same column instead of a number (or a panic).
+        assert_eq!(pin_text(3, None), "Pin  3:       —");
+    }
 
     /// The embedded license text is a generated artifact (`sh licenses.sh`
     /// into `licenses.txt`); this catches an empty, truncated or
