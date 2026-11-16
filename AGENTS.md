@@ -412,6 +412,31 @@ Optional (`Settings::kill_top_process_on_red`, default off, settings dialog
   of the same excursion (a failed kill plays the regular red alert
   instead).
 
+## Live alert and power-down indicators
+
+Separate from the latching notification below, both UIs show the *current*
+state prominently (`ui::alert_summary` / `level_banner` /
+`power_down_banner` ↔ JS `alertLevel` and the `#level` / `#pdown`
+banners):
+
+- **Yellow / red** (`alerts::level` per pin, worst wins; never judged from
+  missing or stale readings): a "HIGH CURRENT" (yellow) or "CRITICAL
+  CURRENT" (red) banner directly under the header naming the pins in that
+  range, the status pill reads Warning / Critical, a 4 px colored edge runs
+  around the whole window (desktop: a foreground-layer stroke on the
+  viewport; web: the fixed `#edge` div), and the window / tab title gets a
+  "⚠ HIGH CURRENT —" / "⚠ CRITICAL CURRENT —" prefix (the desktop sends
+  `ViewportCommand::Title` on change only), so the taskbar shows it behind
+  a fullscreen game. It goes away with the current.
+- **Powered down** (`WebData::power_down`, published by the poller from
+  `AutoPowerState::lowered` after every sample; web JSON `power_down`
+  `{saved, trigger, restore_in}` or null; link line `power_down`): a purple
+  (`palette::PDOWN`) banner, "GPU POWERED DOWN — power limit at the N W
+  minimum (normally M W)" once NVML reports the minimum ("POWERING DOWN …"
+  while the privileged helper has not applied it yet), with the restore
+  countdown or the trigger level it waits for; purple edge and title when
+  no yellow/red applies.
+
 ## Latching critical-current notification
 
 Independent of the kill safeguard: on the red rising edge
@@ -517,7 +542,7 @@ Optional (`Settings::auto_min_power` = Off / On yellow / On red):
 
 ## Tests
 
-`cargo test` (42 tests, no GPU/display needed):
+`cargo test` (43 tests, no GPU/display needed):
 
 - `alerts::tests`: settings defaults; embedded WAVs decode; alert edge
   triggering; 15 s repeat-while-exceeded behavior; powering-down sound
@@ -543,7 +568,8 @@ Optional (`Settings::auto_min_power` = Off / On yellow / On red):
   unknown lines tolerated, the unit file's quoted `ExecStart`, line
   escaping. (Never call `install`/`uninstall` in a test: they drive the
   real user manager.)
-- `ui::tests`: embedded license-text sanity (the generated `licenses.txt` is
+- `ui::tests`: the live alert summary (worst range, pins named, red over
+  yellow); embedded license-text sanity (the generated `licenses.txt` is
   non-empty, lists one "Used by:" section per license, and has no template
   leftovers or HTML escaping); readings shown as dashes when missing; the sensor
   fault / staleness warning.

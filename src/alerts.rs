@@ -454,6 +454,39 @@ impl AutoPowerState {
         self.saved_limit_w = None;
         self.below_since = None;
     }
+
+    /// While the automatic power limit is in effect (the limit was lowered
+    /// and not restored yet): the limit it will restore, and how long until
+    /// it does — `None` while the current is still at or above the trigger
+    /// level (the countdown has not started).
+    pub(crate) fn lowered(&self) -> Option<(u32, Option<Duration>)> {
+        self.saved_limit_w.map(|saved| {
+            let left = self
+                .below_since
+                .map(|since| AUTO_POWER_RESTORE_DELAY.saturating_sub(since.elapsed()));
+            (saved, left)
+        })
+    }
+}
+
+/// The current range a reading falls in (green / yellow / red).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Level {
+    Normal,
+    Yellow,
+    Red,
+}
+
+/// Classify a pin current against the limits: yellow from the yellow limit,
+/// red from the red limit (both inclusive).
+pub(crate) fn level(current: f64, s: &Settings) -> Level {
+    if current >= s.red_limit_a as f64 {
+        Level::Red
+    } else if current >= s.yellow_limit_a as f64 {
+        Level::Yellow
+    } else {
+        Level::Normal
+    }
 }
 
 /// Fold one sample into the automatic power-limit state machine and return
@@ -819,6 +852,8 @@ mod tests {
             auto_power_action(&mut st, 9.5, Some(580), Some(300), &s),
             Some(300)
         );
+        // Lowered, no countdown while the current stays high.
+        assert_eq!(st.lowered(), Some((580, None)));
         // Still lowered: no repeat while the excursion lasts.
         assert_eq!(
             auto_power_action(&mut st, 9.7, Some(300), Some(300), &s),
@@ -829,12 +864,14 @@ mod tests {
             auto_power_action(&mut st, 5.0, Some(300), Some(300), &s),
             None
         );
+        assert!(matches!(st.lowered(), Some((580, Some(left))) if left > Duration::from_secs(29)));
         st.below_since = Some(Instant::now() - AUTO_POWER_RESTORE_DELAY);
         // ... then the saved limit comes back.
         assert_eq!(
             auto_power_action(&mut st, 5.0, Some(300), Some(300), &s),
             Some(580)
         );
+        assert_eq!(st.lowered(), None);
         // A new excursion lowers again.
         assert_eq!(
             auto_power_action(&mut st, 9.5, Some(580), Some(300), &s),

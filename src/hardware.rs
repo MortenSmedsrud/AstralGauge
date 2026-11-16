@@ -23,10 +23,10 @@ use std::time::{Duration, Instant};
 
 use crate::alerts::{
     auto_power_action, critical_alert_edge, kill_guard_action, kill_reply_wait, over_limit_sound,
-    sensor_fault_sound, AlertState, AutoPowerState, CriticalAlertState, KillGuardState,
-    KillReplyWait, SensorFaultState, Sound, SoundPlayer,
+    sensor_fault_sound, AlertState, AutoMinPower, AutoPowerState, CriticalAlertState,
+    KillGuardState, KillReplyWait, SensorFaultState, Sound, SoundPlayer,
 };
-use crate::web::WebData;
+use crate::web::{PowerDown, WebData};
 
 // ITE IT8915FN constants
 const I2C_SLAVE_ADDR: u16 = 0x2B;
@@ -881,6 +881,18 @@ pub(crate) fn spawn_poller(
                 println!("Automatic power limit: applying {watts} W");
                 power_helper.set(watts);
             }
+            // Whether the automatic power limit has the GPU powered down
+            // right now (both UIs show it prominently).
+            let power_down = auto_power.lowered().map(|(saved_w, left)| PowerDown {
+                saved_w,
+                trigger_a: match settings.auto_min_power {
+                    AutoMinPower::OnYellow => settings.yellow_limit_a as f64,
+                    _ => settings.red_limit_a as f64,
+                },
+                restore_in: left.map(|d| d.as_secs_f64()),
+            });
+            data.lock().unwrap().power_down = power_down;
+
             // Wait out the rest of the interval, handling commands as they
             // arrive (a closed channel means the poller was stopped).
             let deadline = poll_start + Duration::from_millis(poll_ms);

@@ -41,7 +41,9 @@ use crate::hardware::{
     NUM_PINS,
 };
 use crate::persist;
-use crate::web::{ServiceLink, WebData, WebServer, WebState, DEFAULT_WEB_PORT, HISTORY_SECS};
+use crate::web::{
+    PowerDown, ServiceLink, WebData, WebServer, WebState, DEFAULT_WEB_PORT, HISTORY_SECS,
+};
 
 /// Command-line flag that runs this binary as the background service.
 pub(crate) const SERVICE_ARG: &str = "--service";
@@ -589,6 +591,7 @@ struct SyncReply {
     sensor_error: Option<String>,
     web_port: Option<u16>,
     web_error: Option<String>,
+    power_down: Option<PowerDown>,
     sample: Sample,
     /// [`SERIES`] histories of (time, value), oldest first.
     series: Vec<Vec<(f64, f64)>>,
@@ -619,6 +622,7 @@ fn sync_reply(d: &WebData, since: Option<f64>) -> SyncReply {
         sensor_error: d.sensor_error.clone(),
         web_port: link.web_port,
         web_error: link.web_error,
+        power_down: d.power_down.clone(),
         sample: d.sample.clone(),
         series,
     }
@@ -691,6 +695,15 @@ fn encode_sync(r: &SyncReply) -> String {
     }
     if let Some(e) = &r.web_error {
         let _ = writeln!(o, "web_error {}", escape(e));
+    }
+    if let Some(pd) = &r.power_down {
+        let _ = writeln!(
+            o,
+            "power_down {} {} {}",
+            pd.saved_w,
+            pd.trigger_a,
+            opt(pd.restore_in)
+        );
     }
     let s = &r.sample;
     let _ = writeln!(
@@ -785,6 +798,20 @@ fn decode_sync(lines: &[String]) -> Result<SyncReply, String> {
             "sensor_error" => r.sensor_error = Some(unescape(rest)),
             "web_port" => r.web_port = num(words.next()).map_err(bad)?,
             "web_error" => r.web_error = Some(unescape(rest)),
+            "power_down" => {
+                let saved_w = num(words.next())
+                    .map_err(bad)?
+                    .ok_or("SYNC power_down: no limit")?;
+                let trigger_a = num(words.next())
+                    .map_err(bad)?
+                    .ok_or("SYNC power_down: no trigger")?;
+                let restore_in = num(words.next()).map_err(bad)?;
+                r.power_down = Some(PowerDown {
+                    saved_w,
+                    trigger_a,
+                    restore_in,
+                });
+            }
             "sample" => {
                 let s = &mut r.sample;
                 s.power_w = num(words.next()).map_err(bad)?;
@@ -896,6 +923,7 @@ fn apply_sync(d: &mut WebData, r: SyncReply, full: bool, keep_ack: bool, keep_au
     d.power_note = r.power_note;
     d.kill_note = r.kill_note;
     d.sensor_error = r.sensor_error;
+    d.power_down = r.power_down;
     d.service_link = Some(ServiceLink {
         web_port: r.web_port,
         web_error: r.web_error,
@@ -1123,6 +1151,11 @@ mod tests {
             "Critical-alert safeguard: killed game (pid 4242).".into(),
         ));
         d.sensor_error = None;
+        d.power_down = Some(PowerDown {
+            saved_w: 600,
+            trigger_a: 5.5,
+            restore_in: Some(12.25),
+        });
         d.service_link = Some(ServiceLink {
             web_port: Some(8666),
             web_error: None,
@@ -1160,6 +1193,7 @@ mod tests {
         assert!(app.critical_alert);
         assert_eq!(app.power_auth, AuthState::Failed);
         assert_eq!(app.kill_note, service.kill_note);
+        assert_eq!(app.power_down, service.power_down);
         assert_eq!(app.service_link.as_ref().unwrap().web_port, Some(8666));
         // The app's clock now runs on the service's.
         let skew = app.start.elapsed().as_secs_f64() - service.start.elapsed().as_secs_f64();

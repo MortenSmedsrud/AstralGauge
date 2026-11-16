@@ -12,12 +12,16 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::alerts::{AutoMinPower, EmbeddedSound, Settings, Sound, MAX_LIMIT_A, MIN_LIMIT_A};
+use crate::alerts::{
+    level, AutoMinPower, EmbeddedSound, Level, Settings, Sound, MAX_LIMIT_A, MIN_LIMIT_A,
+};
 use crate::hardware::{AuthState, Cmd, GpuProcess, DEFAULT_POLL_MS};
+use crate::hardware::{PinReading, Sample};
 use crate::persist;
 use crate::service::{self, ServiceAction, ServiceControl};
 use crate::web::{
-    m4_downsample, stale_after_secs, ServiceLink, WebData, WebServer, WebState, DEFAULT_WEB_PORT,
+    m4_downsample, stale_after_secs, PowerDown, ServiceLink, WebData, WebServer, WebState,
+    DEFAULT_WEB_PORT,
 };
 
 /// Fallback repaint interval while no new sample arrives (new samples
@@ -69,6 +73,8 @@ mod palette {
     pub(super) const POWER: Color32 = Color32::from_rgb(251, 176, 59);
     pub(super) const TEMP: Color32 = Color32::from_rgb(248, 113, 113);
     pub(super) const VRAM: Color32 = Color32::from_rgb(129, 178, 250);
+    /// GPU powered down by the automatic power limit.
+    pub(super) const PDOWN: Color32 = Color32::from_rgb(192, 132, 252);
 }
 
 /// Install the app's dark theme: flatter, rounder widgets on a near-black
@@ -343,6 +349,96 @@ fn dot_label(ui: &mut egui::Ui, text: impl Into<egui::RichText>, color: egui::Co
     });
 }
 
+/// The live alert state of a set of pin readings: the highest range any pin
+/// is in, and a description naming the pins in it ("pin 3: 7.62 A, pin 4:
+/// 7.88 A (red limit 6.0 A)"). `None` while every pin is green or there
+/// are no readings. Mirrored by `alertLevel` in the web page.
+fn alert_summary(pins: &[PinReading], s: &Settings) -> Option<(Level, String)> {
+    let worst = pins.iter().map(|p| level(p.current, s)).max()?;
+    let (limit_name, limit) = match worst {
+        Level::Normal => return None,
+        Level::Yellow => ("warning limit", s.yellow_limit_a),
+        Level::Red => ("red limit", s.red_limit_a),
+    };
+    let named: Vec<String> = pins
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| level(p.current, s) == worst)
+        .map(|(i, p)| format!("pin {i}: {:.2} A", p.current))
+        .collect();
+    Some((
+        worst,
+        format!("{} ({limit_name} {limit:.1} A)", named.join(", ")),
+    ))
+}
+
+/// The live alert banner: which pins are over which limit right now. Not
+/// latching (the critical notification below is): it goes away with the
+/// current.
+fn level_banner(ui: &mut egui::Ui, level: Level, why: &str) {
+    let (fill, stroke, text, title) = match level {
+        Level::Red => (
+            egui::Color32::from_rgb(69, 18, 18),
+            palette::RED,
+            egui::Color32::from_rgb(254, 202, 202),
+            "CRITICAL CURRENT",
+        ),
+        _ => (
+            egui::Color32::from_rgb(66, 52, 8),
+            palette::YELLOW,
+            egui::Color32::from_rgb(253, 230, 138),
+            "HIGH CURRENT",
+        ),
+    };
+    banner(ui, fill, stroke, |ui| {
+        dot_label(
+            ui,
+            egui::RichText::new(title).strong().size(15.0).color(text),
+            stroke,
+        );
+        ui.label(egui::RichText::new(why).size(14.0).color(text));
+    });
+}
+
+/// The banner shown while the automatic power limit has the GPU powered
+/// down: the lowered and the normal limit, and when it comes back.
+fn power_down_banner(ui: &mut egui::Ui, pd: &PowerDown, sample: &Sample) {
+    let text = egui::Color32::from_rgb(233, 213, 255);
+    let applied = matches!((sample.limit_w, sample.limit_min_w), (Some(l), Some(min)) if l <= min);
+    let title = match sample.limit_w {
+        Some(limit) if applied => format!(
+            "GPU POWERED DOWN \u{2014} power limit at the {limit} W minimum (normally {} W)",
+            pd.saved_w
+        ),
+        // Requested, not (yet) in effect: the privileged helper may still be
+        // waiting for its authentication.
+        _ => format!(
+            "POWERING DOWN \u{2014} lowering the power limit (normally {} W) to its minimum\u{2026}",
+            pd.saved_w
+        ),
+    };
+    let when = match pd.restore_in {
+        Some(left) => format!("Restores to {} W in {:.0} s.", pd.saved_w, left.ceil()),
+        None => format!(
+            "Restores 30 s after every pin is back below {:.1} A.",
+            pd.trigger_a
+        ),
+    };
+    banner(
+        ui,
+        egui::Color32::from_rgb(46, 26, 74),
+        palette::PDOWN,
+        |ui| {
+            dot_label(
+                ui,
+                egui::RichText::new(title).strong().color(text),
+                palette::PDOWN,
+            );
+            ui.label(egui::RichText::new(when).color(text));
+        },
+    );
+}
+
 /// Rounded status chip ("● Live", "● Sensor fault") for the header.
 ///
 /// Painted as one fixed-size widget (not a `Frame`), so a center-aligned
@@ -524,6 +620,8 @@ pub(crate) struct App {
     /// retried at `web_retry_at` while this app monitors locally.
     web_error: Option<String>,
     web_retry_at: Instant,
+    /// The window title last set (it carries the alert state).
+    title: &'static str,
 }
 
 /// Retry spacing for the desktop app's own web server when its port was
@@ -668,6 +766,7 @@ impl App {
             service_ctl: Arc::new(Mutex::new(ServiceControl::default())),
             web_error: None,
             web_retry_at: Instant::now(),
+            title: "AstralGauge",
         }
     }
 }
@@ -863,6 +962,14 @@ impl eframe::App for App {
             now,
             self.config.poll_ms,
         );
+        // Which limits the pins exceed right now (not judged from missing or
+        // stale readings: the sensor banner covers those).
+        let alert = if sensor_warn.is_none() {
+            alert_summary(&data.sample.pins, &self.config.alerts)
+        } else {
+            None
+        };
+        let power_down = data.power_down.clone();
         let panel_frame =
             egui::Frame::central_panel(ui.style()).inner_margin(egui::Margin::same(14));
         egui::CentralPanel::default()
@@ -915,7 +1022,11 @@ impl eframe::App for App {
                             (Some(_), _) => ("Sensor fault", palette::ORANGE),
                             (None, Some(_)) => ("Stale", palette::ORANGE),
                             (None, None) if data.pins_at.is_none() => ("Starting", palette::DIM),
-                            (None, None) => ("Live", palette::GREEN),
+                            (None, None) => match &alert {
+                                Some((Level::Red, _)) => ("Critical", palette::RED),
+                                Some(_) => ("Warning", palette::YELLOW),
+                                None => ("Live", palette::GREEN),
+                            },
                         };
                         status_pill(ui, text, color);
                         // Who does the monitoring: the background service
@@ -937,6 +1048,17 @@ impl eframe::App for App {
                 ui.add_space(6.0);
                 if let Some(link) = &service_link {
                     service_banner(ui, link);
+                    ui.add_space(6.0);
+                }
+
+                // Live alert state and the automatic power-down: the first
+                // things in the window while they apply.
+                if let Some((level, why)) = &alert {
+                    level_banner(ui, *level, why);
+                    ui.add_space(6.0);
+                }
+                if let Some(pd) = &power_down {
+                    power_down_banner(ui, pd, &data.sample);
                     ui.add_space(6.0);
                 }
 
@@ -1932,6 +2054,42 @@ Apply the reset with Accept, discard it with Cancel."
         // text (the staleness warning, note expiry) moving when samples
         // stop, plus the critical alert's flash while it shows. Input events
         // (slider drags, checkbox, window moves) still repaint immediately.
+        // A colored edge around the whole window while a limit is exceeded
+        // (purple while only the power-down applies), and the same state in
+        // the window title, so it shows in the taskbar with the window behind
+        // a fullscreen game.
+        let edge = match (&alert, &power_down) {
+            (Some((Level::Red, _)), _) => Some(palette::RED),
+            (Some(_), _) => Some(palette::YELLOW),
+            (None, Some(_)) => Some(palette::PDOWN),
+            (None, None) => None,
+        };
+        if let Some(color) = edge {
+            let rect = ui.ctx().viewport_rect().shrink(2.0);
+            ui.ctx()
+                .layer_painter(egui::LayerId::new(
+                    egui::Order::Foreground,
+                    egui::Id::new("alert_edge"),
+                ))
+                .rect_stroke(
+                    rect,
+                    egui::CornerRadius::same(4),
+                    egui::Stroke::new(4.0, color),
+                    egui::StrokeKind::Inside,
+                );
+        }
+        let title = match (&alert, &power_down) {
+            (Some((Level::Red, _)), _) => "\u{26a0} CRITICAL CURRENT \u{2014} AstralGauge",
+            (Some(_), _) => "\u{26a0} HIGH CURRENT \u{2014} AstralGauge",
+            (None, Some(_)) => "GPU POWERED DOWN \u{2014} AstralGauge",
+            (None, None) => "AstralGauge",
+        };
+        if self.title != title {
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::Title(title.to_owned()));
+            self.title = title;
+        }
+
         let idle_ms = if data.critical_alert {
             self.config.poll_ms.min(ALERT_REPAINT_MS)
         } else {
@@ -2395,7 +2553,41 @@ fn add_metric_graph(
 
 #[cfg(test)]
 mod tests {
-    use super::{reading_text, sensor_warning, ABOUT_TEXT};
+    use super::{alert_summary, reading_text, sensor_warning, ABOUT_TEXT};
+    use crate::alerts::{Level, Settings};
+    use crate::hardware::PinReading;
+
+    #[test]
+    fn alert_summary_names_the_pins_in_the_worst_range() {
+        let s = Settings {
+            yellow_limit_a: 8.0,
+            red_limit_a: 9.2,
+            ..Settings::default()
+        };
+        let pins = |currents: [f64; 6]| -> Vec<PinReading> {
+            currents
+                .iter()
+                .map(|&current| PinReading {
+                    voltage: 12.0,
+                    current,
+                })
+                .collect()
+        };
+        assert_eq!(alert_summary(&pins([7.9; 6]), &s), None);
+        assert_eq!(alert_summary(&[], &s), None);
+        assert_eq!(
+            alert_summary(&pins([7.0, 8.0, 7.0, 8.5, 7.0, 7.0]), &s),
+            Some((
+                Level::Yellow,
+                "pin 1: 8.00 A, pin 3: 8.50 A (warning limit 8.0 A)".to_owned()
+            ))
+        );
+        // Red outranks yellow; only the red pins are named.
+        assert_eq!(
+            alert_summary(&pins([8.5, 9.2, 7.0, 7.0, 7.0, 7.0]), &s),
+            Some((Level::Red, "pin 1: 9.20 A (red limit 9.2 A)".to_owned()))
+        );
+    }
 
     #[test]
     fn sensor_warning_covers_faults_and_staleness() {

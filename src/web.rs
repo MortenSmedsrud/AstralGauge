@@ -108,6 +108,23 @@ pub(crate) struct WebData {
     /// desktop app without a background service). The desktop app only
     /// runs its own web server then; with a service the service serves it.
     pub(crate) local_monitor: bool,
+    /// Set while the automatic power limit has the GPU powered down (the
+    /// limit lowered by an alert and not restored yet). Published by the
+    /// poller after every sample; shown as a banner in both UIs.
+    pub(crate) power_down: Option<PowerDown>,
+}
+
+/// The automatic power limit's lowering in effect (see
+/// [`WebData::power_down`]).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct PowerDown {
+    /// The limit (W) that comes back when it restores.
+    pub(crate) saved_w: u32,
+    /// The current (A) the pins must stay below for the restore.
+    pub(crate) trigger_a: f64,
+    /// Seconds until the restore; `None` while the current is still at or
+    /// above the trigger (the countdown has not started).
+    pub(crate) restore_in: Option<f64>,
 }
 
 /// What a desktop app showing a background service's data knows about it
@@ -150,6 +167,7 @@ impl WebData {
             service_mode: false,
             service_link: None,
             local_monitor: false,
+            power_down: None,
         };
         // Pre-reserve history for the default 1 Hz sample rate so the common
         // case never reallocates; a faster slider setting just grows the vecs.
@@ -429,6 +447,18 @@ fn web_json(data: &WebData, window_secs: f64) -> String {
     out.push_str(if data.show_graphs { "true" } else { "false" });
     out.push_str(",\"critical_alert\":");
     out.push_str(if data.critical_alert { "true" } else { "false" });
+    out.push_str(",\"power_down\":");
+    match &data.power_down {
+        Some(pd) => {
+            out.push_str(&format!(
+                "{{\"saved\":{},\"trigger\":{:.1},\"restore_in\":",
+                pd.saved_w, pd.trigger_a
+            ));
+            json_opt_f(&mut out, pd.restore_in, 0);
+            out.push('}');
+        }
+        None => out.push_str("null"),
+    }
     out.push_str(",\"service\":");
     out.push_str(if data.service_mode { "true" } else { "false" });
     out.push_str(",\"safeguard\":");
@@ -622,7 +652,7 @@ const INDEX_HTML: &str = r###"<!DOCTYPE html>
     --bg: #0e1014; --card: #171a20; --card-stroke: #242830; --tile: #1e2229; --plot: #111318;
     --track: #2a2f38; --text: #e6e9ee; --dim: #8b93a0; --accent: #60a5fa;
     --green: #4ade80; --yellow: #facc15; --red: #ef4444; --orange: #fb923c;
-    --power: #fbb03b; --temp: #f87171; --vram: #81b2fa;
+    --power: #fbb03b; --temp: #f87171; --vram: #81b2fa; --pdown: #c084fc;
   }
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--text); font-family: system-ui, -apple-system, 'Segoe UI', sans-serif; font-size: 14px; }
@@ -640,6 +670,17 @@ const INDEX_HTML: &str = r###"<!DOCTYPE html>
   .banner.alert { background: #991b1b; border: 1px solid var(--red); color: #fff; font-size: 15px; animation: blink 1s step-end infinite; }
   .banner.warn { background: #3a240e; border: 1px solid var(--orange); color: #fdba74; }
   @keyframes blink { 50% { background: #451212; } }
+  .banner.red { background: #451212; border: 1px solid var(--red); color: #fecaca; font-size: 15px; }
+  .banner.yellow { background: #423408; border: 1px solid var(--yellow); color: #fde68a; font-size: 15px; }
+  .banner.pdown { background: #2e1a4a; border: 1px solid var(--pdown); color: #e9d5ff; }
+  .banner .bdot { width: 9px; height: 9px; border-radius: 50%; background: currentColor; flex: none; }
+  .banner .why { font-weight: 400; opacity: .85; }
+  .pill.yel { color: var(--yellow); background: rgba(250,204,21,.15); }
+  .pill.crit { color: var(--red); background: rgba(239,68,68,.18); }
+  /* Colored edge around the whole page while a limit is exceeded. */
+  #edge { position: fixed; inset: 0; pointer-events: none; border: 4px solid transparent; border-radius: 6px; z-index: 10; }
+  #edge.yellow { border-color: var(--yellow); }
+  #edge.red { border-color: var(--red); }
   button { font: inherit; font-size: 13px; color: var(--text); background: #262b34; border: 1px solid #303640; border-radius: 4px; padding: 3px 10px; cursor: pointer; }
   button:hover { background: #323844; border-color: #464e5c; }
   .card { background: var(--card); border: 1px solid var(--card-stroke); border-radius: 10px; padding: 12px; min-width: 0; }
@@ -687,6 +728,7 @@ const INDEX_HTML: &str = r###"<!DOCTYPE html>
 </style>
 </head>
 <body>
+<div id="edge"></div>
 <div class="wrap">
   <div class="top">
     <span class="title">AstralGauge</span>
@@ -694,6 +736,8 @@ const INDEX_HTML: &str = r###"<!DOCTYPE html>
     <span class="pill" id="status"><i></i><span>Starting</span></span>
     <span class="svc" id="svc" title="Served by the AstralGauge background service (astral-gauge.service)">Service</span>
   </div>
+  <div class="banner" id="level"></div>
+  <div class="banner pdown" id="pdown"></div>
   <div class="banner alert" id="alert"><span>⚠ ALERT: critical current detected! Please check your GPU power cables!</span><button id="ackbtn" type="button">Acknowledge</button></div>
   <div class="banner warn" id="sensor"></div>
   <div class="stats">
@@ -1057,6 +1101,19 @@ document.getElementById('ackbtn').addEventListener('click', function () {
 // Mirrors web::stale_after_secs: three sample intervals, at least 3 s.
 function staleAfter(pollMs) { return Math.max(3 * pollMs / 1000, 3); }
 
+// The pins at or above the yellow / red limits, for the alert banner
+// (mirrors ui::alert_summary). null while every pin is green.
+function alertLevel(pins) {
+  const red = [], yellow = [];
+  pins.forEach(function (p, i) {
+    const t = 'pin ' + i + ': ' + p[1].toFixed(2) + ' A';
+    if (p[1] >= limits[1]) red.push(t); else if (p[1] >= limits[0]) yellow.push(t);
+  });
+  if (red.length) return { cls: 'red', title: 'CRITICAL CURRENT', why: red.join(', ') + ' (red limit ' + limits[1].toFixed(1) + ' A)' };
+  if (yellow.length) return { cls: 'yellow', title: 'HIGH CURRENT', why: yellow.join(', ') + ' (warning limit ' + limits[0].toFixed(1) + ' A)' };
+  return null;
+}
+
 function setStatus(text, cls) {
   const st = document.getElementById('status');
   st.className = 'pill' + (cls ? ' ' + cls : '');
@@ -1096,6 +1153,43 @@ function render(d) {
   }
   sensorEl.textContent = sensorMsg;
   sensorEl.style.display = sensorMsg ? 'flex' : 'none';
+
+  // Live alert state (mirrors ui.rs): which pins are in the yellow / red
+  // range right now, as a banner, the status pill, a colored page edge and
+  // the tab title. Not while the readings are missing or stale.
+  const lvl = (!sensorMsg && pinsOk) ? alertLevel(s.pins) : null;
+  const levelEl = document.getElementById('level');
+  levelEl.replaceChildren();
+  if (lvl) {
+    levelEl.className = 'banner ' + lvl.cls;
+    levelEl.appendChild(el('span', 'bdot'));
+    levelEl.appendChild(el('span', '', lvl.title));
+    levelEl.appendChild(el('span', 'why', lvl.why));
+    levelEl.style.display = 'flex';
+    setStatus(lvl.cls === 'red' ? 'Critical' : 'Warning', lvl.cls === 'red' ? 'crit' : 'yel');
+  } else {
+    levelEl.style.display = 'none';
+  }
+  document.getElementById('edge').className = lvl ? lvl.cls : '';
+
+  // GPU powered down by the automatic power limit.
+  const pd = d.power_down;
+  const pdEl = document.getElementById('pdown');
+  pdEl.replaceChildren();
+  if (pd) {
+    const applied = s.limit_w != null && s.limit_min_w != null && s.limit_w <= s.limit_min_w;
+    pdEl.appendChild(el('span', 'bdot'));
+    pdEl.appendChild(el('span', '', applied
+      ? 'GPU POWERED DOWN — power limit at the ' + s.limit_w + ' W minimum (normally ' + pd.saved + ' W)'
+      : 'POWERING DOWN — lowering the power limit (normally ' + pd.saved + ' W) to its minimum…'));
+    pdEl.appendChild(el('span', 'why', pd.restore_in != null
+      ? 'Restores to ' + pd.saved + ' W in ' + Math.ceil(pd.restore_in) + ' s.'
+      : 'Restores 30 s after every pin is back below ' + pd.trigger.toFixed(1) + ' A.'));
+    pdEl.style.display = 'flex';
+  } else {
+    pdEl.style.display = 'none';
+  }
+  document.title = (lvl ? '⚠ ' + lvl.title + ' — ' : pd ? 'GPU POWERED DOWN — ' : '') + 'AstralGauge';
 
   // Summary cards. Total power prefers NVML and falls back to the sum of
   // the pins' V*A.
@@ -1320,6 +1414,7 @@ mod tests {
         assert!(json.contains("\"critical_alert\":true"));
         assert!(json.contains("\"safeguard\":false"));
         assert!(json.contains("\"service\":false"));
+        assert!(json.contains("\"power_down\":null"));
         assert!(json.contains("\"sensor_error\":null"));
         assert!(json.contains("\"pins_age\":null"));
         assert!(json.contains("\"poll_ms\":1000"));
