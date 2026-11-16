@@ -375,10 +375,13 @@ Optional (`Settings::auto_min_power` = Off / On yellow / On red):
   (byte-reads take the GPU's I2C bus lock and can stutter games); the
   byte-read fallback exists for kernels without block support and for
   probing.
-- Every polled reading passes `check_plausible` (≤ 50 A, ≤ 20 V per pin):
-  an impossible value (e.g. an all-ones register, 65.535) is a sensor fault,
-  never a red current, so a glitch cannot kill a process. The ceiling is far
-  above real failures (~20–25 A on a melting pin) — don't lower it.
+- Every polled reading passes `check_plausible`, which only rejects
+  recognizable glitches as sensor faults: an all-ones register (65.535 A or
+  V), or pins totalling more than `BOARD_POWER_FACTOR` (2) x NVML board power
+  + `BOARD_POWER_MARGIN_W` (100 W; NVML averages, the pins are
+  instantaneous). There is deliberately **no fixed current ceiling**: one pin
+  carrying the whole card's power is the failure this app exists for. High
+  readings consistent with NVML, or without NVML data, count as real.
 - Rail→pin mapping is reversed: rail `r` at offset `r*4` maps to pin
   `NUM_PINS - 1 - r` (see `read_pins`).
 

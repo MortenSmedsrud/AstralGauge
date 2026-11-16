@@ -39,14 +39,26 @@ const TOTAL_BYTES: usize = NUM_PINS * BYTES_PER_PIN;
 const VOLTAGE_SANITY_MIN: u32 = 10_000;
 const VOLTAGE_SANITY_MAX: u32 = 14_000;
 
-// Plausibility bounds for every polled pin reading. Beyond them the reading
-// is treated as a sensor fault, never as a real current: a glitched or torn
-// transfer (an all-ones register reads 65.535) must not trigger the red
-// alert, the automatic power limit or the kill safeguard. Both sit far above
-// anything a 12 V-2x6 pin can carry for long (a melting pin has been measured
-// at ~20-25 A); the ceiling is not a lower threshold for real faults.
-const MAX_PLAUSIBLE_CURRENT_A: f64 = 50.0;
-const MAX_PLAUSIBLE_VOLTAGE_V: f64 = 20.0;
+// Glitch detection for every polled pin reading (see `check_plausible`).
+// There is deliberately no fixed current ceiling: one pin carrying (nearly)
+// the whole card's power is exactly the failure this app exists for, and
+// the register can report up to 65.535 A. A reading is only rejected when
+// it is recognizably not a measurement:
+//
+// - The all-ones register value (0xFFFF = 65.535), the classic failed or
+//   torn transfer, in a current or a voltage.
+// - The pins together claiming far more power than NVML says the whole
+//   board draws. The 12 V-2x6 pins are a subset of the board's input (the
+//   PCIe slot adds the rest), so their sum cannot really exceed it — but
+//   NVML averages (about 1 s on current GPUs) while the pins are sampled
+//   instantaneously, so load transients get generous headroom: the sum may
+//   reach `BOARD_POWER_FACTOR` x NVML power + `BOARD_POWER_MARGIN_W`.
+//   A real single-pin overload keeps the sum in line with NVML and passes.
+//   Without NVML power there is nothing to compare against and the reading
+//   counts as real (a false alarm beats a missed overload).
+const ALL_ONES_READING: f64 = u16::MAX as f64 / 1000.0;
+const BOARD_POWER_FACTOR: f64 = 2.0;
+const BOARD_POWER_MARGIN_W: f64 = 100.0;
 
 // Linux i2c-dev ioctl constants
 const I2C_SLAVE: libc::c_ulong = 0x0703;
@@ -545,7 +557,7 @@ pub(crate) fn spawn_poller(
                         }
                     }
                     read.map_err(|e| format!("I2C read failed: {e}"))
-                        .and_then(|pins| check_plausible(&pins).map(|()| pins))
+                        .and_then(|pins| check_plausible(&pins, power_w).map(|()| pins))
                 }
                 Err(reason) => Err(reason.clone()),
             };
@@ -799,17 +811,27 @@ pub(crate) fn spawn_poller(
     cmd_tx
 }
 
-/// Reject physically impossible pin readings (see
-/// [`MAX_PLAUSIBLE_CURRENT_A`]): `Err` names the first offending pin and is
-/// reported as a sensor fault instead of being judged against the limits.
-fn check_plausible(pins: &[PinReading]) -> Result<(), String> {
+/// Reject pin readings that are recognizably glitches rather than
+/// measurements (see [`ALL_ONES_READING`] and the board-power cross-check
+/// above it); `board_power_w` is NVML's total board power for the same poll.
+/// `Err` describes the glitch and is reported as a sensor fault instead of
+/// being judged against the limits. High but consistent currents always
+/// pass: they must reach the red alert and the safeguard.
+fn check_plausible(pins: &[PinReading], board_power_w: Option<f64>) -> Result<(), String> {
     for (i, p) in pins.iter().enumerate() {
-        let ok = (0.0..=MAX_PLAUSIBLE_CURRENT_A).contains(&p.current)
-            && (0.0..=MAX_PLAUSIBLE_VOLTAGE_V).contains(&p.voltage);
-        if !ok {
+        if p.current == ALL_ONES_READING || p.voltage == ALL_ONES_READING {
             return Err(format!(
-                "Implausible sensor reading (pin {i}: {:.3} V, {:.3} A)",
+                "Glitched sensor reading (pin {i}: {:.3} V, {:.3} A, an all-ones register)",
                 p.voltage, p.current
+            ));
+        }
+    }
+    if let Some(board_w) = board_power_w {
+        let pins_w: f64 = pins.iter().map(|p| p.voltage * p.current).sum();
+        if pins_w > board_w * BOARD_POWER_FACTOR + BOARD_POWER_MARGIN_W {
+            return Err(format!(
+                "Implausible sensor reading (pins total {pins_w:.0} W while the GPU reports \
+                 {board_w:.0} W)"
             ));
         }
     }
@@ -1572,18 +1594,41 @@ mod tests {
     #[test]
     fn implausible_readings_are_sensor_faults() {
         let pin = |voltage: f64, current: f64| PinReading { voltage, current };
-        let mut pins = vec![pin(12.1, 8.4); NUM_PINS];
-        assert!(check_plausible(&pins).is_ok());
-        // A genuinely dangerous but physical current is a reading, not a
-        // fault: it must reach the red alert and the safeguard.
-        pins[2] = pin(11.9, 25.0);
-        assert!(check_plausible(&pins).is_ok());
-        // An all-ones register (65.535) in either field is a glitch.
-        pins[2] = pin(12.1, 65.535);
-        let err = check_plausible(&pins).unwrap_err();
-        assert!(err.contains("pin 2"), "{err}");
-        pins[2] = pin(65.535, 8.4);
-        assert!(check_plausible(&pins).is_err());
+        // Full load (~610 W on the pins) with NVML agreeing: fine.
+        let full = vec![pin(12.1, 8.4); NUM_PINS];
+        assert!(check_plausible(&full, Some(600.0)).is_ok());
+
+        // The failure this app is for: nearly the whole card through one
+        // pin (50 A, others almost disconnected). The sum still matches the
+        // board power, so it is a real reading, whatever the current.
+        let mut one_pin = vec![pin(12.0, 0.5); NUM_PINS];
+        one_pin[2] = pin(11.8, 50.0);
+        assert!(check_plausible(&one_pin, Some(620.0)).is_ok());
+        // Without NVML power there is nothing to compare: counts as real.
+        assert!(check_plausible(&one_pin, None).is_ok());
+
+        // The same 50 A on one pin while the rest show a 250 W load and NVML
+        // says 250 W: ~800 W on the pins is a glitch, not a measurement.
+        let mut glitch = vec![pin(12.1, 3.5); NUM_PINS];
+        glitch[2] = pin(12.1, 50.0);
+        let err = check_plausible(&glitch, Some(250.0)).unwrap_err();
+        assert!(err.contains("250 W"), "{err}");
+
+        // Load transients: instantaneous pins may run ahead of NVML's
+        // averaged power (here ~610 W on the pins vs 300 W averaged).
+        assert!(check_plausible(&full, Some(300.0)).is_ok());
+
+        // An all-ones register (65.535) in either field is always a glitch,
+        // with or without NVML.
+        let mut ones = full.clone();
+        ones[4] = pin(12.1, 65.535);
+        let err = check_plausible(&ones, None).unwrap_err();
+        assert!(err.contains("pin 4"), "{err}");
+        ones[4] = pin(65.535, 8.4);
+        assert!(check_plausible(&ones, None).is_err());
+        // Just below it is a (dangerous) reading like any other.
+        ones[4] = pin(12.1, 65.534);
+        assert!(check_plausible(&ones, None).is_ok());
     }
 
     #[test]
