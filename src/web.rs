@@ -399,6 +399,12 @@ fn web_json(data: &WebData, window_secs: f64) -> String {
     out.push_str(if data.show_graphs { "true" } else { "false" });
     out.push_str(",\"critical_alert\":");
     out.push_str(if data.critical_alert { "true" } else { "false" });
+    out.push_str(",\"safeguard\":");
+    out.push_str(if data.settings.kill_top_process_on_red {
+        "true"
+    } else {
+        "false"
+    });
     out.push_str(",\"sensor_error\":");
     match &data.sensor_error {
         Some(e) => json_string(&mut out, e),
@@ -578,78 +584,117 @@ const INDEX_HTML: &str = r###"<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>AstralGauge</title>
 <style>
-  :root { color-scheme: dark; }
+  /* Mirrors ui::palette. */
+  :root {
+    color-scheme: dark;
+    --bg: #0e1014; --card: #171a20; --card-stroke: #242830; --tile: #1e2229; --plot: #111318;
+    --track: #2a2f38; --text: #e6e9ee; --dim: #8b93a0; --accent: #60a5fa;
+    --green: #4ade80; --yellow: #facc15; --red: #ef4444; --orange: #fb923c;
+    --power: #fbb03b; --temp: #f87171; --vram: #81b2fa;
+  }
   * { box-sizing: border-box; }
-  body { margin: 0; background: #1e1e1e; color: #d4d4d4; font-family: system-ui, -apple-system, sans-serif; }
-  .wrap { max-width: 1100px; margin: 0 auto; padding: 10px 16px 48px; }
-  h1 { font-size: 22px; margin: 10px 0 6px; }
-  .stats { display: flex; flex-wrap: wrap; gap: 20px; font-size: 17px; font-weight: 600; }
-  #power { font-size: 21px; }
-  #alert { display: none; align-items: center; flex-wrap: wrap; gap: 12px; color: #f03c3c; font-weight: 700; font-size: 16px; animation: blink 1s step-end infinite; }
-  #alert button { background: #4a1414; color: #f0d0d0; border: 1px solid #f03c3c; border-radius: 3px; padding: 4px 14px; font-size: 14px; font-weight: 700; cursor: pointer; }
-  #alert button:hover { background: #5f1a1a; }
-  @keyframes blink { 50% { opacity: 0.15; } }
-  .line { margin: 8px 0; font-size: 14px; }
-  .dim { color: #999; }
-  .tables { display: flex; gap: 48px; margin: 10px 0 4px; }
-  .tables h2 { font-size: 14px; font-weight: 700; margin: 0 0 4px; }
-  table { border-collapse: collapse; }
-  td { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; padding: 1px 16px 1px 0; white-space: pre; }
-  .g { color: #50dc50; }
-  .y { color: #f0d228; }
-  .r { color: #f03c3c; }
-  .legend { font-size: 12px; margin: 2px 0 10px; }
-  .legend span { margin-right: 14px; }
-  .graph-title { font-weight: 700; margin: 14px 0 6px; }
-  .windows { margin: 0 0 8px; }
-  .windows button { background: #2b2b2b; color: #8a8a8a; border: 1px solid #3d3d3d; border-radius: 3px; padding: 3px 12px; margin-right: 4px; font-size: 13px; cursor: pointer; }
-  .windows button:hover { background: #343434; }
-  .windows button.on { color: #78beff; font-weight: 700; border-color: #78beff; }
-  .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+  body { margin: 0; background: var(--bg); color: var(--text); font-family: system-ui, -apple-system, 'Segoe UI', sans-serif; font-size: 14px; }
+  .wrap { max-width: 1100px; margin: 0 auto; padding: 16px 16px 40px; display: flex; flex-direction: column; gap: 10px; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  .top { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .title { font-size: 21px; font-weight: 700; }
+  .sub { color: var(--dim); font-size: 13px; }
+  .pill { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; color: var(--dim); background: rgba(139,147,160,.15); }
+  .pill i { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+  .pill.live { color: var(--green); background: rgba(74,222,128,.15); }
+  .pill.warn { color: var(--orange); background: rgba(251,146,60,.15); }
+  .banner { display: none; align-items: center; flex-wrap: wrap; gap: 12px; padding: 9px 12px; border-radius: 10px; font-weight: 700; }
+  .banner.alert { background: #991b1b; border: 1px solid var(--red); color: #fff; font-size: 15px; animation: blink 1s step-end infinite; }
+  .banner.warn { background: #3a240e; border: 1px solid var(--orange); color: #fdba74; }
+  @keyframes blink { 50% { background: #451212; } }
+  button { font: inherit; font-size: 13px; color: var(--text); background: #262b34; border: 1px solid #303640; border-radius: 4px; padding: 3px 10px; cursor: pointer; }
+  button:hover { background: #323844; border-color: #464e5c; }
+  .card { background: var(--card); border: 1px solid var(--card-stroke); border-radius: 10px; padding: 12px; min-width: 0; }
+  .head { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; flex-wrap: wrap; }
+  .cap { font-size: 11px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; color: var(--dim); }
+  .head > :last-child { margin-left: auto; }
+  .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+  .big { font-size: 26px; font-weight: 600; margin: 2px 0 6px; font-variant-numeric: tabular-nums; }
+  .big small { font-size: 14px; font-weight: 400; color: var(--dim); margin-left: 4px; }
+  .foot { font-size: 12px; color: var(--dim); margin-top: 6px; }
+  .meter { position: relative; height: 6px; border-radius: 3px; background: var(--track); }
+  .meter b { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 3px; min-width: 6px; }
+  .meter b.none { display: none; }
+  .meter i { position: absolute; top: -2px; bottom: -2px; width: 2px; margin-left: -1px; box-shadow: 0 0 0 1px var(--tile); }
+  .legend { display: flex; gap: 12px; font-size: 11px; }
+  .dot::before { content: ''; display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: currentColor; margin-right: 5px; }
+  .pins { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+  .tile { background: var(--tile); border-radius: 8px; padding: 8px 10px; }
+  .tile.y { background: #342e14; }
+  .tile.r { background: #40181b; }
+  .tile .th { display: flex; justify-content: space-between; }
+  .tile .big { font-size: 22px; }
+  .proc { display: grid; grid-template-columns: minmax(0, 1fr) 80px 48px 84px; gap: 12px; align-items: center; height: 22px; font-size: 13px; }
+  .proc .name { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+  .proc .pct { color: var(--dim); text-align: right; font-size: 12px; }
+  .proc .mem { text-align: right; font-size: 12px; }
+  .tag { font-size: 10px; color: var(--red); background: rgba(239,68,68,.18); border-radius: 4px; padding: 1px 4px; margin-left: 8px; }
+  .armed { font-size: 11px; color: var(--red); display: none; }
+  .seg { display: flex; gap: 4px; flex-wrap: wrap; }
+  .seg button { background: transparent; border-color: transparent; color: var(--text); }
+  .seg button:hover { background: #262b34; }
+  .seg button.on { background: #2563eb; color: #fff; }
+  .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
   .cell { min-width: 0; }
-  .name { font-weight: 700; font-size: 13px; margin-bottom: 2px; }
-  canvas { display: block; width: 100%; height: 150px; background: #232323; border: 1px solid #3a3a3a; }
-  #err { display: none; color: #f03c3c; margin-top: 12px; }
-  #sensor { display: none; color: #f0a028; font-weight: 700; font-size: 15px; margin: 6px 0; }
-  @media (max-width: 800px) { .grid { grid-template-columns: repeat(2, 1fr); } .tables { gap: 24px; } }
+  .gt { display: flex; justify-content: space-between; font-size: 12px; color: var(--dim); margin-bottom: 3px; }
+  .gt span:last-child { font-weight: 600; }
+  canvas { display: block; width: 100%; height: 120px; background: var(--plot); border-radius: 6px; }
+  .dim { color: var(--dim); }
+  #err { display: none; color: var(--red); }
+  @media (max-width: 760px) {
+    .stats { grid-template-columns: 1fr; }
+    .pins, .grid { grid-template-columns: repeat(2, 1fr); }
+  }
+  @media (max-width: 420px) { .grid { grid-template-columns: 1fr; } }
 </style>
 </head>
 <body>
 <div class="wrap">
-  <h1>ASUS 5090 ROG Astral</h1>
+  <div class="top">
+    <span class="title">AstralGauge</span>
+    <span class="sub">ASUS RTX 5090 ROG Astral</span>
+    <span class="pill" id="status"><i></i><span>Starting</span></span>
+  </div>
+  <div class="banner alert" id="alert"><span>⚠ ALERT: critical current detected! Please check your GPU power cables!</span><button id="ackbtn" type="button">Acknowledge</button></div>
+  <div class="banner warn" id="sensor"></div>
   <div class="stats">
-    <span id="power">Total power: …</span>
-    <span id="alert"><span>⚠ ALERT: critical current detected! Please check your GPU power cables!</span><button id="ackbtn" type="button">Acknowledge</button></span>
-    <span id="temp"></span>
-    <span id="vram"></span>
-  </div>
-  <div id="sensor"></div>
-  <div id="limit" class="line"></div>
-  <div id="interval" class="line dim"></div>
-  <div class="tables">
-    <div>
-      <h2>Voltage (V)</h2>
-      <table id="volt"></table>
+    <div class="card">
+      <div class="cap" id="powercap">Board power</div>
+      <div class="big"><span id="power">—</span><small>W</small></div>
+      <div class="meter"><b id="powerbar" style="background: var(--power)"></b></div>
+      <div class="foot" id="limit"></div>
     </div>
-    <div>
-      <h2>Current (A)</h2>
-      <table id="curr"></table>
+    <div class="card">
+      <div class="cap">GPU temperature</div>
+      <div class="big"><span id="temp">—</span><small>°C</small></div>
+      <div class="meter"><b id="tempbar" style="background: var(--temp)"></b></div>
+      <div class="foot" id="tempfoot"></div>
     </div>
-  </div>
-  <div class="legend" id="legend">
-    <span class="r">● &gt; 10A</span><span class="y">● 9.2–10A</span><span class="g">● &lt; 9.2A</span>
-  </div>
-  <div class="tables" id="procs">
-    <div>
-      <h2>Top GPU processes</h2>
-      <table id="proctab"></table>
+    <div class="card">
+      <div class="cap">VRAM</div>
+      <div class="big"><span id="vram">—</span><small>GB</small></div>
+      <div class="meter"><b id="vrambar" style="background: var(--vram)"></b></div>
+      <div class="foot" id="vramfoot"></div>
     </div>
   </div>
-  <div id="graphs">
-    <div class="graph-title">Current and GPU metrics over time</div>
-    <div class="windows" id="windows"></div>
+  <div class="card">
+    <div class="head"><span class="cap">Connector pins</span><span class="legend" id="legend"></span></div>
+    <div class="pins" id="pins"></div>
+  </div>
+  <div class="card">
+    <div class="head"><span class="cap">Top GPU processes</span><span class="armed" id="armed" title="On a red current, the first process in this list is killed">kill safeguard armed</span></div>
+    <div id="procs"></div>
+  </div>
+  <div class="card" id="graphs">
+    <div class="head"><span class="cap">History</span><div class="seg" id="windows"></div></div>
     <div class="grid" id="grid"></div>
   </div>
+  <div class="foot" id="interval"></div>
   <div id="err"></div>
 </div>
 <script>
@@ -660,11 +705,21 @@ let windowMin = 1;
 // [yellow, red] current limits (A); updated from the settings dialog.
 let limits = [9.2, 10.0];
 
+// Mirrors ui::palette, as [r, g, b] for canvas drawing.
+const C = {
+  plot: [17, 19, 24], track: [42, 47, 56], text: [230, 233, 238], dim: [139, 147, 160],
+  stroke: [36, 40, 48], tile: [30, 34, 41],
+  green: [74, 222, 128], yellow: [250, 204, 21], red: [239, 68, 68],
+  power: [251, 176, 59], temp: [248, 113, 113], vram: [129, 178, 250]
+};
+function rgba(c, a) { return 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + (a == null ? 1 : a) + ')'; }
+
 const winsEl = document.getElementById('windows');
 HORIZONS.forEach(function (m) {
   const b = document.createElement('button');
+  b.type = 'button';
   b.textContent = m + 'm';
-  b.addEventListener('click', function () { windowMin = m; syncWindowButtons(); });
+  b.addEventListener('click', function () { windowMin = m; syncWindowButtons(); tick(); });
   winsEl.appendChild(b);
 });
 function syncWindowButtons() {
@@ -674,25 +729,65 @@ function syncWindowButtons() {
 }
 syncWindowButtons();
 
-const NAMES = ['Pin 0', 'Pin 1', 'Pin 2', 'Pin 3', 'Pin 4', 'Pin 5', 'Power (W)', 'Temp (°C)', 'VRAM (GB)'];
-const METRIC_COLORS = { 6: '#ffa500', 7: '#ff5a46', 8: '#8cbefe' };
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text != null) e.textContent = text;
+  return e;
+}
+
+// Pin tiles: pin number + voltage, current, meter with the limits marked.
+const pinsEl = document.getElementById('pins');
+const tiles = [];
+for (let i = 0; i < 6; i++) {
+  const tile = el('div', 'tile');
+  const th = el('div', 'th');
+  th.appendChild(el('span', 'cap', 'Pin ' + i));
+  const volt = el('span', 'foot', '— V');
+  volt.style.marginTop = '0';
+  th.appendChild(volt);
+  const big = el('div', 'big');
+  const cur = el('span', null, '—');
+  big.appendChild(cur);
+  big.appendChild(el('small', null, 'A'));
+  const meter = el('div', 'meter');
+  const bar = el('b');
+  const ty = el('i');
+  const tr = el('i');
+  ty.style.background = rgba(C.yellow);
+  tr.style.background = rgba(C.red);
+  meter.appendChild(bar);
+  meter.appendChild(ty);
+  meter.appendChild(tr);
+  tile.appendChild(th);
+  tile.appendChild(big);
+  tile.appendChild(meter);
+  pinsEl.appendChild(tile);
+  tiles.push({ tile: tile, volt: volt, cur: cur, bar: bar, ty: ty, tr: tr });
+}
+
+const NAMES = ['Pin 0', 'Pin 1', 'Pin 2', 'Pin 3', 'Pin 4', 'Pin 5', 'Power', 'Temperature', 'VRAM'];
+const METRIC_COLORS = { 6: C.power, 7: C.temp, 8: C.vram };
+const UNITS = ['A', 'A', 'A', 'A', 'A', 'A', 'W', '°C', 'GB'];
 const grid = document.getElementById('grid');
 const canvases = [];
+const graphValues = [];
 // Last mouse position per canvas (CSS px, null when the pointer is away).
 const hoverPos = new Array(NAMES.length).fill(null);
 // Latest drawGraph arguments, so mouse moves can redraw between polls.
 const drawArgs = new Array(NAMES.length).fill(null);
 NAMES.forEach(function (n, i) {
-  const cell = document.createElement('div');
-  cell.className = 'cell';
-  const label = document.createElement('div');
-  label.className = 'name';
-  label.textContent = n;
+  const cell = el('div', 'cell');
+  const title = el('div', 'gt');
+  title.appendChild(el('span', null, n));
+  const value = el('span', 'mono');
+  title.appendChild(value);
   const cv = document.createElement('canvas');
-  cell.appendChild(label);
+  cell.appendChild(title);
   cell.appendChild(cv);
   grid.appendChild(cell);
   canvases.push(cv);
+  graphValues.push(value);
   cv.addEventListener('mousemove', function (e) {
     const r = cv.getBoundingClientRect();
     hoverPos[i] = { x: e.clientX - r.left, y: e.clientY - r.top };
@@ -708,11 +803,12 @@ function redrawGraph(i) {
   if (a) drawGraph(canvases[i], a[0], a[1], a[2], a[3], a[4]);
 }
 
-function currentColor(v) {
-  if (v < limits[0]) return '#50dc50';
-  if (v < limits[1]) return '#f0d228';
-  return '#f03c3c';
+function currentRgb(v) {
+  if (v < limits[0]) return C.green;
+  if (v < limits[1]) return C.yellow;
+  return C.red;
 }
+function currentColor(v) { return rgba(currentRgb(v)); }
 
 // M4 downsampling, mirroring web::m4_downsample: per time bucket of
 // `bucket` seconds (aligned to absolute time), keep the first, min, max and
@@ -757,10 +853,22 @@ function drawGraph(cv, pts, now, win, fixedMax, idx) {
   const vis = pts.slice(k);
   const n = vis.length;
 
-  let yMax;
+  // Newest value in the title row.
+  const valEl = graphValues[idx];
+  if (n > 0) {
+    const v = vis[n - 1][1];
+    valEl.textContent = v.toFixed(idx === 7 ? 0 : (isPin ? 2 : 1)) + ' ' + UNITS[idx];
+    valEl.style.color = isPin ? currentColor(v) : rgba(METRIC_COLORS[idx]);
+  } else {
+    valEl.textContent = '';
+  }
+
+  let yMax, baseMax = 0;
   if (isPin) {
-    // keep the limit lines visible, grow the scale for spikes
-    yMax = limits[1] * 1.1;
+    // keep the limit lines visible (30 % headroom above red leaves room for
+    // its label), grow the scale for spikes
+    baseMax = limits[1] * 1.3;
+    yMax = baseMax;
     for (let i = 0; i < n; i++) yMax = Math.max(yMax, vis[i][1] * 1.05);
   } else if (fixedMax && fixedMax > 0) {
     yMax = fixedMax;
@@ -776,46 +884,83 @@ function drawGraph(cv, pts, now, win, fixedMax, idx) {
     return (1 - Math.min(Math.max(v, 0), yMax) / yMax) * h;
   };
 
+  // Faint horizontal grid at the quarters.
+  ctx.strokeStyle = rgba(C.track, 0.6);
+  ctx.lineWidth = 1;
+  for (let i = 1; i < 4; i++) {
+    const y = Math.round(h * i / 4) + 0.5;
+    ctx.beginPath(); ctx.moveTo(4, y); ctx.lineTo(w - 4, y); ctx.stroke();
+  }
+
   ctx.font = '9px monospace';
-  ctx.fillStyle = '#8a8a8a';
-  if (!isPin || yMax > limits[1] * 1.1) ctx.fillText(yMax.toFixed(0), 2, 10);
-  ctx.fillText('0', 2, h - 3);
+  if (!isPin || yMax > baseMax) {
+    ctx.fillStyle = rgba(C.dim);
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+    ctx.fillText(yMax.toFixed(0), 4, 3);
+  }
 
   if (isPin) {
-    const lims = [[limits[0], '#a5964b'], [limits[1], '#af5555']];
+    // Dashed, muted limit lines; the red label above its line, the yellow
+    // one below its own, each on a small backing and kept inside the plot.
+    const lims = [[limits[0], C.yellow, false], [limits[1], C.red, true]];
     for (let i = 0; i < lims.length; i++) {
-      const lim = lims[i][0], col = lims[i][1];
-      const y = yOf(lim);
+      const lim = lims[i][0], col = rgba(lims[i][1], 0.55), above = lims[i][2];
+      const y = Math.round(yOf(lim)) + 0.5;
       ctx.strokeStyle = col;
       ctx.setLineDash([4, 3]);
       ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
       ctx.setLineDash([]);
+      const text = lim.toFixed(1);
+      const tw = ctx.measureText(text).width, th = 9;
+      let top = above ? y - 1 - th : y + 1;
+      top = Math.min(Math.max(top, 2), h - 2 - th);
+      ctx.fillStyle = rgba(C.plot, 0.85);
+      ctx.fillRect(w - 4 - tw - 1, top - 1, tw + 2, th + 2);
       ctx.fillStyle = col;
-      ctx.fillText(String(lim), w - 20, Math.max(y - 3, 9));
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'top';
+      ctx.fillText(text, w - 4 - tw, top);
     }
   }
 
   // Line through one M4 bucket per CSS pixel (time-aligned, so it stays
-  // put while the window slides; spikes always survive). Each segment takes
-  // the color of its end point; runs of one color share a path.
+  // put while the window slides; spikes always survive) over a soft fill.
+  // Each segment takes the color of its end point; runs of one color are
+  // drawn (and filled) as one path.
   const line = m4(vis, win / w);
-  if (line.length >= 2) {
-    ctx.lineWidth = isPin ? 1 : 1.5;
+  const fillAlpha = isPin ? 0.16 : 0.22;
+  function drawRun(run, c) {
+    if (run.length < 2) return;
+    const grad = ctx.createLinearGradient(0, 0, 0, h);
+    grad.addColorStop(0, rgba(c, fillAlpha));
+    grad.addColorStop(1, rgba(c, 0));
+    ctx.beginPath();
+    ctx.moveTo(run[0][0], h);
+    for (const p of run) ctx.lineTo(p[0], p[1]);
+    ctx.lineTo(run[run.length - 1][0], h);
+    ctx.closePath();
+    ctx.fillStyle = grad;
+    ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(run[0][0], run[0][1]);
+    for (let i = 1; i < run.length; i++) ctx.lineTo(run[i][0], run[i][1]);
+    ctx.strokeStyle = rgba(c);
+    ctx.lineWidth = 1.5;
     ctx.lineJoin = 'round';
-    let col = null;
-    for (let j = 1; j < line.length; j++) {
-      const c = isPin ? currentColor(line[j][1]) : METRIC_COLORS[idx];
-      if (c !== col) {
-        if (col !== null) ctx.stroke();
-        col = c;
-        ctx.strokeStyle = c;
-        ctx.beginPath();
-        ctx.moveTo(xOf(line[j - 1][0]), yOf(line[j - 1][1]));
-      }
-      ctx.lineTo(xOf(line[j][0]), yOf(line[j][1]));
-    }
     ctx.stroke();
   }
+  let run = [], col = null;
+  for (let j = 1; j < line.length; j++) {
+    const c = isPin ? currentRgb(line[j][1]) : METRIC_COLORS[idx];
+    if (c !== col) {
+      drawRun(run, col);
+      run = [[xOf(line[j - 1][0]), yOf(line[j - 1][1])]];
+      col = c;
+    }
+    run.push([xOf(line[j][0]), yOf(line[j][1])]);
+  }
+  drawRun(run, col);
 
   // Hover readout, drawn last so it sits above the lines.
   drawHover(ctx, w, h, vis, t0, win, xOf, yOf, idx);
@@ -839,30 +984,32 @@ function drawHover(ctx, w, h, vis, t0, win, xOf, yOf, idx) {
   const x = xOf(p[0]);
   const y = yOf(p[1]);
 
-  ctx.strokeStyle = '#565656';
+  ctx.strokeStyle = rgba(C.dim, 0.4);
   ctx.lineWidth = 1;
   ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke();
 
-  ctx.fillStyle = idx < 6 ? currentColor(p[1]) : METRIC_COLORS[idx];
-  ctx.beginPath(); ctx.arc(x, y, 3, 0, Math.PI * 2); ctx.fill();
-  ctx.strokeStyle = '#232323';
+  ctx.fillStyle = idx < 6 ? currentColor(p[1]) : rgba(METRIC_COLORS[idx]);
+  ctx.beginPath(); ctx.arc(x, y, 3.5, 0, Math.PI * 2); ctx.fill();
+  ctx.strokeStyle = rgba(C.plot);
+  ctx.lineWidth = 1.5;
   ctx.stroke();
 
-  const unit = idx < 6 ? 'A' : ['W', '°C', 'GB'][idx - 6];
-  const label = p[1].toFixed(2) + ' ' + unit;
+  const label = p[1].toFixed(2) + ' ' + UNITS[idx];
   ctx.font = '11px monospace';
   const lw = ctx.measureText(label).width;
-  let lx = x + 6;
-  if (lx + lw > w - 2) lx = Math.max(x - lw - 6, 1);
-  ctx.fillStyle = '#232323';
-  ctx.fillRect(lx - 1, 1, lw + 2, 14);
-  ctx.fillStyle = '#f0f0f0';
-  ctx.fillText(label, lx, 12);
-}
-
-function pinLabel(pin, value) {
-  const v = value == null ? '\u2014' : value.toFixed(3);
-  return 'Pin ' + String(pin).padStart(2) + ': ' + v.padStart(7);
+  let lx = x + 8;
+  if (lx + lw + 8 > w - 2) lx = Math.max(x - lw - 16, 2);
+  ctx.fillStyle = rgba(C.tile);
+  ctx.strokeStyle = rgba(C.stroke);
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  if (ctx.roundRect) ctx.roundRect(lx, 4, lw + 8, 17, 4); else ctx.rect(lx, 4, lw + 8, 17);
+  ctx.fill();
+  ctx.stroke();
+  ctx.fillStyle = rgba(C.text);
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'top';
+  ctx.fillText(label, lx + 4, 7);
 }
 
 // Latching critical-current alert: shown while the poller has it armed,
@@ -876,101 +1023,125 @@ document.getElementById('ackbtn').addEventListener('click', function () {
 // Mirrors web::stale_after_secs: three sample intervals, at least 3 s.
 function staleAfter(pollMs) { return Math.max(3 * pollMs / 1000, 3); }
 
+function setStatus(text, cls) {
+  const st = document.getElementById('status');
+  st.className = 'pill' + (cls ? ' ' + cls : '');
+  st.lastChild.textContent = text;
+}
+
+function setMeter(bar, frac) {
+  if (frac == null || !isFinite(frac)) { bar.classList.add('none'); return; }
+  bar.classList.remove('none');
+  bar.style.width = (Math.min(Math.max(frac, 0), 1) * 100) + '%';
+}
+
 function render(d) {
   const s = d.sample;
   const pinsOk = s.pins.length === 6;
+  if (d.limits) limits = d.limits;
 
-  alertEl.style.display = d.critical_alert ? 'inline-flex' : 'none';
+  alertEl.style.display = d.critical_alert ? 'flex' : 'none';
 
   // Sensor fault / stale readings: the pin currents are not being checked.
   const sensorEl = document.getElementById('sensor');
   let sensorMsg = '';
+  const stale = d.pins_age == null ? d.now > staleAfter(d.poll_ms) : d.pins_age > staleAfter(d.poll_ms);
   if (d.sensor_error != null) {
-    sensorMsg = '\u26a0 SENSOR UNAVAILABLE: ' + d.sensor_error + ' \u2014 pin currents are NOT monitored!';
-  } else if (d.pins_age == null ? d.now > staleAfter(d.poll_ms) : d.pins_age > staleAfter(d.poll_ms)) {
-    sensorMsg = '\u26a0 Pin readings are stale' +
-      (d.pins_age == null ? '' : ' (last update ' + d.pins_age.toFixed(0) + ' s ago)') +
-      ' \u2014 monitoring may have stopped!';
+    sensorMsg = '⚠ SENSOR UNAVAILABLE: ' + d.sensor_error + ' — pin currents are NOT monitored!';
+    setStatus('Sensor fault', 'warn');
+  } else if (stale) {
+    sensorMsg = d.pins_age == null
+      ? '⚠ No pin readings yet — pin currents are NOT monitored!'
+      : '⚠ Pin readings are stale (last update ' + d.pins_age.toFixed(0) + ' s ago) — monitoring may have stopped!';
+    setStatus('Stale', 'warn');
+  } else if (d.pins_age == null) {
+    setStatus('Starting', '');
+  } else {
+    setStatus('Live', 'live');
   }
   sensorEl.textContent = sensorMsg;
-  sensorEl.style.display = sensorMsg ? 'block' : 'none';
+  sensorEl.style.display = sensorMsg ? 'flex' : 'none';
 
-  if (s.power_w != null) {
-    document.getElementById('power').textContent = 'Total power: ' + s.power_w.toFixed(1) + ' W';
-  } else if (!pinsOk) {
-    document.getElementById('power').textContent = 'Total power: \u2014';
-  } else {
-    let sum = 0;
-    for (const p of s.pins) sum += p[0] * p[1];
-    document.getElementById('power').textContent = 'Total power: ' + sum.toFixed(1) + ' W (estimated)';
+  // Summary cards. Total power prefers NVML and falls back to the sum of
+  // the pins' V*A.
+  let power = s.power_w;
+  if (power == null && pinsOk) {
+    power = 0;
+    for (const p of s.pins) power += p[0] * p[1];
   }
-  document.getElementById('temp').textContent = s.temp_c != null ? 'GPU temp: ' + s.temp_c.toFixed(0) + ' °C' : '';
-  const vramEl = document.getElementById('vram');
-  if (s.mem_used_gb != null) {
-    vramEl.textContent = s.mem_total_gb != null
-      ? 'VRAM: ' + s.mem_used_gb.toFixed(1) + ' / ' + s.mem_total_gb.toFixed(0) + ' GB'
-      : 'VRAM: ' + s.mem_used_gb.toFixed(1) + ' GB';
-  } else {
-    vramEl.textContent = '';
-  }
-
-  const limitEl = document.getElementById('limit');
+  document.getElementById('powercap').textContent =
+    s.power_w == null && power != null ? 'Board power (est.)' : 'Board power';
+  document.getElementById('power').textContent = power == null ? '—' : power.toFixed(1);
+  setMeter(document.getElementById('powerbar'), power != null && s.limit_w ? power / s.limit_w : null);
+  let limitText = 'Limit —';
   if (s.limit_w != null) {
-    let t = 'Power limit: ' + s.limit_w + ' W';
+    limitText = 'Limit ' + s.limit_w + ' W';
     if (s.limit_min_w != null && s.limit_max_w != null) {
-      t += '    (range ' + s.limit_min_w + '–' + s.limit_max_w + ' W)';
+      limitText += ' · range ' + s.limit_min_w + '–' + s.limit_max_w + ' W';
     }
-    limitEl.textContent = t;
-  } else {
-    limitEl.textContent = '';
   }
+  document.getElementById('limit').textContent = limitText;
+
+  const maxTemp = d.range_max.temp;
+  document.getElementById('temp').textContent = s.temp_c == null ? '—' : s.temp_c.toFixed(0);
+  setMeter(document.getElementById('tempbar'), s.temp_c != null && maxTemp ? s.temp_c / maxTemp : null);
+  document.getElementById('tempfoot').textContent = maxTemp ? 'max ' + maxTemp.toFixed(0) + ' °C' : '';
+
+  document.getElementById('vram').textContent = s.mem_used_gb == null ? '—' : s.mem_used_gb.toFixed(1);
+  setMeter(document.getElementById('vrambar'),
+    s.mem_used_gb != null && s.mem_total_gb ? s.mem_used_gb / s.mem_total_gb : null);
+  document.getElementById('vramfoot').textContent = s.mem_total_gb != null ? 'of ' + s.mem_total_gb.toFixed(0) + ' GB' : '';
+
   document.getElementById('interval').textContent = 'Sample interval: ' + d.poll_ms + ' ms';
 
-  // Top GPU-using processes (NVML): [pid, name, mem GB, util %], highest first.
-  const pt = document.getElementById('proctab');
-  pt.innerHTML = '';
+  // Pin legend and tiles (dashes while there are no valid pin readings).
+  const y = limits[0].toFixed(1), r = limits[1].toFixed(1);
+  const legend = document.getElementById('legend');
+  legend.innerHTML = '';
+  [['< ' + y + ' A', C.green], [y + '–' + r + ' A', C.yellow], ['≥ ' + r + ' A', C.red]].forEach(function (e) {
+    const sp = el('span', 'dot', e[0]);
+    sp.style.color = rgba(e[1]);
+    legend.appendChild(sp);
+  });
+  const scale = limits[1] * 1.25;
+  for (let i = 0; i < 6; i++) {
+    const t = tiles[i];
+    const v = pinsOk ? s.pins[i][0] : null;
+    const c = pinsOk ? s.pins[i][1] : null;
+    t.volt.textContent = (v == null ? '—' : v.toFixed(2)) + ' V';
+    t.cur.textContent = c == null ? '—' : c.toFixed(2);
+    const col = c == null ? C.dim : currentRgb(c);
+    t.cur.style.color = rgba(col);
+    t.bar.style.background = rgba(col);
+    setMeter(t.bar, c == null ? null : c / scale);
+    t.tile.className = 'tile' + (c == null ? '' : (col === C.red ? ' r' : (col === C.yellow ? ' y' : '')));
+    t.ty.style.left = (limits[0] / scale * 100) + '%';
+    t.tr.style.left = (limits[1] / scale * 100) + '%';
+  }
+
+  // Top GPU-using processes (NVML): [pid, name, mem GB, util %], highest
+  // first. With the kill safeguard on, the first one is its target.
+  document.getElementById('armed').style.display = d.safeguard ? 'inline' : 'none';
+  const procsEl = document.getElementById('procs');
+  procsEl.innerHTML = '';
   const procs = d.processes || [];
-  if (procs.length === 0) {
-    const cell = pt.insertRow().insertCell();
-    cell.textContent = 'No GPU-using processes';
-    cell.className = 'dim';
-  } else {
-    for (const p of procs) {
-      const row = pt.insertRow();
-      row.insertCell().textContent = String(p[1]).padEnd(24).slice(0, 24);
-      row.insertCell().textContent = String(p[3]).padStart(4) + ' %';
-      row.insertCell().textContent = p[2].toFixed(2).padStart(6) + ' GB';
-    }
-  }
-
-  // current limits (from the settings dialog) and matching legend
-  if (d.limits) {
-    limits = d.limits;
-    document.getElementById('legend').innerHTML =
-      '<span class="r">● ≥ ' + limits[1] + 'A</span>' +
-      '<span class="y">● ' + limits[0] + '–' + limits[1] + 'A</span>' +
-      '<span class="g">● < ' + limits[0] + 'A</span>';
-  }
-
-  // tables (dashes while there are no valid pin readings)
-  {
-    const volt = document.getElementById('volt');
-    const curr = document.getElementById('curr');
-    volt.innerHTML = '';
-    curr.innerHTML = '';
-    for (let row = 0; row < 2; row++) {
-      const vr = volt.insertRow();
-      const cr = curr.insertRow();
-      for (let c = 0; c < 3; c++) {
-        const pin = row * 3 + c;
-        vr.insertCell().textContent = pinLabel(pin, pinsOk ? s.pins[pin][0] : null);
-        const cell = cr.insertCell();
-        const cur = pinsOk ? s.pins[pin][1] : null;
-        cell.textContent = pinLabel(pin, cur);
-        cell.className = cur == null ? 'dim' : (cur < limits[0] ? 'g' : (cur < limits[1] ? 'y' : 'r'));
-      }
-    }
-  }
+  if (procs.length === 0) procsEl.appendChild(el('div', 'foot', 'No GPU-using processes'));
+  procs.forEach(function (p, rank) {
+    const row = el('div', 'proc');
+    const name = el('div', 'name', String(p[1]));
+    name.title = p[1] + ' (pid ' + p[0] + ')';
+    if (rank === 0 && d.safeguard) name.appendChild(el('span', 'tag', 'TARGET'));
+    const meter = el('div', 'meter');
+    const bar = el('b');
+    bar.style.background = 'var(--accent)';
+    meter.appendChild(bar);
+    setMeter(bar, p[3] > 0 ? p[3] / 100 : null);
+    row.appendChild(name);
+    row.appendChild(meter);
+    row.appendChild(el('div', 'pct mono', p[3] + ' %'));
+    row.appendChild(el('div', 'mem mono', p[2].toFixed(2) + ' GB'));
+    procsEl.appendChild(row);
+  });
 
   const graphsEl = document.getElementById('graphs');
   graphsEl.style.display = d.show_graphs ? '' : 'none';
@@ -988,9 +1159,9 @@ function render(d) {
 
 let fails = 0;
 function showErr(msg) {
-  const el = document.getElementById('err');
-  el.style.display = msg ? 'block' : 'none';
-  if (msg) el.textContent = msg;
+  const e = document.getElementById('err');
+  e.style.display = msg ? 'block' : 'none';
+  if (msg) e.textContent = msg;
 }
 async function tick() {
   try {
@@ -1000,7 +1171,10 @@ async function tick() {
     fails = 0;
     showErr('');
   } catch (e) {
-    if (++fails >= 5) showErr('Cannot reach AstralGauge. Is the web interface enabled?');
+    if (++fails >= 5) {
+      showErr('Cannot reach AstralGauge. Is the web interface enabled?');
+      setStatus('Offline', 'warn');
+    }
   }
 }
 setInterval(tick, 1000);
@@ -1109,6 +1283,7 @@ mod tests {
         assert!(json.contains("\"mem_total_gb\":32.0"));
         assert!(json.contains("\"show_graphs\":true"));
         assert!(json.contains("\"critical_alert\":true"));
+        assert!(json.contains("\"safeguard\":false"));
         assert!(json.contains("\"sensor_error\":null"));
         assert!(json.contains("\"pins_age\":null"));
         assert!(json.contains("\"poll_ms\":1000"));

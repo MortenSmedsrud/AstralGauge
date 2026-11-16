@@ -59,7 +59,8 @@ fn main() {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([720.0, 860.0])
+            .with_inner_size([780.0, 960.0])
+            .with_min_inner_size([560.0, 640.0])
             .with_resizable(true),
         ..Default::default()
     };
@@ -72,6 +73,7 @@ fn main() {
     let creator = Box::new(move |cc: &eframe::CreationContext<'_>| {
         // Repaint as soon as the poller records a sample (see
         // `WebData::on_sample`).
+        ui::apply_theme(&cc.egui_ctx);
         let ctx = cc.egui_ctx.clone();
         data.lock().unwrap().on_sample = Some(Arc::new(move || ctx.request_repaint()));
         Ok(Box::new(app) as Box<dyn eframe::App>)

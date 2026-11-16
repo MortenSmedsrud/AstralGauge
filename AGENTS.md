@@ -128,9 +128,13 @@ src/persist.rs   SETTINGS PERSISTENCE. The applied `ui::Config` is stored as
                  ignores unknown keys, defaults missing ones, clamps numbers
                  into the panel's ranges, and reports a corrupt file (which
                  it never touches) instead of silently resetting it.
-src/ui.rs        DESKTOP UI. `App` (eframe::App::ui: main window with
-                 the "Top GPU processes" list, the flashing critical-current
-                 banner next to the total power, settings dialog, the About
+src/ui.rs        DESKTOP UI. `App` (eframe::App::ui: main window built
+                 from cards — header with a Live/Stale/Sensor-fault status
+                 pill, the flashing critical-current and sensor banners,
+                 power/temperature/VRAM summary cards with meters (the
+                 power card holds the power-limit control), the six pin
+                 tiles, the "Top GPU processes" card, the History card with
+                 the window selector and graphs — settings dialog, the About
                  dialog (scrollable embedded license text, `ABOUT_TEXT` from
                  `licenses.txt`), graphs),
                  `Config` (everything the settings panel edits: limits,
@@ -141,7 +145,13 @@ src/ui.rs        DESKTOP UI. `App` (eframe::App::ui: main window with
                  `Config::defaults()` (the pre-persistence built-in
                  defaults) into the draft for Accept to commit), `FileDialog`
                  (built-in .wav picker), `add_pin_graph`,
-                 `add_metric_graph`, `draw_hover_readout`, colors.
+                 `add_metric_graph`, `draw_hover_readout`, and the look:
+                 `palette` (all colors; mirrored as CSS variables / the
+                 `C` table in `INDEX_HTML`), `apply_theme` (dark-only egui
+                 style, installed from `main`), and the small widget helpers
+                 (`card`, `banner`, `meter`, `stat_card`, `pin_tile`,
+                 `status_pill`, `dot_label` — egui's fonts have no "●", so
+                 dots are painted).
 sound/           Shipped alert WAVs, embedded into the binary at compile
                  time (attention/critical = yellow/red alerts, each with a
                  -powering-down variant for the automatic power feature,
@@ -313,8 +323,8 @@ Optional (`Settings::kill_top_process_on_red`, default off, settings dialog
 
 Independent of the kill safeguard: on the red rising edge
 (`alerts::critical_alert_edge`) the poller sets `WebData::critical_alert`.
-Both UIs then show a **flashing red** banner to the right of the total-power
-readout ("⚠ ALERT: critical current detected! Please check your GPU power
+Both UIs then show a **flashing red** full-width banner below the header
+("⚠ ALERT: critical current detected! Please check your GPU power
 cables!") with an **Acknowledge** button that appears and disappears with it
 (`ui.rs` ↔ `INDEX_HTML`, kept in sync; the web one POSTs `/ack`).
 
@@ -322,9 +332,11 @@ cables!") with an **Acknowledge** button that appears and disappears with it
   desktop button and `POST /ack` are the only ways it clears, and the next
   red excursion shows it again.
 - Mirrored in the web JSON as `critical_alert` (the sensor state as
-  `sensor_error` + `pins_age`, shown as the web page's `#sensor` banner); the desktop blink animates
-  via `ALERT_BLINK_SECS` and forces 250 ms idle repaints while shown (the
-  web page blinks with a CSS `step-end` keyframe).
+  `sensor_error` + `pins_age`, shown as the web page's `#sensor` banner);
+  the desktop banner's fill blinks via `ALERT_BLINK_SECS` and forces 250 ms
+  idle repaints while shown (the web page blinks with a CSS `step-end`
+  keyframe). The kill safeguard's on/off state is mirrored as `safeguard`
+  (the web page's "kill safeguard armed" note and TARGET tag).
 
 ## Automatic minimum power limit (`alerts::auto_power_action`)
 
@@ -382,7 +394,8 @@ Optional (`Settings::auto_min_power` = Off / On yellow / On red):
   are M4-reduced to `WEB_BUCKETS` (400) buckets server-side, then again to
   the canvas width in the browser.
 - Colors: green `< yellow`, yellow `[yellow, red)`, red `>= red`
-  (`ui::current_color` ↔ JS `currentColor`); tables/graphs use the applied
+  (`ui::current_color` ↔ JS `currentColor`, values from `ui::palette`);
+  pin tiles/graphs use the applied
   `Settings`, never hard-coded thresholds (the JS fetches live `limits`
   from `/data`).
 - The NVML process-list getters take `nvmlProcessInfo_v2_t` (24 bytes: the
@@ -429,10 +442,10 @@ Optional (`Settings::auto_min_power` = Off / On yellow / On red):
   order repair, rejection of invalid values, and corrupt-document detection.
 - `ui::tests`: embedded license-text sanity (the generated `licenses.txt` is
   non-empty, lists one "Used by:" section per license, and has no template
-  leftovers or HTML escaping); pin cells without readings; the sensor
+  leftovers or HTML escaping); readings shown as dashes when missing; the sensor
   fault / staleness warning.
 - `web::tests`: JSON field content (incl. process entries, name escaping and
-  the latching `critical_alert` flag, `sensor_error`, `pins_age`),
+  the latching `critical_alert` flag, `safeguard`, `sensor_error`, `pins_age`),
   `record()` history append/prune/range caching and gaps (no zeros) for
   samples without pins, M4 graph downsampling (spikes kept, complete
   buckets unchanged while the window slides), the stale threshold, query-param parsing, HTTP server serve/404/busy-port/restart and

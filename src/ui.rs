@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::alerts::{AutoMinPower, EmbeddedSound, Settings, Sound, MAX_LIMIT_A, MIN_LIMIT_A};
-use crate::hardware::{AuthState, Cmd, DEFAULT_POLL_MS};
+use crate::hardware::{AuthState, Cmd, GpuProcess, DEFAULT_POLL_MS};
 use crate::persist;
 use crate::web::{m4_downsample, stale_after_secs, WebData, WebServer, WebState, DEFAULT_WEB_PORT};
 
@@ -39,14 +39,343 @@ const ALERT_REPAINT_MS: u64 = 250;
 
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 
+/// The app's colors (dark theme only: the threshold colors are tuned for a
+/// dark background). Mirrored by the CSS variables in `web::INDEX_HTML`.
+mod palette {
+    use eframe::egui::Color32;
+    /// Window background.
+    pub(super) const BG: Color32 = Color32::from_rgb(14, 16, 20);
+    /// Cards (the grouped sections of the main window).
+    pub(super) const CARD: Color32 = Color32::from_rgb(23, 26, 32);
+    pub(super) const CARD_STROKE: Color32 = Color32::from_rgb(36, 40, 48);
+    /// Pin tiles and graph plot areas inside cards.
+    pub(super) const TILE: Color32 = Color32::from_rgb(30, 34, 41);
+    pub(super) const PLOT: Color32 = Color32::from_rgb(17, 19, 24);
+    /// Meter tracks and faint grid lines.
+    pub(super) const TRACK: Color32 = Color32::from_rgb(42, 47, 56);
+    pub(super) const TEXT: Color32 = Color32::from_rgb(230, 233, 238);
+    pub(super) const DIM: Color32 = Color32::from_rgb(139, 147, 160);
+    pub(super) const ACCENT: Color32 = Color32::from_rgb(96, 165, 250);
+    /// Current thresholds: below yellow, yellow..red, red and above.
+    pub(super) const GREEN: Color32 = Color32::from_rgb(74, 222, 128);
+    pub(super) const YELLOW: Color32 = Color32::from_rgb(250, 204, 21);
+    pub(super) const RED: Color32 = Color32::from_rgb(239, 68, 68);
+    /// Sensor fault / stale readings.
+    pub(super) const ORANGE: Color32 = Color32::from_rgb(251, 146, 60);
+    /// GPU metric series (graphs and their summary meters).
+    pub(super) const POWER: Color32 = Color32::from_rgb(251, 176, 59);
+    pub(super) const TEMP: Color32 = Color32::from_rgb(248, 113, 113);
+    pub(super) const VRAM: Color32 = Color32::from_rgb(129, 178, 250);
+}
+
+/// Install the app's dark theme: flatter, rounder widgets on a near-black
+/// background with a blue accent. Called once from `main` at startup.
+pub(crate) fn apply_theme(ctx: &egui::Context) {
+    use egui::{Color32, CornerRadius, Stroke};
+    ctx.set_theme(egui::ThemePreference::Dark);
+    let mut style = (*ctx.style_of(egui::Theme::Dark)).clone();
+    let v = &mut style.visuals;
+    v.panel_fill = palette::BG;
+    v.window_fill = palette::CARD;
+    v.window_stroke = Stroke::new(1.0, palette::CARD_STROKE);
+    v.window_corner_radius = CornerRadius::same(12);
+    v.menu_corner_radius = CornerRadius::same(8);
+    v.faint_bg_color = palette::TILE;
+    v.extreme_bg_color = palette::PLOT;
+    v.override_text_color = None;
+    v.selection.bg_fill = Color32::from_rgb(37, 99, 235);
+    v.selection.stroke = Stroke::new(1.0, palette::TEXT);
+    v.hyperlink_color = palette::ACCENT;
+    v.slider_trailing_fill = true;
+    // 4 px: rounder turns the checkbox squares into radio-button circles.
+    let radius = CornerRadius::same(4);
+    let w = &mut v.widgets;
+    w.noninteractive.bg_fill = palette::CARD;
+    w.noninteractive.weak_bg_fill = palette::CARD;
+    w.noninteractive.bg_stroke = Stroke::new(1.0, palette::CARD_STROKE);
+    w.noninteractive.fg_stroke = Stroke::new(1.0, Color32::from_rgb(200, 205, 214));
+    w.noninteractive.corner_radius = radius;
+    for (wv, fill, stroke) in [
+        (
+            &mut w.inactive,
+            Color32::from_rgb(38, 43, 52),
+            Color32::from_rgb(48, 54, 64),
+        ),
+        (
+            &mut w.hovered,
+            Color32::from_rgb(50, 56, 68),
+            Color32::from_rgb(70, 78, 92),
+        ),
+        (
+            &mut w.active,
+            Color32::from_rgb(60, 67, 80),
+            palette::ACCENT,
+        ),
+        (
+            &mut w.open,
+            Color32::from_rgb(44, 49, 59),
+            Color32::from_rgb(60, 67, 80),
+        ),
+    ] {
+        wv.bg_fill = fill;
+        wv.weak_bg_fill = fill;
+        wv.bg_stroke = Stroke::new(1.0, stroke);
+        wv.corner_radius = radius;
+    }
+    w.inactive.fg_stroke = Stroke::new(1.0, palette::TEXT);
+    let s = &mut style.spacing;
+    s.item_spacing = egui::vec2(8.0, 6.0);
+    s.button_padding = egui::vec2(10.0, 4.0);
+    s.window_margin = egui::Margin::same(14);
+    s.interact_size.y = 22.0;
+    ctx.set_style_of(egui::Theme::Dark, style);
+}
+
 fn current_color(current: f64, s: &Settings) -> egui::Color32 {
     if current < s.yellow_limit_a as f64 {
-        egui::Color32::from_rgb(80, 220, 80)
+        palette::GREEN
     } else if current < s.red_limit_a as f64 {
-        egui::Color32::from_rgb(240, 210, 40)
+        palette::YELLOW
     } else {
-        egui::Color32::from_rgb(240, 60, 60)
+        palette::RED
     }
+}
+
+/// Small uppercase caption used for card titles and value labels.
+fn caption(text: &str) -> egui::RichText {
+    egui::RichText::new(text.to_uppercase())
+        .size(11.0)
+        .color(palette::DIM)
+        .strong()
+}
+
+/// One card of the main window: a rounded panel with a caption on the left
+/// of its header row, optional header widgets on the right (`header`, laid
+/// out right to left), and the body below. Fills the available width.
+fn card<R>(
+    ui: &mut egui::Ui,
+    title: &str,
+    header: impl FnOnce(&mut egui::Ui),
+    body: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    egui::Frame::new()
+        .fill(palette::CARD)
+        .stroke(egui::Stroke::new(1.0, palette::CARD_STROKE))
+        .corner_radius(egui::CornerRadius::same(10))
+        .inner_margin(egui::Margin::same(12))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(caption(title));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), header);
+            });
+            ui.add_space(4.0);
+            body(ui)
+        })
+        .inner
+}
+
+/// A full-width notice strip (critical alert, sensor fault).
+fn banner(
+    ui: &mut egui::Ui,
+    fill: egui::Color32,
+    stroke: egui::Color32,
+    add: impl FnOnce(&mut egui::Ui),
+) {
+    egui::Frame::new()
+        .fill(fill)
+        .stroke(egui::Stroke::new(1.0, stroke))
+        .corner_radius(egui::CornerRadius::same(10))
+        .inner_margin(egui::Margin::symmetric(12, 8))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.horizontal_wrapped(add);
+        });
+}
+
+/// A thin horizontal meter: `frac` (clamped to 0..=1) of the track filled
+/// with `color`, plus optional tick marks at the given fractions (the pin
+/// tiles mark the yellow and red limits).
+fn meter(
+    ui: &mut egui::Ui,
+    width: f32,
+    frac: Option<f64>,
+    color: egui::Color32,
+    ticks: &[(f64, egui::Color32)],
+) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 6.0), egui::Sense::hover());
+    let painter = ui.painter();
+    let r = egui::CornerRadius::same(3);
+    painter.rect_filled(rect, r, palette::TRACK);
+    if let Some(frac) = frac {
+        let w = rect.width() * frac.clamp(0.0, 1.0) as f32;
+        if w > 0.5 {
+            let fill = egui::Rect::from_min_size(rect.min, egui::vec2(w.max(6.0), rect.height()));
+            painter.rect_filled(fill, r, color);
+        }
+    }
+    for &(at, c) in ticks {
+        let x = rect.left() + rect.width() * at.clamp(0.0, 1.0) as f32;
+        // Dark outline first, so a tick stays visible on a fill of its
+        // own color.
+        let span = (rect.top() - 2.0)..=(rect.bottom() + 2.0);
+        painter.vline(x, span.clone(), egui::Stroke::new(4.0, palette::CARD));
+        painter.vline(x, span, egui::Stroke::new(1.5, c));
+    }
+}
+
+/// Big number + unit (+ optional note) as one baseline-aligned row.
+fn big_value(ui: &mut egui::Ui, value: &str, unit: &str, color: egui::Color32, size: f32) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        ui.label(egui::RichText::new(value).size(size).strong().color(color));
+        ui.label(
+            egui::RichText::new(unit)
+                .size(size * 0.55)
+                .color(palette::DIM),
+        );
+    });
+}
+
+/// One summary card (power / temperature / VRAM): caption, big value,
+/// a meter against the card's range, and a footer line.
+fn stat_card(
+    ui: &mut egui::Ui,
+    title: &str,
+    value: &str,
+    unit: &str,
+    frac: Option<f64>,
+    color: egui::Color32,
+    footer: impl FnOnce(&mut egui::Ui),
+) {
+    card(
+        ui,
+        title,
+        |_| {},
+        |ui| {
+            big_value(ui, value, unit, palette::TEXT, 26.0);
+            let w = ui.available_width();
+            meter(ui, w, frac, color, &[]);
+            ui.add_space(2.0);
+            ui.horizontal(footer);
+        },
+    );
+}
+
+/// One pin tile: pin number and voltage, the current in its threshold
+/// color, and a meter with the yellow/red limits marked. A tile without a
+/// reading shows dashes. Yellow/red tiles get a tinted background.
+fn pin_tile(
+    ui: &mut egui::Ui,
+    pin: usize,
+    voltage: Option<f64>,
+    current: Option<f64>,
+    s: &Settings,
+) {
+    let color = current.map(|c| current_color(c, s));
+    let fill = match color {
+        Some(c) if c == palette::RED => egui::Color32::from_rgb(64, 24, 27),
+        Some(c) if c == palette::YELLOW => egui::Color32::from_rgb(52, 46, 20),
+        _ => palette::TILE,
+    };
+    egui::Frame::new()
+        .fill(fill)
+        .corner_radius(egui::CornerRadius::same(8))
+        .inner_margin(egui::Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(caption(&format!("Pin {pin}")));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let v = format!("{} V", reading_text(voltage));
+                    ui.label(egui::RichText::new(v).size(12.0).color(palette::DIM));
+                });
+            });
+            big_value(
+                ui,
+                &reading_text(current),
+                "A",
+                color.unwrap_or(palette::DIM),
+                22.0,
+            );
+            // Scale: a little past the red limit, so both marks sit inside.
+            let scale = s.red_limit_a as f64 * 1.25;
+            let w = ui.available_width();
+            meter(
+                ui,
+                w,
+                current.map(|c| c / scale),
+                color.unwrap_or(palette::DIM),
+                &[
+                    (
+                        s.yellow_limit_a as f64 / scale,
+                        palette::YELLOW.gamma_multiply(0.8),
+                    ),
+                    (
+                        s.red_limit_a as f64 / scale,
+                        palette::RED.gamma_multiply(0.8),
+                    ),
+                ],
+            );
+        });
+}
+
+/// A label preceded by a painted colored dot (egui's default fonts have no
+/// "●" glyph).
+fn dot_label(ui: &mut egui::Ui, text: impl Into<egui::RichText>, color: egui::Color32) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 5.0;
+        // Inside a right-to-left row items are placed from the right: add
+        // the label first there, so the dot still ends up on its left.
+        let rtl = ui.layout().prefer_right_to_left();
+        let text = text.into().color(color);
+        if rtl {
+            ui.label(text.clone());
+        }
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(7.0, 7.0), egui::Sense::hover());
+        ui.painter().circle_filled(rect.center(), 3.5, color);
+        if !rtl {
+            ui.label(text);
+        }
+    });
+}
+
+/// Rounded status chip ("● Live", "● Sensor fault") for the header.
+///
+/// Painted as one fixed-size widget (not a `Frame`), so a center-aligned
+/// row centers it exactly like the buttons next to it.
+fn status_pill(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
+    let galley =
+        ui.painter()
+            .layout_no_wrap(text.to_owned(), egui::FontId::proportional(12.0), color);
+    let (pad_x, dot, gap) = (10.0, 7.0, 5.0);
+    let size = egui::vec2(pad_x * 2.0 + dot + gap + galley.size().x, 22.0);
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(
+        rect,
+        egui::CornerRadius::same(255),
+        color.gamma_multiply(0.15),
+    );
+    let dot_center = egui::pos2(rect.left() + pad_x + dot / 2.0, rect.center().y);
+    painter.circle_filled(dot_center, dot / 2.0, color);
+    let text_pos = egui::pos2(
+        rect.left() + pad_x + dot + gap,
+        rect.center().y - galley.size().y / 2.0,
+    );
+    painter.galley(text_pos, galley, color);
+}
+
+/// Section heading inside the settings dialog.
+fn settings_section(ui: &mut egui::Ui, title: &str) {
+    ui.add_space(10.0);
+    ui.label(
+        egui::RichText::new(title.to_uppercase())
+            .size(12.0)
+            .strong()
+            .color(palette::ACCENT),
+    );
+    ui.add_space(2.0);
 }
 
 /// The sensor warning to show, if the pin currents are not being monitored
@@ -80,13 +409,10 @@ fn sensor_warning(
     }
 }
 
-/// One pin cell of the voltage/current tables: `Pin  i:   1.234`, or a dash
-/// when there is no reading for that pin.
-fn pin_text(pin: usize, value: Option<f64>) -> String {
-    match value {
-        Some(v) => format!("Pin {pin:>2}: {v:>7.3}"),
-        None => format!("Pin {pin:>2}: {:>7}", "—"),
-    }
+/// A reading with two decimals, or a dash when there is none (before the
+/// first sample, or with the sensor down) — never a made-up 0.00.
+fn reading_text(value: Option<f64>) -> String {
+    value.map_or_else(|| "\u{2014}".to_owned(), |v| format!("{v:.2}"))
 }
 
 pub(crate) struct App {
@@ -428,328 +754,402 @@ impl eframe::App for App {
 
         let window_secs = HORIZONS_MIN[self.window_idx as usize] as f64 * 60.0;
 
-        egui::CentralPanel::default().show(ui, |ui| {
-            // GPU name on the left, settings button (gear) on the right.
-            ui.horizontal(|ui| {
-                ui.heading("ASUS 5090 ROG Astral");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .add(
-                            egui::Button::new(egui::RichText::new("\u{2699}").size(18.0))
-                                .frame(false),
-                        )
-                        .on_hover_text("Settings")
-                        .clicked()
-                        && self.draft.is_none()
-                    {
-                        self.draft = Some(self.config.clone());
-                    }
-                    // In this right-to-left row the next item sits left of
-                    // the gear.
-                    if ui
-                        .add(egui::Button::new("About").frame(false))
-                        .on_hover_text("Licenses")
-                        .clicked()
-                    {
-                        self.about_open = true;
-                    }
+        let sensor_warn = sensor_warning(
+            data.sensor_error.as_deref(),
+            data.pins_at,
+            now,
+            self.config.poll_ms,
+        );
+        let panel_frame =
+            egui::Frame::central_panel(ui.style()).inner_margin(egui::Margin::same(14));
+        egui::CentralPanel::default()
+            .frame(panel_frame)
+            .show(ui, |ui| {
+                // Header: app + card name, live status, About and settings.
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("AstralGauge")
+                            .size(20.0)
+                            .strong()
+                            .color(palette::TEXT),
+                    );
+                    ui.label(
+                        egui::RichText::new("ASUS RTX 5090 ROG Astral")
+                            .size(13.0)
+                            .color(palette::DIM),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(egui::RichText::new("\u{2699}").size(18.0))
+                                    .frame(false),
+                            )
+                            .on_hover_text("Settings")
+                            .clicked()
+                            && self.draft.is_none()
+                        {
+                            self.draft = Some(self.config.clone());
+                        }
+                        // In this right-to-left row the next item sits left of
+                        // the gear.
+                        // Styled as a link (accent color, underlined,
+                        // pointer cursor) so it reads as clickable.
+                        if ui
+                            .link(
+                                egui::RichText::new("About")
+                                    .color(palette::ACCENT)
+                                    .underline(),
+                            )
+                            .on_hover_text("Version and licenses")
+                            .clicked()
+                        {
+                            self.about_open = true;
+                        }
+                        ui.add_space(4.0);
+                        // Whether the pins are being watched right now (the
+                        // banner below says why not).
+                        let (text, color) = match (&data.sensor_error, &sensor_warn) {
+                            (Some(_), _) => ("Sensor fault", palette::ORANGE),
+                            (None, Some(_)) => ("Stale", palette::ORANGE),
+                            (None, None) if data.pins_at.is_none() => ("Starting", palette::DIM),
+                            (None, None) => ("Live", palette::GREEN),
+                        };
+                        status_pill(ui, text, color);
+                    });
                 });
-            });
-            ui.separator();
-
-            // Total power: prefer NVML (same source as nvidia-smi),
-            // fall back to the sum of pin V*A
-            let power_text = match data.sample.power_w {
-                Some(w) => format!("Total power: {:.1} W", w),
-                None if data.sample.pins.is_empty() => "Total power: \u{2014}".to_owned(),
-                None => {
-                    let est: f64 = data.sample.pins.iter().map(|p| p.voltage * p.current).sum();
-                    format!("Total power: {:.1} W (estimated)", est)
-                }
-            };
-            ui.horizontal_wrapped(|ui| {
-                ui.label(egui::RichText::new(power_text).strong().size(20.0));
+                ui.add_space(6.0);
 
                 // Latching critical-current notification: flashing while the
                 // poller has it armed, dismissed only by this button (which
                 // disappears together with it). Power returning to normal
                 // never clears it; the next red excursion shows it again.
                 if data.critical_alert {
-                    ui.add_space(16.0);
                     let bright = ((now / ALERT_BLINK_SECS) as u64).is_multiple_of(2);
-                    let color = if bright {
-                        egui::Color32::from_rgb(255, 70, 70)
+                    let fill = if bright {
+                        egui::Color32::from_rgb(153, 27, 27)
                     } else {
-                        egui::Color32::from_rgb(110, 25, 25)
+                        egui::Color32::from_rgb(69, 18, 18)
                     };
-                    ui.label(
-                        egui::RichText::new(
-                            "\u{26a0} ALERT: critical current detected! \
+                    let mut ack = false;
+                    banner(ui, fill, palette::RED, |ui| {
+                        ui.label(
+                            egui::RichText::new(
+                                "\u{26a0} ALERT: critical current detected! \
                              Please check your GPU power cables!",
-                        )
-                        .strong()
-                        .color(color)
-                        .size(15.0),
-                    );
-                    if ui.button("Acknowledge").clicked() {
+                            )
+                            .strong()
+                            .size(15.0)
+                            .color(egui::Color32::WHITE),
+                        );
+                        ack = ui.button("Acknowledge").clicked();
+                    });
+                    if ack {
                         data.critical_alert = false;
                     }
+                    ui.add_space(6.0);
                 }
-            });
 
-            // Sensor fault or stale readings: the limits are not being
-            // checked, which must never look like a quiet, green card.
-            if let Some(warning) = sensor_warning(
-                data.sensor_error.as_deref(),
-                data.pins_at,
-                now,
-                self.config.poll_ms,
-            ) {
-                ui.label(
-                    egui::RichText::new(warning)
-                        .strong()
-                        .color(egui::Color32::from_rgb(240, 160, 40))
-                        .size(15.0),
-                );
-            }
-
-            // GPU temperature and VRAM (NVML)
-            let mut gpu_texts: Vec<String> = Vec::new();
-            if let Some(t) = data.sample.temp_c {
-                gpu_texts.push(format!("GPU temp: {:.0} °C", t));
-            }
-            if let Some(used) = data.sample.mem_used_gb {
-                let text = match data.sample.mem_total_gb {
-                    Some(total) => format!("VRAM: {:.1} / {:.0} GB", used, total),
-                    None => format!("VRAM: {:.1} GB", used),
-                };
-                gpu_texts.push(text);
-            }
-            if !gpu_texts.is_empty() {
-                ui.horizontal(|ui| {
-                    for (i, text) in gpu_texts.into_iter().enumerate() {
-                        if i > 0 {
-                            ui.add_space(16.0);
-                        }
-                        ui.label(egui::RichText::new(text).strong().size(16.0));
-                    }
-                });
-            }
-
-            // Power management limit (NVML)
-            if let (Some(min), Some(max), Some(current)) = (
-                data.sample.limit_min_w,
-                data.sample.limit_max_w,
-                data.sample.limit_w,
-            ) {
-                // Follow limit changes made outside this control; keep an
-                // unapplied drag edit as long as the real limit is unchanged.
-                if self.shown_limit != Some(current) || self.pending_limit.is_none() {
-                    self.pending_limit = Some(current);
+                // Sensor fault or stale readings: the limits are not being
+                // checked, which must never look like a quiet, green card.
+                if let Some(warning) = &sensor_warn {
+                    banner(
+                        ui,
+                        egui::Color32::from_rgb(58, 36, 14),
+                        palette::ORANGE,
+                        |ui| {
+                            ui.label(
+                                egui::RichText::new(warning)
+                                    .strong()
+                                    .size(14.0)
+                                    .color(egui::Color32::from_rgb(253, 186, 116)),
+                            );
+                        },
+                    );
+                    ui.add_space(6.0);
                 }
-                self.shown_limit = Some(current);
-                let mut pending = self.pending_limit.unwrap_or(current);
-                ui.horizontal(|ui| {
-                    ui.label("Power limit:");
-                    let changed = ui
-                        .add(
-                            egui::DragValue::new(&mut pending)
-                                .range(min..=max)
-                                .suffix(" W"),
-                        )
-                        .changed();
-                    if changed {
-                        self.pending_limit = Some(pending);
-                    }
-                    if pending != current && ui.button("Apply").clicked() {
-                        let _ = self.cmd_tx.send(Cmd::SetLimit(pending));
-                    }
-                });
-            }
-            // Privileged power helper status (only while it has something to
-            // report: activation, or why a limit change failed).
-            if let Some(note) = data.power_note.clone() {
-                ui.label(egui::RichText::new(note).weak().size(12.0));
-            }
-            // Critical-alert safeguard result, shown only while fresh.
-            if let Some((secs, note)) = data.kill_note.clone() {
-                if now - secs < KILL_NOTE_TTL_SECS {
-                    ui.label(egui::RichText::new(note).weak().size(12.0));
-                }
-            }
 
-            ui.separator();
-
-            ui.checkbox(&mut self.show_graphs, "Show graphs");
-            if self.show_graphs {
-                // Time window for the graphs (discrete steps)
-                ui.horizontal(|ui| {
-                    ui.label("Time window:");
-                    let mut idx = self.window_idx as f64;
-                    ui.add(egui::Slider::new(&mut idx, 0.0..=5.0).step_by(1.0));
-                    self.window_idx = idx as u8;
+                // Summary cards: total power (with the power limit control),
+                // GPU temperature, VRAM. Total power prefers NVML (same source
+                // as nvidia-smi) and falls back to the sum of pin V*A.
+                let est_power = (!data.sample.pins.is_empty()).then(|| {
+                    data.sample
+                        .pins
+                        .iter()
+                        .map(|p| p.voltage * p.current)
+                        .sum::<f64>()
                 });
-                ui.horizontal(|ui| {
-                    for (i, &min) in HORIZONS_MIN.iter().enumerate() {
-                        let text = egui::RichText::new(format!("{min}m"));
-                        let text = if i == self.window_idx as usize {
-                            text.strong().color(egui::Color32::from_rgb(120, 190, 255))
+                let power = data.sample.power_w.or(est_power);
+                ui.columns(3, |cols| {
+                    let limit = data.sample.limit_w;
+                    stat_card(
+                        &mut cols[0],
+                        if data.sample.power_w.is_none() && power.is_some() {
+                            "Board power (est.)"
                         } else {
-                            text.weak()
-                        };
-                        ui.label(text);
-                    }
-                });
-            }
-
-            ui.separator();
-
-            // Voltage table - 2 rows x 3 columns. A sample without pin
-            // readings (none recorded yet, or the sensor is unavailable)
-            // shows dashes instead of numbers.
-            ui.strong("Voltage (V)");
-            for row in 0..2 {
-                ui.horizontal(|ui| {
-                    for i in row * 3..row * 3 + 3 {
-                        let voltage = data.sample.pins.get(i).map(|p| p.voltage);
-                        ui.monospace(pin_text(i, voltage));
-                    }
-                });
-            }
-
-            ui.separator();
-
-            // Current table - 2 rows x 3 columns with color coding,
-            // legend to the right of the numbers
-            ui.strong("Current (A)");
-            for row in 0..2 {
-                ui.horizontal(|ui| {
-                    for i in row * 3..row * 3 + 3 {
-                        let current = data.sample.pins.get(i).map(|p| p.current);
-                        let color = match current {
-                            Some(c) => current_color(c, &self.config.alerts),
-                            None => ui.visuals().weak_text_color(),
-                        };
-                        ui.label(egui::RichText::new(pin_text(i, current)).color(color));
-                    }
-                    if row == 0 {
-                        let y = self.config.alerts.yellow_limit_a;
-                        let r = self.config.alerts.red_limit_a;
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(
-                                egui::RichText::new(format!("● ≥ {r:.1}A"))
-                                    .color(egui::Color32::from_rgb(240, 60, 60)),
-                            );
-                            ui.add_space(12.0);
-                            ui.label(
-                                egui::RichText::new(format!("● {y:.1}–{r:.1}A"))
-                                    .color(egui::Color32::from_rgb(240, 210, 40)),
-                            );
-                            ui.add_space(12.0);
-                            ui.label(
-                                egui::RichText::new(format!("● < {y:.1}A"))
-                                    .color(egui::Color32::from_rgb(80, 220, 80)),
-                            );
-                        });
-                    }
-                });
-            }
-
-            ui.separator();
-
-            // Top GPU-using processes (NVML), highest first; the critical
-            // alert safeguard (when enabled) kills the first entry.
-            ui.strong("Top GPU processes");
-            if data.sample.processes.is_empty() {
-                ui.label(
-                    egui::RichText::new("No GPU-using processes")
-                        .weak()
-                        .size(12.0),
-                );
-            } else {
-                for p in &data.sample.processes {
-                    let name: String = p.name.chars().take(26).collect();
-                    ui.horizontal(|ui| {
-                        ui.monospace(format!("{name:<26}"));
-                        ui.monospace(format!("{:>4} %", p.util_percent));
-                        ui.monospace(format!("{:>6.2} GB", p.mem_bytes as f64 / GIB));
-                    });
-                }
-            }
-
-            if self.show_graphs {
-                ui.separator();
-
-                // Per-pin current graphs (rows 0-1) plus GPU metric graphs
-                // (power, temperature, VRAM) in row 2. All share the same
-                // time window. 60 px is the minimum height; extra vertical
-                // space is used.
-                ui.strong("Current and GPU metrics over time");
-                let spacing = 8.0;
-                let graph_w = (ui.available_width() - 2.0 * spacing) / 3.0;
-                let item_spacing_y = ui.spacing().item_spacing.y;
-                let label_h = ui.fonts_mut(|f| f.row_height(&egui::FontId::default()));
-                let graph_h = ((ui.available_height() - 3.0 * label_h - 6.0 * item_spacing_y)
-                    / 3.0)
-                    .max(60.0);
-                let graph_size = egui::vec2(graph_w.max(60.0), graph_h);
-                for row in 0..3 {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = spacing;
-                        for col in 0..3 {
-                            if row < 2 {
-                                let pin = row * 3 + col;
-                                add_pin_graph(
-                                    ui,
-                                    pin,
-                                    &data.history[pin],
-                                    graph_now,
-                                    window_secs,
-                                    graph_size,
-                                    &self.config.alerts,
+                            "Board power"
+                        },
+                        &power.map_or("—".to_owned(), |w| format!("{w:.1}")),
+                        "W",
+                        power.zip(limit).map(|(p, l)| p / l as f64),
+                        palette::POWER,
+                        |ui| {
+                            // Power management limit (NVML).
+                            let (Some(min), Some(max), Some(current)) =
+                                (data.sample.limit_min_w, data.sample.limit_max_w, limit)
+                            else {
+                                ui.label(
+                                    egui::RichText::new("Limit —")
+                                        .size(12.0)
+                                        .color(palette::DIM),
                                 );
-                            } else {
-                                match col {
-                                    0 => add_metric_graph(
+                                return;
+                            };
+                            // Follow limit changes made outside this control;
+                            // keep an unapplied drag edit as long as the real
+                            // limit is unchanged.
+                            if self.shown_limit != Some(current) || self.pending_limit.is_none() {
+                                self.pending_limit = Some(current);
+                            }
+                            self.shown_limit = Some(current);
+                            let mut pending = self.pending_limit.unwrap_or(current);
+                            ui.label(egui::RichText::new("Limit").size(12.0).color(palette::DIM));
+                            if ui
+                                .add(
+                                    egui::DragValue::new(&mut pending)
+                                        .range(min..=max)
+                                        .suffix(" W"),
+                                )
+                                .on_hover_text("Power management limit: drag or type, then Apply")
+                                .changed()
+                            {
+                                self.pending_limit = Some(pending);
+                            }
+                            if pending != current && ui.small_button("Apply").clicked() {
+                                let _ = self.cmd_tx.send(Cmd::SetLimit(pending));
+                            }
+                        },
+                    );
+                    let temp = data.sample.temp_c;
+                    let max_temp = data.temp_range_max;
+                    stat_card(
+                        &mut cols[1],
+                        "GPU temperature",
+                        &temp.map_or("—".to_owned(), |t| format!("{t:.0}")),
+                        "°C",
+                        temp.zip(max_temp).map(|(t, m)| t / m),
+                        palette::TEMP,
+                        |ui| {
+                            let text = max_temp.map_or(String::new(), |m| format!("max {m:.0} °C"));
+                            ui.label(egui::RichText::new(text).size(12.0).color(palette::DIM));
+                        },
+                    );
+                    let used = data.sample.mem_used_gb;
+                    let total = data.sample.mem_total_gb;
+                    stat_card(
+                        &mut cols[2],
+                        "VRAM",
+                        &used.map_or("—".to_owned(), |u| format!("{u:.1}")),
+                        "GB",
+                        used.zip(total).map(|(u, t)| u / t),
+                        palette::VRAM,
+                        |ui| {
+                            let text = total.map_or(String::new(), |t| format!("of {t:.0} GB"));
+                            ui.label(egui::RichText::new(text).size(12.0).color(palette::DIM));
+                        },
+                    );
+                });
+
+                // Privileged power helper status (only while it has something to
+                // report: activation, or why a limit change failed), and the
+                // critical-alert safeguard result while fresh.
+                if let Some(note) = data.power_note.clone() {
+                    ui.label(egui::RichText::new(note).size(12.0).color(palette::DIM));
+                }
+                if let Some((secs, note)) = data.kill_note.clone() {
+                    if now - secs < KILL_NOTE_TTL_SECS {
+                        ui.label(egui::RichText::new(note).size(12.0).color(palette::DIM));
+                    }
+                }
+                ui.add_space(4.0);
+
+                // Connector pins: 2 rows x 3 tiles (current in its threshold
+                // color, voltage, meter with the limits marked), legend in the
+                // header. A sample without pin readings (none recorded yet, or
+                // the sensor is unavailable) shows dashes instead of numbers.
+                let settings = self.config.alerts.clone();
+                card(
+                    ui,
+                    "Connector pins",
+                    |ui| {
+                        let y = settings.yellow_limit_a;
+                        let r = settings.red_limit_a;
+                        for (text, color) in [
+                            (format!("≥ {r:.1} A"), palette::RED),
+                            (format!("{y:.1}–{r:.1} A"), palette::YELLOW),
+                            (format!("< {y:.1} A"), palette::GREEN),
+                        ] {
+                            dot_label(ui, egui::RichText::new(text).size(11.0), color);
+                            ui.add_space(4.0);
+                        }
+                    },
+                    |ui| {
+                        for row in 0..2 {
+                            ui.columns(3, |cols| {
+                                for (col, ui) in cols.iter_mut().enumerate() {
+                                    let i = row * 3 + col;
+                                    let pin = data.sample.pins.get(i);
+                                    pin_tile(
                                         ui,
-                                        "Power (W)",
-                                        &data.power_history,
-                                        graph_now,
-                                        window_secs,
-                                        graph_size,
-                                        egui::Color32::from_rgb(255, 165, 0),
-                                        "W",
-                                        data.power_range_max,
-                                    ),
-                                    1 => add_metric_graph(
-                                        ui,
-                                        "Temp (°C)",
-                                        &data.temp_history,
-                                        graph_now,
-                                        window_secs,
-                                        graph_size,
-                                        egui::Color32::from_rgb(255, 90, 70),
-                                        "°C",
-                                        data.temp_range_max,
-                                    ),
-                                    _ => add_metric_graph(
-                                        ui,
-                                        "VRAM (GB)",
-                                        &data.mem_history,
-                                        graph_now,
-                                        window_secs,
-                                        graph_size,
-                                        egui::Color32::from_rgb(140, 190, 255),
-                                        "GB",
-                                        data.mem_range_max,
-                                    ),
+                                        i,
+                                        pin.map(|p| p.voltage),
+                                        pin.map(|p| p.current),
+                                        &settings,
+                                    );
+                                }
+                            });
+                        }
+                    },
+                );
+                ui.add_space(4.0);
+
+                // Top GPU-using processes (NVML), highest first; the critical
+                // alert safeguard (when enabled) kills the first entry.
+                let safeguard = settings.kill_top_process_on_red;
+                card(
+                    ui,
+                    "Top GPU processes",
+                    |ui| {
+                        if safeguard {
+                            ui.label(
+                                egui::RichText::new("kill safeguard armed")
+                                    .size(11.0)
+                                    .color(palette::RED.gamma_multiply(0.85)),
+                            )
+                            .on_hover_text(
+                                "On a red current, the first process in this list is killed \
+                             (see Settings → Critical-alert safeguard).",
+                            );
+                        }
+                    },
+                    |ui| {
+                        if data.sample.processes.is_empty() {
+                            ui.label(
+                                egui::RichText::new("No GPU-using processes")
+                                    .size(12.0)
+                                    .color(palette::DIM),
+                            );
+                        }
+                        for (rank, p) in data.sample.processes.iter().enumerate() {
+                            process_row(ui, rank, p, safeguard);
+                        }
+                    },
+                );
+                ui.add_space(4.0);
+
+                // History: per-pin current graphs (rows 0-1) plus GPU metric
+                // graphs (power, temperature, VRAM) in row 2, all sharing the
+                // time window picked in the header. Hiding them only stops the
+                // drawing; history keeps accumulating.
+                // Cells: the header closure edits these, the body reads them.
+                let window_idx = std::cell::Cell::new(self.window_idx as usize);
+                let show_graphs = std::cell::Cell::new(self.show_graphs);
+                card(
+                    ui,
+                    "History",
+                    |ui| {
+                        if ui
+                            .small_button(if show_graphs.get() { "Hide" } else { "Show" })
+                            .on_hover_text("Show or hide the graphs")
+                            .clicked()
+                        {
+                            show_graphs.set(!show_graphs.get());
+                        }
+                        if show_graphs.get() {
+                            ui.add_space(6.0);
+                            // Right to left: add the longest window first.
+                            for (i, &min) in HORIZONS_MIN.iter().enumerate().rev() {
+                                if ui
+                                    .selectable_label(i == window_idx.get(), format!("{min}m"))
+                                    .clicked()
+                                {
+                                    window_idx.set(i);
                                 }
                             }
                         }
-                    });
-                }
-            }
-        });
+                    },
+                    |ui| {
+                        if !show_graphs.get() {
+                            return;
+                        }
+                        let spacing = 10.0;
+                        let graph_w = ((ui.available_width() - 2.0 * spacing) / 3.0).max(60.0);
+                        // Each graph: an 18 px title row + the plot; 60 px is the
+                        // minimum plot height, extra vertical space is used.
+                        let graph_h =
+                            ((ui.available_height() - 3.0 * 18.0 - 2.0 * spacing) / 3.0).max(60.0);
+                        let size = egui::vec2(graph_w, graph_h);
+                        for row in 0..3 {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = spacing;
+                                for col in 0..3 {
+                                    if row < 2 {
+                                        let pin = row * 3 + col;
+                                        add_pin_graph(
+                                            ui,
+                                            pin,
+                                            &data.history[pin],
+                                            graph_now,
+                                            window_secs,
+                                            size,
+                                            &settings,
+                                        );
+                                    } else {
+                                        let (title, hist, color, unit, y_max) = match col {
+                                            0 => (
+                                                "Power",
+                                                &data.power_history,
+                                                palette::POWER,
+                                                "W",
+                                                data.power_range_max,
+                                            ),
+                                            1 => (
+                                                "Temperature",
+                                                &data.temp_history,
+                                                palette::TEMP,
+                                                "°C",
+                                                data.temp_range_max,
+                                            ),
+                                            _ => (
+                                                "VRAM",
+                                                &data.mem_history,
+                                                palette::VRAM,
+                                                "GB",
+                                                data.mem_range_max,
+                                            ),
+                                        };
+                                        add_metric_graph(
+                                            ui,
+                                            title,
+                                            hist,
+                                            graph_now,
+                                            window_secs,
+                                            size,
+                                            color,
+                                            unit,
+                                            y_max,
+                                        );
+                                    }
+                                }
+                            });
+                            if row < 2 {
+                                ui.add_space(spacing - ui.spacing().item_spacing.y);
+                            }
+                        }
+                    },
+                );
+                self.window_idx = window_idx.get() as u8;
+                self.show_graphs = show_graphs.get();
+            });
 
         // One-shot warning (port in use, denied power authentication, ...) as
         // a small dialog; OK clears it.
@@ -800,7 +1200,10 @@ impl eframe::App for App {
                     // The Accept/Cancel/Reset bar stays at the bottom of the
                     // window, visible no matter how tall the content is; the
                     // content itself scrolls.
-                    egui::Panel::bottom("settings_buttons").show(ui, |ui| {
+                    // Both panels frameless: the dialog reads as one surface.
+                    egui::Panel::bottom("settings_buttons")
+                        .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(0, 8)))
+                        .show(ui, |ui| {
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 // Right-to-left: added first = rightmost, so
                                 // Accept ends up to the left of Cancel and
@@ -837,11 +1240,11 @@ Apply the reset with Accept, discard it with Cancel."
                                 }
                             });
                         });
-                    egui::CentralPanel::default().show(ui, |ui| {
+                    egui::CentralPanel::default().frame(egui::Frame::new()).show(ui, |ui| {
                         egui::ScrollArea::vertical().show(ui, |ui| {
                             ui.set_min_width(400.0);
 
-                            ui.strong("Current limits");
+                            settings_section(ui, "Current limits");
                             let mut yellow = draft.alerts.yellow_limit_a;
                             ui.add(
                                 egui::Slider::new(&mut yellow, MIN_LIMIT_A..=draft.alerts.red_limit_a)
@@ -859,9 +1262,8 @@ Apply the reset with Accept, discard it with Cancel."
                             );
                             draft.alerts.red_limit_a = (red * 10.0).round() / 10.0;
 
-                            ui.add_space(6.0);
                             ui.separator();
-                            ui.strong("Alert sounds");
+                            settings_section(ui, "Alert sounds");
                             ui.checkbox(
                                 &mut draft.alerts.yellow_sound_enabled,
                                 "Play sound when the yellow limit is surpassed",
@@ -883,12 +1285,11 @@ Apply the reset with Accept, discard it with Cancel."
                                 &mut open_browser,
                             );
 
-                            ui.add_space(6.0);
                             ui.separator();
                             // Lower the GPU power limit to its minimum when a pin
                             // reaches the selected limit. Applying it needs root, so
                             // the first change asks polkit (pkexec) for a password.
-                            ui.strong("Automatic power limit");
+                            settings_section(ui, "Automatic power limit");
                             let auto_labels = ["Never", "On yellow limit", "On red limit"];
                             let mut auto_idx = draft.alerts.auto_min_power.index();
                             ui.horizontal(|ui| {
@@ -961,11 +1362,10 @@ Apply the reset with Accept, discard it with Cancel."
                                 let _ = self.cmd_tx.send(Cmd::GrantPowerAccess);
                             }
 
-                            ui.add_space(6.0);
                             ui.separator();
                             // Last-resort protection: SIGKILL the top GPU-using
                             // process on the rising edge into the red range.
-                            ui.strong("Critical-alert safeguard");
+                            settings_section(ui, "Critical-alert safeguard");
                             ui.checkbox(
                                 &mut draft.alerts.kill_top_process_on_red,
                                 "Kill the top GPU-using process when the red limit is reached",
@@ -1003,9 +1403,8 @@ Apply the reset with Accept, discard it with Cancel."
                                 &mut open_browser,
                             );
 
-                            ui.add_space(6.0);
                             ui.separator();
-                            ui.strong("Sampling");
+                            settings_section(ui, "Sampling");
                             ui.horizontal(|ui| {
                                 ui.label("Sample interval:");
                                 ui.add(
@@ -1015,13 +1414,12 @@ Apply the reset with Accept, discard it with Cancel."
                                 );
                             });
 
-                            ui.add_space(6.0);
                             ui.separator();
                             // The HTTP server mirroring this UI for other devices.
                             // Disabled by default; applied on Accept, where a busy or
                             // invalid port is rejected with a warning (a server that
                             // is already running keeps its port).
-                            ui.strong("Web server");
+                            settings_section(ui, "Web server");
                             ui.horizontal(|ui| {
                                 ui.label("Port:");
                                 if ui
@@ -1265,9 +1663,77 @@ Apply the reset with Accept, discard it with Cancel."
     }
 }
 
-/// Draw one small graph of a pin's current over the visible time window.
-/// The line is colored per segment by the current thresholds, and the
-/// yellow/red limits are drawn as horizontal reference lines.
+/// One row of the "Top GPU processes" card: name (clipped), a utilization
+/// meter with its percentage, and the VRAM use right-aligned. With the
+/// kill safeguard on, the first row is tagged as its target.
+fn process_row(ui: &mut egui::Ui, rank: usize, p: &GpuProcess, safeguard: bool) {
+    let w = ui.available_width();
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 20.0), egui::Sense::hover());
+    let painter = ui.painter();
+    let mid = rect.center().y;
+    let mono = egui::FontId::monospace(12.0);
+    painter.text(
+        egui::pos2(rect.right(), mid),
+        egui::Align2::RIGHT_CENTER,
+        format!("{:.2} GB", p.mem_bytes as f64 / GIB),
+        mono.clone(),
+        palette::TEXT,
+    );
+    let pct_right = rect.right() - 84.0;
+    painter.text(
+        egui::pos2(pct_right, mid),
+        egui::Align2::RIGHT_CENTER,
+        format!("{:>3} %", p.util_percent),
+        mono,
+        palette::DIM,
+    );
+    let bar = egui::Rect::from_min_size(
+        egui::pos2(pct_right - 120.0, mid - 3.0),
+        egui::vec2(80.0, 6.0),
+    );
+    let r = egui::CornerRadius::same(3);
+    painter.rect_filled(bar, r, palette::TRACK);
+    let frac = (p.util_percent as f32 / 100.0).clamp(0.0, 1.0);
+    if frac > 0.0 {
+        let fill =
+            egui::Rect::from_min_size(bar.min, egui::vec2((bar.width() * frac).max(6.0), 6.0));
+        painter.rect_filled(fill, r, palette::ACCENT);
+    }
+    // The name gets whatever is left of the meter.
+    let name_clip =
+        egui::Rect::from_min_max(rect.min, egui::pos2(bar.left() - 12.0, rect.bottom()));
+    let name = painter.layout_no_wrap(
+        p.name.clone(),
+        egui::FontId::proportional(13.0),
+        palette::TEXT,
+    );
+    let name_w = name.size().x;
+    painter.with_clip_rect(name_clip).galley(
+        egui::pos2(rect.left(), mid - name.size().y / 2.0),
+        name,
+        palette::TEXT,
+    );
+    if rank == 0 && safeguard {
+        let tag = painter.layout_no_wrap(
+            "TARGET".to_owned(),
+            egui::FontId::proportional(10.0),
+            palette::RED,
+        );
+        let x = (rect.left() + name_w + 8.0).min(name_clip.right() - tag.size().x - 8.0);
+        let tag_rect = egui::Rect::from_min_size(
+            egui::pos2(x, mid - tag.size().y / 2.0 - 1.0),
+            tag.size() + egui::vec2(8.0, 2.0),
+        );
+        painter.rect_filled(
+            tag_rect,
+            egui::CornerRadius::same(4),
+            palette::RED.gamma_multiply(0.18),
+        );
+        painter.galley(tag_rect.min + egui::vec2(4.0, 1.0), tag, palette::RED);
+    }
+    resp.on_hover_text(format!("{} (pid {})", p.name, p.pid));
+}
+
 /// Hover readout shared by all graphs: while the pointer is inside the
 /// graph rect, draw a faint vertical crosshair, a marker on the data line,
 /// and a label with the value of the nearest sample.
@@ -1314,46 +1780,111 @@ fn draw_hover_readout(
     let x = x_of(ts) as f32;
     let y = y_of(v) as f32;
 
-    let dim = ui.visuals().weak_text_color();
     painter.vline(
         x,
         rect.top()..=rect.bottom(),
-        egui::Stroke::new(1.0, dim.gamma_multiply(0.5)),
+        egui::Stroke::new(1.0, palette::DIM.gamma_multiply(0.4)),
     );
     painter.circle(
         egui::Pos2::new(x, y),
-        3.0,
+        3.5,
         dot_color(v),
-        egui::Stroke::new(1.0, ui.visuals().faint_bg_color),
+        egui::Stroke::new(1.5, palette::PLOT),
     );
     // Value label next to the crosshair, flipping sides near the right edge.
     let galley = painter.layout_no_wrap(
         format!("{v:.2} {unit}"),
         egui::FontId::monospace(11.0),
-        ui.visuals().strong_text_color(),
+        palette::TEXT,
     );
-    let mut label_x = x + 6.0;
-    if label_x + galley.size().x > rect.right() - 2.0 {
-        label_x = (x - galley.size().x - 6.0).max(rect.left() + 1.0);
+    let mut label_x = x + 8.0;
+    if label_x + galley.size().x + 6.0 > rect.right() - 2.0 {
+        label_x = (x - galley.size().x - 14.0).max(rect.left() + 2.0);
     }
     // Backing so the label stays readable over the lines.
+    let backing = egui::Rect::from_min_size(
+        egui::Pos2::new(label_x, rect.top() + 4.0),
+        galley.size() + egui::vec2(8.0, 4.0),
+    );
     painter.rect(
-        egui::Rect::from_min_size(
-            egui::Pos2::new(label_x - 1.0, rect.top() + 1.0),
-            galley.size() + egui::vec2(2.0, 2.0),
-        ),
-        0.0,
-        ui.visuals().faint_bg_color,
-        egui::Stroke::NONE,
-        egui::StrokeKind::Middle,
+        backing,
+        egui::CornerRadius::same(4),
+        palette::TILE,
+        egui::Stroke::new(1.0, palette::CARD_STROKE),
+        egui::StrokeKind::Inside,
     );
-    painter.galley(
-        egui::Pos2::new(label_x, rect.top() + 2.0),
-        galley,
-        ui.visuals().strong_text_color(),
-    );
+    painter.galley(backing.min + egui::vec2(4.0, 2.0), galley, palette::TEXT);
 }
 
+/// Title row above a graph: the series name on the left and its newest
+/// value (in `color`) on the right.
+fn graph_title(
+    ui: &mut egui::Ui,
+    width: f32,
+    title: &str,
+    value: Option<String>,
+    color: egui::Color32,
+) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 18.0), egui::Sense::hover());
+    let painter = ui.painter();
+    painter.text(
+        rect.left_center(),
+        egui::Align2::LEFT_CENTER,
+        title,
+        egui::FontId::proportional(12.0),
+        palette::DIM,
+    );
+    if let Some(value) = value {
+        painter.text(
+            rect.right_center(),
+            egui::Align2::RIGHT_CENTER,
+            value,
+            egui::FontId::monospace(12.0),
+            color,
+        );
+    }
+}
+
+/// Rounded plot area with a faint horizontal grid at the quarters.
+fn plot_background(painter: &egui::Painter, rect: egui::Rect) {
+    painter.rect_filled(rect, egui::CornerRadius::same(6), palette::PLOT);
+    let grid = egui::Stroke::new(1.0, palette::TRACK.gamma_multiply(0.6));
+    for i in 1..4 {
+        let y = rect.top() + rect.height() * i as f32 / 4.0;
+        painter.hline(rect.left() + 4.0..=rect.right() - 4.0, y, grid);
+    }
+}
+
+/// Soft area fill under a line: one quad per segment from the line down to
+/// `bottom`, fading from `alpha` of the segment's color to transparent.
+fn draw_area(
+    painter: &egui::Painter,
+    line: &[(f64, f64)],
+    bottom: f32,
+    alpha: f32,
+    x_of: impl Fn(f64) -> f64,
+    y_of: impl Fn(f64) -> f64,
+    color_of: impl Fn(f64) -> egui::Color32,
+) {
+    let mut mesh = egui::Mesh::default();
+    for j in 1..line.len() {
+        let top = color_of(line[j].1).gamma_multiply(alpha);
+        let a = egui::pos2(x_of(line[j - 1].0) as f32, y_of(line[j - 1].1) as f32);
+        let b = egui::pos2(x_of(line[j].0) as f32, y_of(line[j].1) as f32);
+        let i = mesh.vertices.len() as u32;
+        mesh.colored_vertex(a, top);
+        mesh.colored_vertex(b, top);
+        mesh.colored_vertex(egui::pos2(b.x, bottom), egui::Color32::TRANSPARENT);
+        mesh.colored_vertex(egui::pos2(a.x, bottom), egui::Color32::TRANSPARENT);
+        mesh.add_triangle(i, i + 1, i + 2);
+        mesh.add_triangle(i, i + 2, i + 3);
+    }
+    painter.add(egui::Shape::mesh(mesh));
+}
+
+/// Draw one small graph of a pin's current over the visible time window.
+/// The line is colored per segment by the current thresholds, and the
+/// yellow/red limits are drawn as dashed reference lines.
 fn add_pin_graph(
     ui: &mut egui::Ui,
     pin: usize,
@@ -1364,25 +1895,25 @@ fn add_pin_graph(
     settings: &Settings,
 ) {
     ui.vertical(|ui| {
-        ui.label(egui::RichText::new(format!("Pin {pin}")).strong());
-        let (resp, painter) = ui.allocate_painter(size, egui::Sense::hover());
-        let rect = resp.rect;
-
-        // Background and frame
-        painter.rect(
-            rect,
-            0.0,
-            ui.visuals().faint_bg_color,
-            ui.visuals().widgets.noninteractive.bg_stroke,
-            egui::StrokeKind::Middle,
-        );
-
+        ui.spacing_mut().item_spacing.y = 2.0;
         let t0 = now - window_secs;
         let k = hist.partition_point(|(t, _)| *t < t0);
         let vis = &hist[k..];
+        let latest = vis.last().map(|&(_, v)| v);
+        graph_title(
+            ui,
+            size.x,
+            &format!("Pin {pin}"),
+            latest.map(|v| format!("{v:.2} A")),
+            latest.map_or(palette::DIM, |v| current_color(v, settings)),
+        );
+        let (resp, painter) = ui.allocate_painter(size, egui::Sense::hover());
+        let rect = resp.rect;
+        plot_background(&painter, rect);
 
         // Y range: always keep both limit lines visible, grow for spikes
-        let base_max = settings.red_limit_a as f64 * 1.1;
+        // (30 % headroom above red leaves room for the red limit's label.)
+        let base_max = settings.red_limit_a as f64 * 1.3;
         let mut y_max: f64 = base_max;
         for (_, v) in vis {
             y_max = y_max.max(*v * 1.05);
@@ -1390,65 +1921,64 @@ fn add_pin_graph(
         let y_of = |v: f64| rect.top() as f64 + (1.0 - v / y_max) * rect.height() as f64;
         let x_of = |t: f64| rect.left() as f64 + (t - t0) / window_secs * rect.width() as f64;
 
-        // Limit reference lines with numeric labels. Muted and dashed so
-        // they recede behind the current line instead of competing with it.
+        // Limit reference lines, dashed and muted so they recede behind
+        // the current line. The red label sits above its line and the
+        // yellow one below its own, so the two never overlap.
         let small = egui::FontId::monospace(9.0);
-        let dim = ui.visuals().weak_text_color();
-        for (limit, color) in [
-            (
-                settings.yellow_limit_a as f64,
-                egui::Color32::from_rgb(165, 150, 75),
-            ),
-            (
-                settings.red_limit_a as f64,
-                egui::Color32::from_rgb(175, 85, 85),
-            ),
+        for (limit, color, above) in [
+            (settings.yellow_limit_a as f64, palette::YELLOW, false),
+            (settings.red_limit_a as f64, palette::RED, true),
         ] {
+            let color = color.gamma_multiply(0.55);
             let y = y_of(limit) as f32;
-            let mut x = rect.left();
-            while x < rect.right() {
-                let x_end = (x + 4.0).min(rect.right());
-                painter.line_segment(
-                    [egui::Pos2::new(x, y), egui::Pos2::new(x_end, y)],
-                    egui::Stroke::new(1.0, color),
-                );
-                x = x_end + 3.0;
-            }
-            painter.text(
-                egui::Pos2::new(rect.right() - 18.0, (y - 10.0).max(rect.top() + 1.0)),
-                egui::Align2::LEFT_TOP,
-                format!("{limit:.1}"),
-                small.clone(),
-                dim,
+            painter.add(egui::Shape::dashed_line(
+                &[egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+                egui::Stroke::new(1.0, color),
+                4.0,
+                3.0,
+            ));
+            let (anchor, dy) = if above {
+                (egui::Align2::RIGHT_BOTTOM, -1.0)
+            } else {
+                (egui::Align2::RIGHT_TOP, 1.0)
+            };
+            let label = painter.layout_no_wrap(format!("{limit:.1}"), small.clone(), color);
+            let mut label_rect =
+                anchor.anchor_size(egui::pos2(rect.right() - 4.0, y + dy), label.size());
+            // Keep it inside the plot (the painter clips to it).
+            label_rect = label_rect.translate(egui::vec2(
+                0.0,
+                (rect.top() + 2.0 - label_rect.top()).max(0.0)
+                    + (rect.bottom() - 2.0 - label_rect.bottom()).min(0.0),
+            ));
+            painter.rect_filled(
+                label_rect.expand(1.0),
+                egui::CornerRadius::same(2),
+                palette::PLOT.gamma_multiply(0.85),
             );
+            painter.galley(label_rect.min, label, color);
         }
 
         // Top scale label: only when the range has grown beyond the base
-        // limit scale; the limit lines otherwise define the scale
+        // limit scale; the limit lines otherwise define the scale.
         if y_max > base_max {
             painter.text(
-                egui::Pos2::new(rect.left() + 2.0, rect.top() + 1.0),
+                rect.left_top() + egui::vec2(4.0, 3.0),
                 egui::Align2::LEFT_TOP,
                 format!("{y_max:.0}"),
-                small.clone(),
-                dim,
+                small,
+                palette::DIM,
             );
         }
-        painter.text(
-            egui::Pos2::new(rect.left() + 2.0, rect.bottom() - 10.0),
-            egui::Align2::LEFT_TOP,
-            "0",
-            small,
-            dim,
-        );
 
         // Current line through one M4 bucket per point of width (see
         // `web::m4_downsample`: stable while the window slides, spikes
         // always kept). Each segment takes its end point's color.
         let line = m4_downsample(vis, window_secs / rect.width() as f64);
-        draw_line(&painter, &line, 1.0, x_of, y_of, |v| {
-            current_color(v, settings)
-        });
+        let clipped = painter.with_clip_rect(rect);
+        let color_of = |v: f64| current_color(v, settings);
+        draw_area(&clipped, &line, rect.bottom(), 0.16, x_of, y_of, color_of);
+        draw_line(&clipped, &line, 1.5, x_of, y_of, color_of);
 
         // Hover readout, drawn last so it sits above the lines.
         draw_hover_readout(
@@ -1461,7 +1991,7 @@ fn add_pin_graph(
             window_secs,
             x_of,
             y_of,
-            |v| current_color(v, settings),
+            color_of,
             "A",
         );
     });
@@ -1518,22 +2048,21 @@ fn add_metric_graph(
     y_max: Option<f64>,
 ) {
     ui.vertical(|ui| {
-        ui.label(egui::RichText::new(title).strong());
-        let (resp, painter) = ui.allocate_painter(size, egui::Sense::hover());
-        let rect = resp.rect;
-
-        // Background and frame
-        painter.rect(
-            rect,
-            0.0,
-            ui.visuals().faint_bg_color,
-            ui.visuals().widgets.noninteractive.bg_stroke,
-            egui::StrokeKind::Middle,
-        );
-
+        ui.spacing_mut().item_spacing.y = 2.0;
         let t0 = now - window_secs;
         let k = hist.partition_point(|(t, _)| *t < t0);
         let vis = &hist[k..];
+        let decimals = if unit == "°C" { 0 } else { 1 };
+        graph_title(
+            ui,
+            size.x,
+            title,
+            vis.last().map(|&(_, v)| format!("{v:.decimals$} {unit}")),
+            color,
+        );
+        let (resp, painter) = ui.allocate_painter(size, egui::Sense::hover());
+        let rect = resp.rect;
+        plot_background(&painter, rect);
 
         // Y range: the permanent scale from NVML (e.g. max power limit, max
         // temperature, total VRAM); auto-fit to the data when unknown.
@@ -1552,29 +2081,21 @@ fn add_metric_graph(
         let y_of =
             |v: f64| rect.top() as f64 + (1.0 - v.clamp(0.0, y_max) / y_max) * rect.height() as f64;
 
-        let small = egui::FontId::monospace(9.0);
-        let dim = ui.visuals().weak_text_color();
-
-        // Top and bottom scale labels
+        // Top scale label (the scale's maximum).
         painter.text(
-            egui::Pos2::new(rect.left() + 2.0, rect.top() + 1.0),
+            rect.left_top() + egui::vec2(4.0, 3.0),
             egui::Align2::LEFT_TOP,
             format!("{y_max:.0}"),
-            small.clone(),
-            dim,
-        );
-        painter.text(
-            egui::Pos2::new(rect.left() + 2.0, rect.bottom() - 10.0),
-            egui::Align2::LEFT_TOP,
-            "0",
-            small,
-            dim,
+            egui::FontId::monospace(9.0),
+            palette::DIM,
         );
 
         // Metric line through one M4 bucket per point of width (see
-        // `web::m4_downsample`).
+        // `web::m4_downsample`), over a soft fill.
         let line = m4_downsample(vis, window_secs / rect.width() as f64);
-        draw_line(&painter, &line, 1.5, x_of, y_of, |_| color);
+        let clipped = painter.with_clip_rect(rect);
+        draw_area(&clipped, &line, rect.bottom(), 0.22, x_of, y_of, |_| color);
+        draw_line(&clipped, &line, 1.5, x_of, y_of, |_| color);
 
         // Hover readout, drawn last so it sits above the lines.
         draw_hover_readout(
@@ -1595,7 +2116,7 @@ fn add_metric_graph(
 
 #[cfg(test)]
 mod tests {
-    use super::{pin_text, sensor_warning, ABOUT_TEXT};
+    use super::{reading_text, sensor_warning, ABOUT_TEXT};
 
     #[test]
     fn sensor_warning_covers_faults_and_staleness() {
@@ -1615,11 +2136,11 @@ mod tests {
     }
 
     #[test]
-    fn pin_text_shows_values_and_dashes() {
-        assert_eq!(pin_text(3, Some(9.5)), "Pin  3:   9.500");
+    fn readings_show_values_and_dashes() {
+        assert_eq!(reading_text(Some(9.5)), "9.50");
         // No reading (before the first sample or with the sensor down): a
-        // dash in the same column instead of a number (or a panic).
-        assert_eq!(pin_text(3, None), "Pin  3:       —");
+        // dash instead of a number (or a panic), never a green 0.00.
+        assert_eq!(reading_text(None), "\u{2014}");
     }
 
     /// The embedded license text is a generated artifact (`sh licenses.sh`
