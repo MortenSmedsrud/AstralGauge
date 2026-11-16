@@ -360,6 +360,12 @@ Optional (`Settings::auto_min_power` = Off / On yellow / On red):
   windows (`ui::HORIZONS_MIN`, duplicated as `HORIZONS` in the JS).
 - History timestamps (pin/power/temp/mem series) are seconds since
   `WebData::start`; the process list is snapshot-only (no history).
+- Graphs never decimate by stride (every Nth sample shimmers as the window
+  slides and drops spikes). Both UIs draw a line through
+  `web::m4_downsample` (↔ JS `m4`): per time bucket of about one pixel,
+  aligned to absolute time, the first/min/max/last point. `/data` series
+  are M4-reduced to `WEB_BUCKETS` (400) buckets server-side, then again to
+  the canvas width in the browser.
 - Colors: green `< yellow`, yellow `[yellow, red)`, red `>= red`
   (`ui::current_color` ↔ JS `currentColor`); tables/graphs use the applied
   `Settings`, never hard-coded thresholds (the JS fetches live `limits`
@@ -387,7 +393,7 @@ Optional (`Settings::auto_min_power` = Off / On yellow / On red):
 
 ## Tests
 
-`cargo test` (34 tests, no GPU/display needed):
+`cargo test` (35 tests, no GPU/display needed):
 
 - `alerts::tests`: settings defaults; embedded WAVs decode; alert edge
   triggering; 15 s repeat-while-exceeded behavior; powering-down sound
@@ -413,7 +419,8 @@ Optional (`Settings::auto_min_power` = Off / On yellow / On red):
 - `web::tests`: JSON field content (incl. process entries, name escaping and
   the latching `critical_alert` flag, `sensor_error`, `pins_age`),
   `record()` history append/prune/range caching and gaps (no zeros) for
-  samples without pins, the stale threshold, query-param parsing, HTTP server serve/404/busy-port/restart and
+  samples without pins, M4 graph downsampling (spikes kept, complete
+  buckets unchanged while the window slides), the stale threshold, query-param parsing, HTTP server serve/404/busy-port/restart and
   the `POST /ack` dismissal.
 
 Tests that bind ports use `free_port()` (bind :0, drop, reuse).

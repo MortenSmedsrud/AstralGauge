@@ -15,7 +15,7 @@ use std::time::Duration;
 use crate::alerts::{AutoMinPower, EmbeddedSound, Settings, Sound, MAX_LIMIT_A, MIN_LIMIT_A};
 use crate::hardware::{AuthState, Cmd, DEFAULT_POLL_MS};
 use crate::persist;
-use crate::web::{stale_after_secs, WebData, WebServer, WebState, DEFAULT_WEB_PORT};
+use crate::web::{m4_downsample, stale_after_secs, WebData, WebServer, WebState, DEFAULT_WEB_PORT};
 
 pub(crate) const HORIZONS_MIN: [u32; 6] = [1, 5, 10, 15, 30, 60];
 
@@ -1432,31 +1432,13 @@ fn add_pin_graph(
             dim,
         );
 
-        // Current line: downsample to ~2 points/px, colored per segment.
-        // The final step is shortened so the line always ends on the newest sample.
-        let n = vis.len();
-        if n >= 2 {
-            let max_pts = (size.x as usize).saturating_mul(2).max(2);
-            let stride = n.div_ceil(max_pts).clamp(1, n - 1);
-            let seg = |i: usize, j: usize| {
-                painter.line_segment(
-                    [
-                        egui::Pos2::new(x_of(vis[i].0) as f32, y_of(vis[i].1) as f32),
-                        egui::Pos2::new(x_of(vis[j].0) as f32, y_of(vis[j].1) as f32),
-                    ],
-                    egui::Stroke::new(1.0, current_color(vis[j].1, settings)),
-                );
-            };
-            let mut i = 0;
-            while i + stride < n {
-                let j = i + stride;
-                seg(i, j);
-                i = j;
-            }
-            if i < n - 1 {
-                seg(i, n - 1);
-            }
-        }
+        // Current line through one M4 bucket per point of width (see
+        // `web::m4_downsample`: stable while the window slides, spikes
+        // always kept). Each segment takes its end point's color.
+        let line = m4_downsample(vis, window_secs / rect.width() as f64);
+        draw_line(&painter, &line, 1.0, x_of, y_of, |v| {
+            current_color(v, settings)
+        });
 
         // Hover readout, drawn last so it sits above the lines.
         draw_hover_readout(
@@ -1473,6 +1455,39 @@ fn add_pin_graph(
             "A",
         );
     });
+}
+
+/// Draw a polyline through `line` (time-sorted (t, v) points). Each segment
+/// takes `color_of` its end point; runs of one color are drawn as a single
+/// path so the joins stay clean.
+fn draw_line(
+    painter: &egui::Painter,
+    line: &[(f64, f64)],
+    width: f32,
+    x_of: impl Fn(f64) -> f64,
+    y_of: impl Fn(f64) -> f64,
+    color_of: impl Fn(f64) -> egui::Color32,
+) {
+    let pos = |p: &(f64, f64)| egui::Pos2::new(x_of(p.0) as f32, y_of(p.1) as f32);
+    let mut run: Vec<egui::Pos2> = Vec::new();
+    let mut run_color = None;
+    for j in 1..line.len() {
+        let c = color_of(line[j].1);
+        if run_color != Some(c) {
+            if let Some(rc) = run_color {
+                painter.add(egui::Shape::line(
+                    std::mem::take(&mut run),
+                    egui::Stroke::new(width, rc),
+                ));
+            }
+            run_color = Some(c);
+            run.push(pos(&line[j - 1]));
+        }
+        run.push(pos(&line[j]));
+    }
+    if let Some(rc) = run_color {
+        painter.add(egui::Shape::line(run, egui::Stroke::new(width, rc)));
+    }
 }
 
 /// Draw one small line graph of a GPU metric (power, temperature, VRAM) over
@@ -1546,31 +1561,10 @@ fn add_metric_graph(
             dim,
         );
 
-        // Metric line, downsampled to ~2 points/px. The final step is
-        // shortened so the line always ends on the newest sample.
-        let n = vis.len();
-        if n >= 2 {
-            let max_pts = (size.x as usize).saturating_mul(2).max(2);
-            let stride = n.div_ceil(max_pts).clamp(1, n - 1);
-            let seg = |i: usize, j: usize| {
-                painter.line_segment(
-                    [
-                        egui::Pos2::new(x_of(vis[i].0) as f32, y_of(vis[i].1) as f32),
-                        egui::Pos2::new(x_of(vis[j].0) as f32, y_of(vis[j].1) as f32),
-                    ],
-                    egui::Stroke::new(1.5, color),
-                );
-            };
-            let mut i = 0;
-            while i + stride < n {
-                let j = i + stride;
-                seg(i, j);
-                i = j;
-            }
-            if i < n - 1 {
-                seg(i, n - 1);
-            }
-        }
+        // Metric line through one M4 bucket per point of width (see
+        // `web::m4_downsample`).
+        let line = m4_downsample(vis, window_secs / rect.width() as f64);
+        draw_line(&painter, &line, 1.5, x_of, y_of, |_| color);
 
         // Hover readout, drawn last so it sits above the lines.
         draw_hover_readout(

@@ -20,9 +20,10 @@ use crate::hardware::{AuthState, Sample, DEFAULT_POLL_MS, NUM_PINS};
 /// Default port for the web interface (editable in the UI).
 pub(crate) const DEFAULT_WEB_PORT: u16 = 8666;
 
-/// Max points per series sent to a web client; the canvas can't show more
-/// anyway, and it keeps the payload small at the 60-minute horizon.
-const WEB_MAX_PTS: usize = 600;
+/// Time buckets per series sent to a web client (see [`m4_downsample`]: at
+/// most 4 points each). About one per canvas pixel, so the browser can't
+/// show more anyway, and it bounds the payload at the 60-minute horizon.
+const WEB_BUCKETS: f64 = 400.0;
 
 /// Keep a little more history than the largest horizon
 pub(crate) const HISTORY_SECS: f64 = 60.0 * 60.0 + 120.0;
@@ -446,40 +447,75 @@ fn web_json(data: &WebData, window_secs: f64) -> String {
         if i > 0 {
             out.push(',');
         }
-        push_series(&mut out, hist, t_min);
+        push_series(&mut out, hist, t_min, window_secs);
     }
     out.push_str("],\"power\":");
-    push_series(&mut out, &data.power_history, t_min);
+    push_series(&mut out, &data.power_history, t_min, window_secs);
     out.push_str(",\"temp\":");
-    push_series(&mut out, &data.temp_history, t_min);
+    push_series(&mut out, &data.temp_history, t_min, window_secs);
     out.push_str(",\"mem\":");
-    push_series(&mut out, &data.mem_history, t_min);
+    push_series(&mut out, &data.mem_history, t_min, window_secs);
     out.push_str("}}");
     out
 }
 
+/// M4 downsampling for line graphs: split the time-sorted `pts` into
+/// buckets of `bucket_secs` and keep each bucket's first, min, max and last
+/// point (in time order, duplicates once). With about one bucket per pixel,
+/// a polyline through the result draws the same picture as one through
+/// every sample: no spike is ever dropped.
+///
+/// Buckets are aligned to absolute time (`floor(t / bucket_secs)`), not to
+/// the window start, so as the window slides every complete bucket keeps
+/// exactly the same points and the line does not shimmer. (Picking every
+/// Nth sample counted from the window start chose a different subset on
+/// each poll.) Mirrored by `m4` in `INDEX_HTML`'s JS.
+pub(crate) fn m4_downsample(pts: &[(f64, f64)], bucket_secs: f64) -> Vec<(f64, f64)> {
+    if !bucket_secs.is_finite() || bucket_secs <= 0.0 || pts.len() <= 4 {
+        return pts.to_vec();
+    }
+    let mut out = Vec::with_capacity(pts.len().min(4 * 1024));
+    let mut start = 0;
+    while start < pts.len() {
+        let b = (pts[start].0 / bucket_secs).floor();
+        let mut end = start + 1;
+        while end < pts.len() && (pts[end].0 / bucket_secs).floor() == b {
+            end += 1;
+        }
+        let bucket = &pts[start..end];
+        let (mut lo, mut hi) = (0, 0);
+        for (i, p) in bucket.iter().enumerate() {
+            if p.1 < bucket[lo].1 {
+                lo = i;
+            }
+            if p.1 > bucket[hi].1 {
+                hi = i;
+            }
+        }
+        let mut idx = [0, lo, hi, bucket.len() - 1];
+        idx.sort_unstable();
+        for (n, &i) in idx.iter().enumerate() {
+            if n == 0 || idx[n - 1] != i {
+                out.push(bucket[i]);
+            }
+        }
+        start = end;
+    }
+    out
+}
+
 /// Append one history as a JSON array of [t, v] pairs, restricted to the
-/// visible window and downsampled to at most WEB_MAX_PTS points (always
-/// keeping the newest sample).
-fn push_series(out: &mut String, hist: &[(f64, f64)], t_min: f64) {
+/// visible window and M4-downsampled into WEB_BUCKETS time buckets (the
+/// newest sample is always the last point of the last bucket).
+fn push_series(out: &mut String, hist: &[(f64, f64)], t_min: f64, window: f64) {
     let k = hist.partition_point(|(t, _)| *t < t_min);
-    let vis = &hist[k..];
-    if vis.is_empty() {
-        out.push_str("[]");
-        return;
-    }
-    let n = vis.len();
-    let stride = n.div_ceil(WEB_MAX_PTS).max(1);
-    let mut idx: Vec<usize> = (0..n).step_by(stride).collect();
-    if idx.last() != Some(&(n - 1)) {
-        idx.push(n - 1);
-    }
+    let pts = m4_downsample(&hist[k..], window / WEB_BUCKETS);
     out.push('[');
-    for (i, &j) in idx.iter().enumerate() {
+    for (i, (t, v)) in pts.iter().enumerate() {
         if i > 0 {
             out.push(',');
         }
-        out.push_str(&format!("[{:.1},{:.2}]", vis[j].0, vis[j].1));
+        out.push_str(&format!("[{t:.2},{v:.2}]"));
     }
     out.push(']');
 }
@@ -666,6 +702,31 @@ function currentColor(v) {
   return '#f03c3c';
 }
 
+// M4 downsampling, mirroring web::m4_downsample: per time bucket of
+// `bucket` seconds (aligned to absolute time), keep the first, min, max and
+// last point in time order.
+function m4(pts, bucket) {
+  if (!(bucket > 0) || pts.length <= 4) return pts;
+  const out = [];
+  let s = 0;
+  while (s < pts.length) {
+    const b = Math.floor(pts[s][0] / bucket);
+    let e = s + 1;
+    while (e < pts.length && Math.floor(pts[e][0] / bucket) === b) e++;
+    let lo = s, hi = s;
+    for (let i = s; i < e; i++) {
+      if (pts[i][1] < pts[lo][1]) lo = i;
+      if (pts[i][1] > pts[hi][1]) hi = i;
+    }
+    const idx = [s, lo, hi, e - 1].sort(function (a, b) { return a - b; });
+    for (let n = 0; n < 4; n++) {
+      if (n === 0 || idx[n] !== idx[n - 1]) out.push(pts[idx[n]]);
+    }
+    s = e;
+  }
+  return out;
+}
+
 function drawGraph(cv, pts, now, win, fixedMax, idx) {
   drawArgs[idx] = [pts, now, win, fixedMax, idx];
   const dpr = window.devicePixelRatio || 1;
@@ -722,29 +783,26 @@ function drawGraph(cv, pts, now, win, fixedMax, idx) {
     }
   }
 
-  if (n >= 2) {
-    const maxPts = Math.max(2, Math.floor(w) * 2);
-    const stride = Math.max(1, Math.ceil(n / maxPts));
+  // Line through one M4 bucket per CSS pixel (time-aligned, so it stays
+  // put while the window slides; spikes always survive). Each segment takes
+  // the color of its end point; runs of one color share a path.
+  const line = m4(vis, win / w);
+  if (line.length >= 2) {
     ctx.lineWidth = isPin ? 1 : 1.5;
-    if (!isPin) ctx.strokeStyle = METRIC_COLORS[idx];
-    let i = 0;
-    while (i + stride < n) {
-      const j = i + stride;
-      ctx.beginPath();
-      ctx.moveTo(xOf(vis[i][0]), yOf(vis[i][1]));
-      ctx.lineTo(xOf(vis[j][0]), yOf(vis[j][1]));
-      if (isPin) ctx.strokeStyle = currentColor(vis[j][1]);
-      ctx.stroke();
-      i = j;
+    ctx.lineJoin = 'round';
+    let col = null;
+    for (let j = 1; j < line.length; j++) {
+      const c = isPin ? currentColor(line[j][1]) : METRIC_COLORS[idx];
+      if (c !== col) {
+        if (col !== null) ctx.stroke();
+        col = c;
+        ctx.strokeStyle = c;
+        ctx.beginPath();
+        ctx.moveTo(xOf(line[j - 1][0]), yOf(line[j - 1][1]));
+      }
+      ctx.lineTo(xOf(line[j][0]), yOf(line[j][1]));
     }
-    if (i < n - 1) {
-      const j = n - 1;
-      ctx.beginPath();
-      ctx.moveTo(xOf(vis[i][0]), yOf(vis[i][1]));
-      ctx.lineTo(xOf(vis[j][0]), yOf(vis[j][1]));
-      if (isPin) ctx.strokeStyle = currentColor(vis[j][1]);
-      ctx.stroke();
-    }
+    ctx.stroke();
   }
 
   // Hover readout, drawn last so it sits above the lines.
@@ -1116,6 +1174,53 @@ mod tests {
         assert!(json.contains("\"pins\":[]"));
         assert!(json.contains("\"pins_age\":"));
         assert!(!json.contains("\"pins_age\":null"));
+    }
+
+    #[test]
+    fn m4_keeps_extremes_and_is_stable_while_sliding() {
+        // 10 samples per second for 100 s; one single-sample spike at 42.3 s.
+        let pts: Vec<(f64, f64)> = (0..1000)
+            .map(|i| {
+                let t = i as f64 * 0.1;
+                (
+                    t,
+                    if i == 423 {
+                        50.0
+                    } else {
+                        5.0 + (i % 7) as f64 * 0.1
+                    },
+                )
+            })
+            .collect();
+        let out = m4_downsample(&pts, 1.0);
+        // At most 4 points per 1 s bucket, time order, newest sample last.
+        assert!(out.len() <= 4 * 100);
+        assert!(out.windows(2).all(|w| w[0].0 < w[1].0));
+        assert_eq!(out.last(), pts.last());
+        // The spike survives (stride decimation could skip it).
+        assert!(out.contains(&pts[423]) && pts[423].1 == 50.0);
+        // Every bucket keeps its true min and max.
+        assert_eq!(out.iter().map(|p| p.1).fold(f64::MAX, f64::min), 5.0);
+
+        // Sliding the window (dropping old samples, appending new ones)
+        // leaves every complete bucket's points unchanged.
+        let slid: Vec<(f64, f64)> = pts[37..]
+            .iter()
+            .copied()
+            .chain((1000..1037).map(|i| (i as f64 * 0.1, 5.0)))
+            .collect();
+        let out2 = m4_downsample(&slid, 1.0);
+        let middle = |o: &[(f64, f64)]| -> Vec<(f64, f64)> {
+            o.iter()
+                .copied()
+                .filter(|p| p.0 >= 4.0 && p.0 < 99.0)
+                .collect()
+        };
+        assert_eq!(middle(&out), middle(&out2));
+
+        // Short series and a zero bucket width pass through untouched.
+        assert_eq!(m4_downsample(&pts[..4], 1.0), pts[..4].to_vec());
+        assert_eq!(m4_downsample(&pts, 0.0), pts);
     }
 
     #[test]
