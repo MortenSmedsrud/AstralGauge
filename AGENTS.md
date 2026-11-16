@@ -16,6 +16,9 @@ rails of an **ASUS RTX 5090 ROG Astral** GPU:
   color coding everywhere and optional **alert sounds** (rodio).
 - A built-in **web server** mirrors the whole UI (page + JSON API) for other
   devices; graphs support hover readouts everywhere.
+- Optionally it runs as a **background service** (systemd user unit,
+  installed from the settings dialog); the desktop app then shows the
+  service's data instead of reading the hardware itself.
 
 Target platform is Linux only (i2c-dev ioctls, `/sys/bus/i2c`, NVML).
 
@@ -23,6 +26,7 @@ Target platform is Linux only (i2c-dev ioctls, `/sys/bus/i2c`, NVML).
 
 ```sh
 cargo run -- [i2c-bus-number]   # e.g. cargo run -- 15
+cargo run -- --service [bus]    # headless service mode (what the unit runs)
 cargo test                      # unit tests (no GPU/display required)
 cargo check
 sh licenses.sh                  # regenerate the embedded license text
@@ -34,6 +38,9 @@ sh licenses.sh                  # regenerate the embedded license text
   `/sys/bus/i2c/devices/*/name` for `"NVIDIA i2c adapter 1 at <PCI>"`, then
   probes candidates for a sane 10–14 V reading). No fallback bus: without
   one the sensor is reported unavailable (guessing would read garbage).
+  The poller retries a missing bus / unopenable `/dev/i2c-N` / NVML with a
+  backoff (`DEVICE_RETRY_FIRST` 2 s doubling to `DEVICE_RETRY_MAX` 30 s), so
+  a service started before the driver or `i2c-dev` recovers on its own.
 - Reading the chip needs permission on `/dev/i2c-N` (root or `i2c` group).
   Everything degrades gracefully but visibly: no I2C / failed reads → a
   sample with **empty** `pins` (never zeros, which would look green) plus
@@ -66,16 +73,21 @@ sh licenses.sh                  # regenerate the embedded license text
 ## File organization
 
 ```
-src/main.rs      Entry point: resolve I2C bus, create the shared
-                 Arc<Mutex<WebData>>, spawn the sound player + poller, build
-                 ui::App and run eframe. Also dispatches `--power-helper`
-                 (privileged helper mode) before anything else. Keep this
+src/main.rs      Entry point: parse the optional explicit I2C bus, create
+                 the shared Arc<Mutex<WebData>>, spawn the sound player +
+                 `service::spawn_monitor` (local poller or service link),
+                 build ui::App and run eframe. Also dispatches
+                 `--power-helper` (privileged helper mode) and `--service`
+                 (background service mode) before anything else. Keep this
                  file thin.
 src/hardware.rs  HARDWARE POLLING. IT8915 constants + raw i2c-dev/SMBus
                  ioctls (block read of all 24 registers, byte-read
                  fallback), bus auto-detection/probing, `PinReading`,
                  `Sample`, `GpuProcess`, `Cmd`, and `spawn_poller()` (the
-                 background poller thread). Contains `mod nvml` — the
+                 background poller thread; returns a `Poller` whose
+                 `stop()` closes its command channel and joins it), plus
+                 `own_exe()` (this binary's path, minus the " (deleted)"
+                 suffix a rebuild leaves on `/proc/self/exe`). Contains `mod nvml` — the
                  hand-rolled dlopen FFI bindings, including the top GPU-
                  process list (compute + graphics per-process VRAM, and
                  per-process SM utilization from `nvmlDeviceGetProcessUtilization`;
@@ -114,6 +126,17 @@ src/web.rs       WEB SERVER + SHARED STATE. `WebData` (latest sample —
                  `POST /ack` → acknowledge the critical alert),
                  hand-rolled JSON serialization, and `INDEX_HTML`
                  (the whole single-page web UI, JS included).
+src/service.rs   BACKGROUND SERVICE. Unit management (`install`,
+                 `uninstall`, `restart`, `unit_status`, `unit_text`; the
+                 settings dialog runs them off the GUI thread via
+                 `ServiceControl` / `run_action` / `refresh_status`), the
+                 headless service mode `run_service` (poller + web server
+                 from the settings file, re-read when it changes), the link
+                 socket server, the SYNC state encoding (`sync_reply`,
+                 `encode_sync`, `decode_sync`, `apply_sync`), and the
+                 desktop side `spawn_monitor` (local poller while no
+                 service runs, service link while one does). See
+                 "Background service" below.
 src/persist.rs   SETTINGS PERSISTENCE. The applied `ui::Config` is stored as
                  a small hand-written JSON document at
                  `$XDG_CONFIG_HOME/astral-gauge/settings.json` (falling back
@@ -189,9 +212,21 @@ src/bin/         Empty (no extra binaries).
 One `Arc<Mutex<WebData>>` (created in `main`) is the single sync point; all
 critical sections are short — keep them that way:
 
-1. **Poller thread** (`hardware::spawn_poller`): opens I2C + NVML once,
-   loops (one poll per interval, measured from each poll's start so the
-   read time does not stretch the spacing): drain `Cmd` channel (`SetLimit`/`Interval`) → read NVML + pins +
+0. **Monitor thread** (`service::spawn_monitor`, desktop app only): owns
+   the choice between monitoring locally and showing the background
+   service. While no service answers on the link socket it runs the local
+   poller and forwards the UI's `Cmd`s to it, looking for a service every
+   second; once one answers it stops the poller (`Poller::stop`, joined, so
+   nothing records after it), clears `WebData::local_monitor` and mirrors
+   the service via SYNC every 200 ms, forwarding `SetLimit` / `GrantPower`
+   `Access` / `AckCritical` (as `LIMIT` / `AUTH` / `ACK`). A broken link
+   brings the local poller straight back.
+1. **Poller thread** (`hardware::spawn_poller`): opens I2C + NVML (retrying
+   what is missing with a backoff), loops (one poll per interval, measured
+   from each poll's start so the read time does not stretch the spacing;
+   the inter-poll wait is a `recv_timeout` on the command channel, so
+   commands apply as they arrive and a closed channel ends the thread):
+   drain `Cmd` channel (`SetLimit`/`Interval`/`GrantPowerAccess`) → read NVML + pins +
    top GPU processes → lock the data, read `settings`, `record(sample)` →
    run `alerts::over_limit_sound` outside the lock (evaluated, not played
    yet) → on a red rising edge, set `WebData::critical_alert` (the latching
@@ -214,8 +249,11 @@ critical sections are short — keep them that way:
    otherwise the pending alert sound plays.
    Monitored data keeps flowing while the window is minimized.
 2. **Audio thread** (`alerts::SoundPlayer`): owns the rodio
-   `OutputStream`/`Sink` (created lazily on first play; absence of audio is
-   logged once and sounds become no-ops). Plays **one sound at a time**;
+   `OutputStream`/`Sink` (created lazily on first play; a missing output is
+   logged once per failure streak and retried on the next request, so a
+   sound server that starts after the app still gets used; a sink that does
+   not drain within the sound's length + `SOUND_STALL_MARGIN` is dropped and
+   reopened). `SoundPlayer` is `Clone` (one shared thread). Plays **one sound at a time**;
    when a sound finishes it drops stale queued requests and plays the
    newest. Never blocks the caller.
 3. **Privileged power helper** (`hardware::PowerHelper`): the app runs as a
@@ -234,7 +272,11 @@ critical sections are short — keep them that way:
    /`KILL OK <pid>`/`KILL ERR <pid> …` lines on stdout; reader threads relay
    replies into a status cell the poller mirrors as `WebData::power_note`
    (GUI-only, not in the web JSON) **and** a `hardware::AuthState` (Idle /
-   Active / Failed) mirrored as `WebData::power_auth` (kill outcomes into a
+   Active / Failed) mirrored as `WebData::power_auth` — on change only, and
+   right after a `GrantPowerAccess`: whoever requests an authentication
+   (the UI, the service link's `AUTH`) first resets `power_auth` to `Idle`,
+   and a stale unchanged state must not overwrite that before the request
+   is handled (the pending-auth rollback would misfire) (kill outcomes into a
    separate cell consumed on the next poll). Enabling the automatic
    min-power or the cross-user kill option in the settings dialog
    immediately pings the helper (so the password prompt shows while the
@@ -248,7 +290,7 @@ critical sections are short — keep them that way:
    `try_lock` with retry → 503 on contention so a GUI frame can never
    deadlock against the server-thread join at shutdown (both `/data` and
    `POST /ack` follow this pattern).
-5. **GUI thread** (`ui::App::update`): renders from `WebData`, mirrors the
+5. **GUI thread** (`ui::App::ui`): renders from `WebData`, mirrors the
    UI-side settings into it (`poll_ms`, `show_graphs`, `settings`), sends
    `Cmd`s to the poller (`SetLimit`, `Interval`, `GrantPowerAccess`).
    `App::new` loads the saved settings (see `persist`); if the automatic
@@ -261,7 +303,51 @@ critical sections are short — keep them that way:
    the wall clock, so they scroll exactly one sample per sample. A
    fallback timer (`IDLE_REPAINT_MS`, 1 s, or the poll interval if slower;
    250 ms while the critical alert flashes) keeps time-based text moving
-   when samples stop.
+   when samples stop. The GUI runs its own web server only while
+   `WebData::local_monitor` is set (reconciled every frame; a busy port is
+   retried every 5 s and shown in the settings dialog); while a service
+   monitors, the service serves the page.
+
+## Background service (`service.rs`)
+
+- **Unit**: `astral-gauge.service`, a systemd **user** unit in
+  `$XDG_CONFIG_HOME/systemd/user` (`~/.config/systemd/user`): no root to
+  install, starts at login (`WantedBy=default.target`), `Restart=always`
+  with `RestartSec=5` and `StartLimitIntervalSec=0`, ordered `After=` the
+  PipeWire/WirePlumber user units (ordering only). `ExecStart` is this
+  executable (`hardware::own_exe`, systemd-quoted) with `--service` and the
+  explicit bus if the app got one. A user unit (not a system one) is what
+  lets the service play sounds through the session's sound server and show
+  polkit prompts through the session's agent. The settings dialog's
+  "Background service" section installs (write unit → `daemon-reload` →
+  `enable` → `restart`), updates (when the unit differs from what this
+  executable would write), restarts and uninstalls (`disable --now` →
+  remove → `daemon-reload` → `reset-failed`); actions apply immediately,
+  outside the Accept/Cancel draft.
+- **Service mode** (`--service`, `run_service`): `WebData::service_mode`
+  (web JSON `service`, the page's "Service" chip), the regular poller and
+  sound player, settings from `persist` re-read whenever the file's mtime
+  changes (every second; persist writes atomically): limits/sounds,
+  interval, web server (busy port retried every `WEB_RETRY`), and newly
+  enabled privileged options authenticate the helper at once. The service
+  never rolls settings back itself (a denied prompt at login just means the
+  next privileged action asks again); the desktop app's pending-auth logic
+  still applies when it is open. Exits with 1 if another service already
+  answers on the socket.
+- **Link**: Unix socket `$XDG_RUNTIME_DIR/astral-gauge.sock` (fallback
+  `/run/user/<uid>`), line protocol, `LINK_VERSION` handshake (`HELLO`). A
+  different version shows a "restart needed" banner/pill instead of data
+  (and still no local monitoring). `SYNC <since>` returns the scalars, the
+  latest sample (pins, processes) and every history point with
+  `t > since`; times are printed with `{}` (shortest exact form) so the
+  next `since` matches bit for bit. The first (full) sync moves the app's
+  `WebData::start` onto the service's clock, so all service timestamps
+  apply unchanged; replies that predate a pending `ACK`/`AUTH` keep the
+  local flag/state (`apply_sync`'s `keep_ack`/`keep_auth`).
+- **Desktop indication**: a "Service" pill next to the status pill, a
+  banner below the header ("Running as a background service", with a link
+  to the service's web interface or its error), and the web-server row in
+  the settings says "served by the service on port N".
 
 ## Alert sound rules (implemented in `alerts::over_limit_sound`)
 
@@ -330,7 +416,9 @@ cables!") with an **Acknowledge** button that appears and disappears with it
 
 - **User-dismissal only:** power returning to normal never hides it; the
   desktop button and `POST /ack` are the only ways it clears, and the next
-  red excursion shows it again.
+  red excursion shows it again. With a background service the desktop
+  button also sends `Cmd::AckCritical` (link `ACK`) to clear the service's
+  flag.
 - Mirrored in the web JSON as `critical_alert` (the sensor state as
   `sensor_error` + `pins_age`, shown as the web page's `#sensor` banner);
   the desktop banner's fill blinks via `ALERT_BLINK_SECS` and forces 250 ms
@@ -373,10 +461,11 @@ Optional (`Settings::auto_min_power` = Off / On yellow / On red):
   tests pass.
 - Module visibility uses `pub(crate)` liberally (binary crate; the modules
   are one cohesive app, not a public API).
-- Module dependency direction: `main → {hardware, alerts, web, ui}`,
-  `hardware → {alerts, web}`, `ui → {alerts, hardware, web, persist}`,
+- Module dependency direction: `main → {hardware, alerts, web, ui,
+  service}`, `hardware → {alerts, web}`, `service → {hardware, alerts, web,
+  persist}`, `ui → {alerts, hardware, web, persist, service}`,
   `persist → alerts`. No cycles; `alerts` depends on nothing else in the
-  crate.
+  crate (`web::ServiceLink` lives in `web` so `web` needs no `service`).
 - Hand-rolled JSON (`web_json`) and the embedded `INDEX_HTML` must stay in
   sync: field names in the JSON are consumed by the JS in `web.rs`.
 - Web page (`INDEX_HTML`) and `ui.rs` deliberately mirror each other (same
@@ -421,7 +510,7 @@ Optional (`Settings::auto_min_power` = Off / On yellow / On red):
 
 ## Tests
 
-`cargo test` (35 tests, no GPU/display needed):
+`cargo test` (40 tests, no GPU/display needed):
 
 - `alerts::tests`: settings defaults; embedded WAVs decode; alert edge
   triggering; 15 s repeat-while-exceeded behavior; powering-down sound
@@ -440,12 +529,18 @@ Optional (`Settings::auto_min_power` = Off / On yellow / On red):
   user sound paths with escapes), a real save()/load() file round-trip in a
   throwaway HOME, unknown/missing-key tolerance, clamping and yellow/red
   order repair, rejection of invalid values, and corrupt-document detection.
+- `service::tests`: full and incremental SYNC round trips into a fresh
+  `WebData` (histories, sample, processes with escaped names, flags, clock
+  alignment, gaps, pending ACK/AUTH kept), malformed replies rejected,
+  unknown lines tolerated, the unit file's quoted `ExecStart`, line
+  escaping. (Never call `install`/`uninstall` in a test: they drive the
+  real user manager.)
 - `ui::tests`: embedded license-text sanity (the generated `licenses.txt` is
   non-empty, lists one "Used by:" section per license, and has no template
   leftovers or HTML escaping); readings shown as dashes when missing; the sensor
   fault / staleness warning.
 - `web::tests`: JSON field content (incl. process entries, name escaping and
-  the latching `critical_alert` flag, `safeguard`, `sensor_error`, `pins_age`),
+  the latching `critical_alert` flag, `safeguard`, `service`, `sensor_error`, `pins_age`),
   `record()` history append/prune/range caching and gaps (no zeros) for
   samples without pins, M4 graph downsampling (spikes kept, complete
   buckets unchanged while the window slides), the stale threshold, query-param parsing, HTTP server serve/404/busy-port/restart and

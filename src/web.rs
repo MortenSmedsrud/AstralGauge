@@ -95,6 +95,33 @@ pub(crate) struct WebData {
     /// the GUI sets it to request a repaint, so frames follow the data
     /// instead of a separate timer that drifts against the poll cadence.
     pub(crate) on_sample: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    /// This process is the background service (`--service`): mirrored to
+    /// the web JSON as `service` so the page says so.
+    pub(crate) service_mode: bool,
+    /// The background service's monitoring state as far as the UIs care:
+    /// in the service itself its own web-server state (published to
+    /// clients); in the desktop app `Some` while it is showing a running
+    /// service's data instead of polling the hardware itself (see
+    /// `service::spawn_monitor`).
+    pub(crate) service_link: Option<ServiceLink>,
+    /// Set while this process's own poller monitors the hardware (the
+    /// desktop app without a background service). The desktop app only
+    /// runs its own web server then; with a service the service serves it.
+    pub(crate) local_monitor: bool,
+}
+
+/// What a desktop app showing a background service's data knows about it
+/// (see [`WebData::service_link`]).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct ServiceLink {
+    /// Port of the service's web interface while it is serving.
+    pub(crate) web_port: Option<u16>,
+    /// Why the service's web interface is not serving although enabled
+    /// (port busy, invalid port); it keeps retrying.
+    pub(crate) web_error: Option<String>,
+    /// Set when the running service is a different build that speaks
+    /// another link protocol: its data cannot be shown until it restarts.
+    pub(crate) incompatible: Option<String>,
 }
 
 impl WebData {
@@ -120,6 +147,9 @@ impl WebData {
             pins_at: None,
             sampled_at: None,
             on_sample: None,
+            service_mode: false,
+            service_link: None,
+            local_monitor: false,
         };
         // Pre-reserve history for the default 1 Hz sample rate so the common
         // case never reallocates; a faster slider setting just grows the vecs.
@@ -399,6 +429,8 @@ fn web_json(data: &WebData, window_secs: f64) -> String {
     out.push_str(if data.show_graphs { "true" } else { "false" });
     out.push_str(",\"critical_alert\":");
     out.push_str(if data.critical_alert { "true" } else { "false" });
+    out.push_str(",\"service\":");
+    out.push_str(if data.service_mode { "true" } else { "false" });
     out.push_str(",\"safeguard\":");
     out.push_str(if data.settings.kill_top_process_on_red {
         "true"
@@ -603,6 +635,7 @@ const INDEX_HTML: &str = r###"<!DOCTYPE html>
   .pill i { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
   .pill.live { color: var(--green); background: rgba(74,222,128,.15); }
   .pill.warn { color: var(--orange); background: rgba(251,146,60,.15); }
+  .svc { display: none; padding: 3px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; color: var(--accent); background: rgba(96,165,250,.15); }
   .banner { display: none; align-items: center; flex-wrap: wrap; gap: 12px; padding: 9px 12px; border-radius: 10px; font-weight: 700; }
   .banner.alert { background: #991b1b; border: 1px solid var(--red); color: #fff; font-size: 15px; animation: blink 1s step-end infinite; }
   .banner.warn { background: #3a240e; border: 1px solid var(--orange); color: #fdba74; }
@@ -659,6 +692,7 @@ const INDEX_HTML: &str = r###"<!DOCTYPE html>
     <span class="title">AstralGauge</span>
     <span class="sub">ASUS RTX 5090 ROG Astral</span>
     <span class="pill" id="status"><i></i><span>Starting</span></span>
+    <span class="svc" id="svc" title="Served by the AstralGauge background service (astral-gauge.service)">Service</span>
   </div>
   <div class="banner alert" id="alert"><span>⚠ ALERT: critical current detected! Please check your GPU power cables!</span><button id="ackbtn" type="button">Acknowledge</button></div>
   <div class="banner warn" id="sensor"></div>
@@ -1041,6 +1075,7 @@ function render(d) {
   if (d.limits) limits = d.limits;
 
   alertEl.style.display = d.critical_alert ? 'flex' : 'none';
+  document.getElementById('svc').style.display = d.service ? 'inline-block' : 'none';
 
   // Sensor fault / stale readings: the pin currents are not being checked.
   const sensorEl = document.getElementById('sensor');
@@ -1284,6 +1319,7 @@ mod tests {
         assert!(json.contains("\"show_graphs\":true"));
         assert!(json.contains("\"critical_alert\":true"));
         assert!(json.contains("\"safeguard\":false"));
+        assert!(json.contains("\"service\":false"));
         assert!(json.contains("\"sensor_error\":null"));
         assert!(json.contains("\"pins_age\":null"));
         assert!(json.contains("\"poll_ms\":1000"));

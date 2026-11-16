@@ -7,10 +7,13 @@
 //! - [`alerts`]: current-limit checking and rodio alert sounds
 //! - [`web`]: shared sample/history store and the HTTP server
 //! - [`ui`]: the eframe/egui desktop UI
+//! - [`service`]: the background (systemd user) service and the desktop
+//!   app's link to it
 
 mod alerts;
 mod hardware;
 mod persist;
+mod service;
 mod ui;
 mod web;
 
@@ -18,7 +21,7 @@ use std::sync::{Arc, Mutex};
 
 use eframe::egui;
 
-use crate::hardware::{find_i2c_bus, POWER_HELPER_ARG};
+use crate::hardware::POWER_HELPER_ARG;
 use crate::web::WebData;
 
 fn main() {
@@ -29,21 +32,17 @@ fn main() {
         std::process::exit(hardware::run_power_helper());
     }
 
-    let bus_arg: Option<String> = std::env::args().nth(1);
+    // An explicit IT8915 bus number (`astral-gauge [--service] 15`). Without
+    // one the poller auto-detects the bus, and keeps retrying while none is
+    // found. There is no fallback bus: guessing (say, bus 0) would read
+    // whatever device answers at the IT8915's address there and could pass
+    // garbage off as pin currents.
+    let explicit_bus: Option<u32> = std::env::args().skip(1).find_map(|a| a.parse().ok());
 
-    // No fallback bus: guessing (say, bus 0) would read whatever device
-    // answers at the IT8915's address there and could pass garbage off as
-    // pin currents. Without a bus the sensor is reported as unavailable.
-    let bus_number = bus_arg
-        .as_ref()
-        .and_then(|s| s.parse::<u32>().ok())
-        .or_else(find_i2c_bus);
-    match bus_number {
-        Some(bus) => println!("Using I2C bus: {bus}"),
-        None => {
-            eprintln!("Warning: IT8915 auto-detect failed; pin currents will NOT be monitored.");
-            eprintln!("Pass the bus number explicitly, e.g.: astral-gauge 15");
-        }
+    // Background-service mode: the same monitoring without a window, run by
+    // the systemd user unit the settings dialog installs (see `service`).
+    if std::env::args().any(|a| a == service::SERVICE_ARG) {
+        std::process::exit(service::run_service(explicit_bus));
     }
 
     // The single shared state: the poller records samples into it, the GUI
@@ -53,9 +52,11 @@ fn main() {
     // Alert-sound playback thread (one sound at a time; see `alerts`).
     let player = alerts::SoundPlayer::spawn();
 
-    // Background poller: reads the pins and NVML, records into the shared
-    // data, and checks the current limits on every sample.
-    let cmd_tx = hardware::spawn_poller(bus_number, data.clone(), player);
+    // Monitoring: the background poller (reads the pins and NVML, records
+    // into the shared data, checks the current limits on every sample) —
+    // or, while the background service runs, a link that shows the
+    // service's data instead (see `service::spawn_monitor`).
+    let cmd_tx = service::spawn_monitor(explicit_bus, data.clone(), player);
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -68,7 +69,7 @@ fn main() {
     // The app loads the settings saved on the previous run (see
     // `persist`), re-applies them, and authenticates the privileged power
     // helper when the saved automatic power limit needs it.
-    let app = ui::App::new(cmd_tx, data.clone());
+    let app = ui::App::new(cmd_tx, data.clone(), explicit_bus);
 
     let creator = Box::new(move |cc: &eframe::CreationContext<'_>| {
         // Repaint as soon as the poller records a sample (see

@@ -10,12 +10,15 @@ use eframe::egui;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::alerts::{AutoMinPower, EmbeddedSound, Settings, Sound, MAX_LIMIT_A, MIN_LIMIT_A};
 use crate::hardware::{AuthState, Cmd, GpuProcess, DEFAULT_POLL_MS};
 use crate::persist;
-use crate::web::{m4_downsample, stale_after_secs, WebData, WebServer, WebState, DEFAULT_WEB_PORT};
+use crate::service::{self, ServiceAction, ServiceControl};
+use crate::web::{
+    m4_downsample, stale_after_secs, ServiceLink, WebData, WebServer, WebState, DEFAULT_WEB_PORT,
+};
 
 /// Fallback repaint interval while no new sample arrives (new samples
 /// repaint on their own, see `WebData::on_sample`).
@@ -344,13 +347,13 @@ fn dot_label(ui: &mut egui::Ui, text: impl Into<egui::RichText>, color: egui::Co
 ///
 /// Painted as one fixed-size widget (not a `Frame`), so a center-aligned
 /// row centers it exactly like the buttons next to it.
-fn status_pill(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
+fn status_pill(ui: &mut egui::Ui, text: &str, color: egui::Color32) -> egui::Response {
     let galley =
         ui.painter()
             .layout_no_wrap(text.to_owned(), egui::FontId::proportional(12.0), color);
     let (pad_x, dot, gap) = (10.0, 7.0, 5.0);
     let size = egui::vec2(pad_x * 2.0 + dot + gap + galley.size().x, 22.0);
-    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
     let painter = ui.painter();
     painter.rect_filled(
         rect,
@@ -364,6 +367,68 @@ fn status_pill(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
         rect.center().y - galley.size().y / 2.0,
     );
     painter.galley(text_pos, galley, color);
+    response
+}
+
+/// The strip under the header while this window shows the background
+/// service's data: says so, and links the service's web interface.
+fn service_banner(ui: &mut egui::Ui, link: &ServiceLink) {
+    let incompatible = link.incompatible.is_some();
+    let (fill, stroke) = if incompatible {
+        (egui::Color32::from_rgb(58, 36, 14), palette::ORANGE)
+    } else {
+        (
+            egui::Color32::from_rgb(20, 33, 52),
+            egui::Color32::from_rgb(37, 64, 104),
+        )
+    };
+    banner(ui, fill, stroke, |ui| {
+        if incompatible {
+            ui.label(
+                egui::RichText::new(
+                    "The background service runs a different build of AstralGauge, so its data \
+                     cannot be shown here. Restart it in Settings \u{2192} Background service.",
+                )
+                .color(egui::Color32::from_rgb(253, 186, 116)),
+            );
+            return;
+        }
+        ui.label(
+            egui::RichText::new("Running as a background service.")
+                .strong()
+                .color(palette::ACCENT),
+        );
+        ui.label(
+            egui::RichText::new(
+                "Monitoring, alert sounds and the safeguard keep running with this window \
+                 closed; this window shows the service's data.",
+            )
+            .color(palette::TEXT),
+        );
+        match (link.web_port, &link.web_error) {
+            (Some(port), _) => {
+                if ui
+                    .link(
+                        egui::RichText::new(format!("Web interface (port {port})"))
+                            .color(palette::ACCENT)
+                            .underline(),
+                    )
+                    .on_hover_text(format!("Open http://localhost:{port}/ in the browser"))
+                    .clicked()
+                {
+                    ui.ctx()
+                        .open_url(egui::OpenUrl::new_tab(format!("http://localhost:{port}/")));
+                }
+            }
+            (None, Some(e)) => {
+                ui.label(
+                    egui::RichText::new(format!("Web interface: {e} (retrying)"))
+                        .color(palette::ORANGE),
+                );
+            }
+            (None, None) => {}
+        }
+    });
 }
 
 /// Section heading inside the settings dialog.
@@ -450,7 +515,20 @@ pub(crate) struct App {
     file_dialog: Option<FileDialog>,
     /// While set, the About dialog (licenses) is open.
     about_open: bool,
+    /// The I2C bus given on the command line, handed on to the service unit.
+    explicit_bus: Option<u32>,
+    /// Background-service unit state and install/uninstall results (the
+    /// settings dialog's "Background service" section).
+    service_ctl: Arc<Mutex<ServiceControl>>,
+    /// Why the enabled web server is not running (port busy, ...); it is
+    /// retried at `web_retry_at` while this app monitors locally.
+    web_error: Option<String>,
+    web_retry_at: Instant,
 }
+
+/// Retry spacing for the desktop app's own web server when its port was
+/// busy (e.g. the background service has just let go of it).
+const WEB_RETRY: Duration = Duration::from_secs(5);
 
 /// Everything the settings panel edits, in one struct. [`App`] keeps the
 /// applied copy while the panel edits a draft of it: Accept commits the
@@ -513,7 +591,11 @@ fn add_warning(warning: &mut Option<String>, msg: String) {
 }
 
 impl App {
-    pub(crate) fn new(cmd_tx: mpsc::Sender<Cmd>, data: Arc<Mutex<WebData>>) -> App {
+    pub(crate) fn new(
+        cmd_tx: mpsc::Sender<Cmd>,
+        data: Arc<Mutex<WebData>>,
+        explicit_bus: Option<u32>,
+    ) -> App {
         // Load the settings saved by the previous run (see `persist`);
         // a corrupt file is reported and the defaults take over.
         let defaults = Config::defaults().stored();
@@ -542,36 +624,19 @@ impl App {
         if config.poll_ms != DEFAULT_POLL_MS {
             let _ = cmd_tx.send(Cmd::Interval(config.poll_ms));
         }
-        // A saved "web server enabled" starts the server right away, exactly
-        // like accepting it in the panel would (a dead port is reported and
-        // the option stays off).
-        let mut web = WebState::Stopped;
-        if config.web_enabled {
-            let port = config.web_port.trim().parse::<u16>().ok();
-            match port {
-                Some(port) if port != 0 => match WebServer::start(port, data.clone()) {
-                    Ok(server) => web = WebState::Running(server),
-                    Err(e) => {
-                        add_warning(
-                            &mut warning,
-                            format!(
-                                "Port {port} is not available: {e}\n\nThe web interface was \
-                                 not started."
-                            ),
-                        );
-                        config.web_enabled = false;
-                    }
-                },
-                _ => {
-                    add_warning(
-                        &mut warning,
-                        "The saved web-server port is invalid; the web interface was not \
-                         started."
-                            .to_owned(),
-                    );
-                    config.web_enabled = false;
-                }
-            }
+        // A saved "web server enabled" starts the server as soon as this app
+        // knows it monitors locally (with a background service running, the
+        // service serves the page; see the reconcile in `ui`). Only an
+        // invalid port is rejected right here.
+        if config.web_enabled
+            && !matches!(config.web_port.trim().parse::<u16>(), Ok(port) if port != 0)
+        {
+            add_warning(
+                &mut warning,
+                "The saved web-server port is invalid; the web interface was not started."
+                    .to_owned(),
+            );
+            config.web_enabled = false;
         }
         // Saved privileged options (automatic power limit, killing other
         // users' processes) need root: ask for the credentials now, at
@@ -593,12 +658,16 @@ impl App {
             window_idx: 0,
             show_graphs: true,
             config,
-            web,
+            web: WebState::Stopped,
             warning,
             auto_power_pending_auth,
             draft: None,
             file_dialog: None,
             about_open: false,
+            explicit_bus,
+            service_ctl: Arc::new(Mutex::new(ServiceControl::default())),
+            web_error: None,
+            web_retry_at: Instant::now(),
         }
     }
 }
@@ -744,6 +813,40 @@ impl eframe::App for App {
             // draws the same thresholds the GUI shows.
             data.settings = self.config.alerts.clone();
         }
+        // The web server runs here only while this app monitors the hardware
+        // itself; while the background service does, the service serves the
+        // page (and this app lets go of the port). A start that fails (port
+        // busy, e.g. still held by a service that just stopped) is retried.
+        let local_monitor = data.local_monitor;
+        let service_link: Option<ServiceLink> = data.service_link.clone();
+        match (&self.web, self.config.web_enabled && local_monitor) {
+            (WebState::Running(_), false) => {
+                self.web = WebState::Stopped;
+                self.web_error = None;
+            }
+            (WebState::Stopped, true) if Instant::now() >= self.web_retry_at => {
+                if let Ok(port) = self.config.web_port.trim().parse::<u16>() {
+                    match WebServer::start(port, self.data.clone()) {
+                        Ok(server) => {
+                            self.web = WebState::Running(server);
+                            self.web_error = None;
+                        }
+                        Err(e) => {
+                            let msg = format!("port {port} is not available: {e}");
+                            if self.web_error.as_ref() != Some(&msg) {
+                                eprintln!("Web interface: {msg} (retrying).");
+                            }
+                            self.web_error = Some(msg);
+                            self.web_retry_at = Instant::now() + WEB_RETRY;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        if !self.config.web_enabled {
+            self.web_error = None;
+        }
         let now = data.start.elapsed().as_secs_f64();
         // The graphs end at the newest sample, not at the wall clock: they
         // then scroll exactly one sample per sample, however the frame
@@ -815,9 +918,27 @@ impl eframe::App for App {
                             (None, None) => ("Live", palette::GREEN),
                         };
                         status_pill(ui, text, color);
+                        // Who does the monitoring: the background service
+                        // (this window only shows its data).
+                        if let Some(link) = &service_link {
+                            ui.add_space(2.0);
+                            let (text, color) = if link.incompatible.is_some() {
+                                ("Service: restart needed", palette::ORANGE)
+                            } else {
+                                ("Service", palette::ACCENT)
+                            };
+                            status_pill(ui, text, color).on_hover_text(
+                                "The background service (astral-gauge.service) does the \
+                                 monitoring; this window shows its data.",
+                            );
+                        }
                     });
                 });
                 ui.add_space(6.0);
+                if let Some(link) = &service_link {
+                    service_banner(ui, link);
+                    ui.add_space(6.0);
+                }
 
                 // Latching critical-current notification: flashing while the
                 // poller has it armed, dismissed only by this button (which
@@ -845,6 +966,8 @@ impl eframe::App for App {
                     });
                     if ack {
                         data.critical_alert = false;
+                        // With a background service, its flag goes too.
+                        let _ = self.cmd_tx.send(Cmd::AckCritical);
                     }
                     ui.add_space(6.0);
                 }
@@ -1178,6 +1301,8 @@ impl eframe::App for App {
         let mut accept = false;
         let mut cancel = false;
         let mut open_browser: Option<(SoundField, Option<PathBuf>)> = None;
+        // "Test privileged access" clicked (sent after the dialog).
+        let mut test_auth = false;
         let current = self.config.clone();
         if let Some(draft) = &mut self.draft {
             let mut open = true;
@@ -1359,7 +1484,7 @@ Apply the reset with Accept, discard it with Cancel."
                                 // Spawn the helper now, so the password prompt shows
                                 // here instead of at the first privileged change
                                 // (limit set or cross-user kill).
-                                let _ = self.cmd_tx.send(Cmd::GrantPowerAccess);
+                                test_auth = true;
                             }
 
                             ui.separator();
@@ -1437,14 +1562,147 @@ Apply the reset with Accept, discard it with Cancel."
                                 }
                                 ui.checkbox(&mut draft.web_enabled, "Enable");
                                 if draft.web_enabled {
-                                    if let WebState::Running(server) = &self.web {
+                                    if let Some(link) = &service_link {
+                                        // The background service serves it.
+                                        let text = match (link.web_port, &link.web_error) {
+                                            (Some(port), _) => {
+                                                format!("served by the service on port {port}")
+                                            }
+                                            (None, Some(e)) => format!("service: {e}"),
+                                            (None, None) => "served by the service".to_owned(),
+                                        };
+                                        ui.label(egui::RichText::new(text).weak());
+                                    } else if let WebState::Running(server) = &self.web {
                                         ui.label(
                                             egui::RichText::new(format!("active on port {}", server.port))
                                                 .weak(),
                                         );
+                                    } else if let Some(e) = &self.web_error {
+                                        ui.label(
+                                            egui::RichText::new(format!("{e} (retrying)"))
+                                                .color(palette::ORANGE),
+                                        );
                                     }
                                 }
                             });
+
+                            ui.separator();
+                            // Install / uninstall the systemd user service that
+                            // runs the monitoring without this window. Applied
+                            // immediately (not part of the Accept/Cancel draft).
+                            settings_section(ui, "Background service");
+                            service::refresh_status(
+                                &self.service_ctl,
+                                self.explicit_bus,
+                                Duration::from_secs(2),
+                            );
+                            let (busy, status, message) = {
+                                let ctl = self.service_ctl.lock().unwrap();
+                                (ctl.busy, ctl.status.clone(), ctl.message.clone())
+                            };
+                            if busy || status.is_none() {
+                                ui.ctx().request_repaint_after(Duration::from_millis(250));
+                            }
+                            let mut action: Option<ServiceAction> = None;
+                            match &status {
+                                None => {
+                                    ui.label(egui::RichText::new("Checking the service\u{2026}").weak());
+                                }
+                                Some(Err(e)) => {
+                                    ui.label(
+                                        egui::RichText::new(format!("Cannot query the service: {e}"))
+                                            .color(palette::ORANGE),
+                                    );
+                                }
+                                Some(Ok(st)) => {
+                                    let (text, color) = if !st.installed {
+                                        ("Not installed".to_owned(), palette::DIM)
+                                    } else if st.active == "active" {
+                                        ("Installed and running".to_owned(), palette::GREEN)
+                                    } else {
+                                        (format!("Installed, {}", st.active), palette::ORANGE)
+                                    };
+                                    dot_label(ui, egui::RichText::new(text).color(color), color);
+                                    if st.installed && !st.enabled {
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "Not enabled: it does not start at login.",
+                                            )
+                                            .color(palette::ORANGE),
+                                        );
+                                    }
+                                    if st.installed && !st.current {
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "The installed service runs another executable (or I2C \
+        bus) than this app. \"Update service\" switches it to this one.",
+                                            )
+                                            .color(palette::ORANGE),
+                                        );
+                                    }
+                                    ui.horizontal(|ui| {
+                                        ui.add_enabled_ui(!busy, |ui| {
+                                            if !st.installed {
+                                                if ui.button("Install service").clicked() {
+                                                    action = Some(ServiceAction::Install);
+                                                }
+                                            } else {
+                                                if !st.current
+                                                    && ui.button("Update service").clicked()
+                                                {
+                                                    action = Some(ServiceAction::Install);
+                                                }
+                                                if ui.button("Restart").clicked() {
+                                                    action = Some(ServiceAction::Restart);
+                                                }
+                                                if ui.button("Uninstall service").clicked() {
+                                                    action = Some(ServiceAction::Uninstall);
+                                                }
+                                            }
+                                        });
+                                        if busy {
+                                            ui.spinner();
+                                        }
+                                    });
+                                }
+                            }
+                            match &message {
+                                Some(Ok(text)) => {
+                                    ui.label(egui::RichText::new(text).color(palette::GREEN));
+                                }
+                                Some(Err(e)) => {
+                                    ui.label(egui::RichText::new(e).color(palette::RED));
+                                }
+                                None => {}
+                            }
+                            ui.label(
+                                egui::RichText::new(
+                                    "Runs the monitoring as a systemd user service (astral-gauge.service) \
+        that starts when you log in and keeps going while this window is closed: the pin and GPU \
+        readings, the alert sounds (through your desktop's sound output), the critical-current \
+        notification, the safeguard, the automatic power limit and, when enabled above, the web \
+        interface. It uses the settings saved here and picks up every accepted change within a \
+        second. While it runs, this window does not read the hardware itself; it shows the \
+        service's data. Installing needs no administrator rights; the options that do still ask \
+        through the desktop's authentication dialog.",
+                                )
+                                .weak()
+                                .size(12.0),
+                            );
+                            if let Ok(exe) = crate::hardware::own_exe() {
+                                let mut text = format!("Executable: {}", exe.display());
+                                if exe.components().any(|c| c.as_os_str() == "target") {
+                                    text.push_str(
+                                        "\nThis is a cargo build directory: rebuilding replaces the \
+        service's executable (restart the service to run the new build) and cargo clean removes \
+        it. An installed copy (e.g. in ~/.local/bin) is more robust.",
+                                    );
+                                }
+                                ui.label(egui::RichText::new(text).weak().size(12.0));
+                            }
+                            if let Some(action) = action {
+                                service::run_action(&self.service_ctl, action, self.explicit_bus);
+                            }
 
                         });
                     });
@@ -1463,40 +1721,54 @@ Apply the reset with Accept, discard it with Cancel."
                 }
                 // Reconcile the web server with the accepted draft: start,
                 // stop, or restart it on a new port. A failed start never
-                // tears down a server that is already running.
-                let running_port = match &self.web {
-                    WebState::Running(server) => Some(server.port),
-                    WebState::Stopped => None,
-                };
-                match (draft.web_enabled, draft.web_port.trim().parse::<u16>()) {
-                    (false, _) => {
-                        if running_port.is_some() {
-                            self.web = WebState::Stopped;
-                        }
+                // tears down a server that is already running. While the
+                // background service monitors, it serves the page instead
+                // (from the saved settings): nothing to start here.
+                let port_ok = matches!(draft.web_port.trim().parse::<u16>(), Ok(port) if port != 0);
+                if !local_monitor {
+                    if draft.web_enabled && !port_ok {
+                        self.warning =
+                            Some("Port must be a number between 1 and 65535.".to_owned());
+                        draft.web_enabled = false;
                     }
-                    (true, Ok(port)) if port != 0 => {
-                        if running_port != Some(port) {
-                            match WebServer::start(port, self.data.clone()) {
-                                Ok(server) => self.web = WebState::Running(server),
-                                Err(e) => {
-                                    self.warning = Some(format!(
-                                        "Port {port} is not available: {e}\n\nThe web interface was not started.",
-                                    ));
+                } else {
+                    let running_port = match &self.web {
+                        WebState::Running(server) => Some(server.port),
+                        WebState::Stopped => None,
+                    };
+                    match (draft.web_enabled, draft.web_port.trim().parse::<u16>()) {
+                        (false, _) => {
+                            if running_port.is_some() {
+                                self.web = WebState::Stopped;
+                            }
+                        }
+                        (true, Ok(port)) if port != 0 => {
+                            if running_port != Some(port) {
+                                match WebServer::start(port, self.data.clone()) {
+                                    Ok(server) => {
+                                        self.web = WebState::Running(server);
+                                        self.web_error = None;
+                                    }
+                                    Err(e) => {
+                                        self.warning = Some(format!(
+                                            "Port {port} is not available: {e}\n\nThe web interface was not started.",
+                                        ));
+                                    }
                                 }
                             }
                         }
+                        (true, _) => {
+                            self.warning =
+                                Some("Port must be a number between 1 and 65535.".to_owned());
+                        }
                     }
-                    (true, _) => {
-                        self.warning =
-                            Some("Port must be a number between 1 and 65535.".to_owned());
+                    // The applied config mirrors what actually runs: a failed
+                    // start is not "enabled", and the port is the live one.
+                    if matches!(self.web, WebState::Stopped) {
+                        draft.web_enabled = false;
+                    } else if let WebState::Running(server) = &self.web {
+                        draft.web_port = server.port.to_string();
                     }
-                }
-                // The applied config mirrors what actually runs: a failed
-                // start is not "enabled", and the port is the live one.
-                if matches!(self.web, WebState::Stopped) {
-                    draft.web_enabled = false;
-                } else if let WebState::Running(server) = &self.web {
-                    draft.web_port = server.port.to_string();
                 }
                 // The cross-user kill only exists while the safeguard itself
                 // is on.
@@ -1526,9 +1798,15 @@ Apply the reset with Accept, discard it with Cancel."
                     || current.alerts.kill_other_users_processes;
                 if needs_privilege {
                     self.auto_power_pending_auth = !had_privilege;
-                    let _ = self.cmd_tx.send(Cmd::GrantPowerAccess);
+                    test_auth = true;
                 }
             }
+        }
+        if test_auth {
+            // Pending until the helper answers: the state of an earlier
+            // attempt must not decide this one (see `auto_power_pending_auth`).
+            data.power_auth = AuthState::Idle;
+            let _ = self.cmd_tx.send(Cmd::GrantPowerAccess);
         }
         if cancel {
             // Cancel / window close: discard the draft, closing the panel.

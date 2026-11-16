@@ -127,13 +127,41 @@ pub(crate) struct GpuProcess {
     pub(crate) util_percent: u32,
 }
 
-/// Commands from the UI to the poller thread.
+/// Commands from the UI to the poller thread (or, while a background
+/// service does the monitoring, to that service; see `service::spawn_monitor`).
 pub(crate) enum Cmd {
     SetLimit(u32),
     Interval(u64),
     /// Spawn/verify the privileged power helper (prompts for the password).
     GrantPowerAccess,
+    /// The user acknowledged the critical-current banner. The desktop UI
+    /// clears its own `WebData::critical_alert`; this only matters when a
+    /// background service owns that flag (the poller ignores it).
+    AckCritical,
 }
+
+/// Handle to a running poller thread (see [`spawn_poller`]).
+pub(crate) struct Poller {
+    pub(crate) tx: mpsc::Sender<Cmd>,
+    handle: thread::JoinHandle<()>,
+}
+
+impl Poller {
+    /// Stop the poller and wait for it: it notices the closed command
+    /// channel within its inter-poll sleep (at once) or after the poll in
+    /// progress, so it never records into the shared data after this.
+    pub(crate) fn stop(self) {
+        drop(self.tx);
+        let _ = self.handle.join();
+    }
+}
+
+/// Retry spacing for hardware that was not available yet (IT8915 bus not
+/// found or not openable, NVML not initialized): at boot or login the
+/// NVIDIA driver, its I2C adapters or `i2c-dev` can come up after the app.
+/// Doubles from the first value up to the second.
+const DEVICE_RETRY_FIRST: Duration = Duration::from_secs(2);
+const DEVICE_RETRY_MAX: Duration = Duration::from_secs(30);
 
 /// Command-line flag that turns this binary into the privileged power-limit
 /// helper instead of the app itself (see [`PowerHelper`], [`run_power_helper`]).
@@ -221,7 +249,7 @@ impl PowerHelper {
             }
         }
 
-        let exe = match std::env::current_exe() {
+        let exe = match own_exe() {
             Ok(exe) => exe,
             Err(e) => {
                 *self.auth.lock().unwrap() = AuthState::Failed;
@@ -359,6 +387,19 @@ impl Drop for PowerHelper {
     }
 }
 
+/// This executable's path, for re-running it (the pkexec helper, the
+/// background service's unit). After a rebuild replaced the running binary,
+/// `/proc/self/exe` carries a " (deleted)" suffix; the path itself then
+/// holds the new build, which is what should run.
+pub(crate) fn own_exe() -> Result<std::path::PathBuf, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("cannot locate the executable: {e}"))?;
+    let text = exe.to_string_lossy();
+    Ok(match text.strip_suffix(" (deleted)") {
+        Some(path) => std::path::PathBuf::from(path),
+        None => exe,
+    })
+}
+
 /// Privileged helper mode (`--power-helper`, normally only started through
 /// pkexec by [`PowerHelper`]): read one-line commands from stdin and apply
 /// power limits via NVML — or SIGKILL a process, for the cross-user kill of
@@ -428,34 +469,43 @@ pub(crate) struct PinReading {
 /// server never depends on the GUI drawing frames), and plays alert sounds
 /// when the current limits are exceeded.
 ///
-/// `bus_number` is `None` when no IT8915 bus was given or found: the app
-/// then runs without pin readings and reports the sensor as unavailable.
+/// `explicit_bus` is the bus number given on the command line; without one
+/// the IT8915 bus is auto-detected. Hardware that is not there yet (no bus
+/// found, `/dev/i2c-N` missing, NVML not initialized) is retried with a
+/// backoff (see [`DEVICE_RETRY_FIRST`]); until then the sensor is reported
+/// as unavailable.
 pub(crate) fn spawn_poller(
-    bus_number: Option<u32>,
+    explicit_bus: Option<u32>,
     data: Arc<Mutex<WebData>>,
     player: SoundPlayer,
-) -> mpsc::Sender<Cmd> {
+) -> Poller {
     let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
-    thread::spawn(move || {
+    let handle = thread::spawn(move || {
         // I2C is best-effort: if the device is unavailable, the app keeps
         // running without pin readings, and the reason is shown as a sensor
         // fault in both UIs (never as zero, i.e. green, currents).
-        let i2c = open_i2c(bus_number);
-        if let Err(reason) = &i2c {
-            eprintln!("{reason}. Pin currents are NOT monitored.");
+        let mut bus = explicit_bus.or_else(find_i2c_bus);
+        let mut i2c = open_i2c(bus);
+        match (&i2c, bus) {
+            (Ok(_), Some(bus)) => println!("Using I2C bus: {bus}"),
+            (Err(reason), _) => eprintln!("{reason}. Pin currents are NOT monitored (retrying)."),
+            _ => {}
         }
         // Whether the previous poll had no valid pin readings (log only the
         // transitions, not every failing poll).
         let mut sensor_failing = false;
         let mut sensor_fault = SensorFaultState::default();
 
-        let nvml = nvml::Nvml::new();
+        let mut nvml = nvml::Nvml::new();
         if nvml.is_none() {
             eprintln!(
-                "Warning: NVML not available; total power will be estimated from pin readings."
+                "Warning: NVML not available (retrying); total power will be estimated from pin readings."
             );
-            eprintln!("Power limit control is disabled.");
+            eprintln!("Power limit control is disabled until NVML is available.");
         }
+        // Next retry of whatever hardware is still missing, and its spacing.
+        let mut retry_delay = DEVICE_RETRY_FIRST;
+        let mut retry_at = Instant::now() + retry_delay;
 
         let mut polls: u64 = 0;
         let mut poll_sum_ms: u64 = 0;
@@ -475,38 +525,53 @@ pub(crate) fn spawn_poller(
         let mut held_sound: Option<Sound> = None;
         let mut critical_state = CriticalAlertState::default();
 
+        // The power helper's authentication state as last mirrored into the
+        // shared data. Mirrored on change only (and right after a
+        // `GrantPowerAccess`): whoever requests the authentication resets the
+        // shared state to `Idle` first, and an unchanged, stale state from
+        // before the request must not overwrite that.
+        let mut mirrored_auth = AuthState::Idle;
+
         loop {
             // Start of this poll: the sleep at the end only waits out the
             // rest of the interval, so samples stay evenly spaced instead of
             // drifting by however long the reads took.
             let poll_start = Instant::now();
-            // Handle UI commands
+            // Handle UI commands (those that arrived during a poll; the
+            // inter-poll sleep below handles the others as they come).
             while let Ok(cmd) = cmd_rx.try_recv() {
-                match cmd {
-                    Cmd::SetLimit(watts) => {
-                        // A manual set takes precedence over the automatic
-                        // lowering: never restore over it later.
-                        auto_power.overridden();
-                        match nvml.as_ref().map(|n| n.set_power_limit(watts)) {
-                            Some(Ok(())) => println!("Power limit set to {watts} W"),
-                            // Running unprivileged: NVML rejects the setter,
-                            // so route it through the pkexec helper (asks for
-                            // the password on first use).
-                            Some(Err(e)) if e.is_permission() => {
-                                println!(
-                                    "Setting the power limit needs root; using the pkexec helper."
-                                );
-                                power_helper.set(watts);
-                            }
-                            Some(Err(e)) => {
-                                eprintln!("Failed to set power limit to {watts} W: {e}")
-                            }
-                            None => eprintln!("NVML unavailable: cannot set the power limit."),
+                handle_cmd(
+                    cmd,
+                    nvml.as_ref(),
+                    &mut power_helper,
+                    &mut auto_power,
+                    &mut poll_ms,
+                    &data,
+                    &mut mirrored_auth,
+                );
+            }
+
+            // Hardware that was missing so far (see DEVICE_RETRY_FIRST).
+            if (i2c.is_err() || nvml.is_none()) && Instant::now() >= retry_at {
+                if i2c.is_err() {
+                    if explicit_bus.is_none() && bus.is_none() {
+                        bus = find_i2c_bus();
+                    }
+                    if bus.is_some() {
+                        i2c = open_i2c(bus);
+                        if let (Ok(_), Some(b)) = (&i2c, bus) {
+                            println!("IT8915 available now: using I2C bus {b}");
                         }
                     }
-                    Cmd::GrantPowerAccess => power_helper.ping(),
-                    Cmd::Interval(ms) => poll_ms = ms,
                 }
+                if nvml.is_none() {
+                    nvml = nvml::Nvml::new();
+                    if nvml.is_some() {
+                        println!("NVML available now.");
+                    }
+                }
+                retry_delay = (retry_delay * 2).min(DEVICE_RETRY_MAX);
+                retry_at = Instant::now() + retry_delay;
             }
 
             let (
@@ -617,7 +682,10 @@ pub(crate) fn spawn_poller(
                 d.record(sample);
                 d.sensor_error = sensor_error;
                 d.power_note = power_note;
-                d.power_auth = power_auth;
+                if power_auth != mirrored_auth {
+                    d.power_auth = power_auth;
+                    mirrored_auth = power_auth;
+                }
                 (settings, d.on_sample.clone())
             };
             // Wake the GUI for this sample (after the lock is released).
@@ -813,10 +881,72 @@ pub(crate) fn spawn_poller(
                 println!("Automatic power limit: applying {watts} W");
                 power_helper.set(watts);
             }
-            thread::sleep(Duration::from_millis(poll_ms).saturating_sub(poll_start.elapsed()));
+            // Wait out the rest of the interval, handling commands as they
+            // arrive (a closed channel means the poller was stopped).
+            let deadline = poll_start + Duration::from_millis(poll_ms);
+            loop {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    break;
+                }
+                match cmd_rx.recv_timeout(left) {
+                    Ok(cmd) => handle_cmd(
+                        cmd,
+                        nvml.as_ref(),
+                        &mut power_helper,
+                        &mut auto_power,
+                        &mut poll_ms,
+                        &data,
+                        &mut mirrored_auth,
+                    ),
+                    Err(mpsc::RecvTimeoutError::Timeout) => break,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                }
+            }
         }
     });
-    cmd_tx
+    Poller { tx: cmd_tx, handle }
+}
+
+/// Apply one command from the UI (or the service link) in the poller.
+fn handle_cmd(
+    cmd: Cmd,
+    nvml: Option<&nvml::Nvml>,
+    power_helper: &mut PowerHelper,
+    auto_power: &mut AutoPowerState,
+    poll_ms: &mut u64,
+    data: &Mutex<WebData>,
+    mirrored_auth: &mut AuthState,
+) {
+    match cmd {
+        Cmd::SetLimit(watts) => {
+            // A manual set takes precedence over the automatic lowering:
+            // never restore over it later.
+            auto_power.overridden();
+            match nvml.map(|n| n.set_power_limit(watts)) {
+                Some(Ok(())) => println!("Power limit set to {watts} W"),
+                // Running unprivileged: NVML rejects the setter, so route it
+                // through the pkexec helper (asks for the password on first
+                // use).
+                Some(Err(e)) if e.is_permission() => {
+                    println!("Setting the power limit needs root; using the pkexec helper.");
+                    power_helper.set(watts);
+                }
+                Some(Err(e)) => eprintln!("Failed to set power limit to {watts} W: {e}"),
+                None => eprintln!("NVML unavailable: cannot set the power limit."),
+            }
+        }
+        Cmd::GrantPowerAccess => {
+            power_helper.ping();
+            // Publish the state this request produced (Idle while a fresh
+            // helper waits for its password, Active when one already runs).
+            let state = power_helper.auth_state();
+            data.lock().unwrap().power_auth = state;
+            *mirrored_auth = state;
+        }
+        Cmd::Interval(ms) => *poll_ms = ms,
+        Cmd::AckCritical => {}
+    }
 }
 
 /// Reject pin readings that are recognizably glitches rather than

@@ -81,6 +81,32 @@ app's own arguments.)
   sensor stays unreadable for 3 s. With no NVML the total power is estimated
   as Σ(V·A) of the pins.
 
+## Background service
+
+AstralGauge can also run in the background, without its window, as a
+systemd **user** service (`astral-gauge.service`). Install or uninstall it
+from **Settings → Background service**. No administrator rights are needed.
+The service starts when you log in and runs this same executable with
+`--service`:
+
+- It uses the settings saved in the app and picks up every accepted change
+  within a second.
+- It keeps the alerts, alert sounds, critical-current notification,
+  safeguards and the web interface (when enabled) running while the window
+  is closed. Sounds play through your desktop's sound server.
+- While it runs, the desktop app doesn't read the hardware itself. It shows
+  the service's data, marked with a **Service** pill and a banner with a
+  link to the web interface. The web page shows a **Service** chip.
+- It waits for what it depends on: the GPU's I2C bus, NVML, the sound
+  output and a busy web port are all retried until they become available,
+  and systemd restarts the service if it ever exits.
+- It runs the executable it was installed from. Install from a stable copy
+  (e.g. `~/.local/bin/astral-gauge`) rather than `target/release`, or
+  restart the service after rebuilding. If a different executable is
+  installed, the settings dialog offers **Update service**.
+
+Logs go to the journal: `journalctl --user -u astral-gauge`.
+
 ## License
 
 MIT — see [LICENSE](LICENSE). The full list of third-party licenses for the

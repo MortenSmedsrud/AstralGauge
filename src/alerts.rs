@@ -16,7 +16,7 @@ use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rodio::{Decoder, OutputStream, Sink};
+use rodio::{Decoder, OutputStream, Sink, Source};
 
 /// Allowed range and defaults for the current limits (amperes).
 pub(crate) const MIN_LIMIT_A: f32 = 1.0;
@@ -543,7 +543,9 @@ fn next_request(current: SoundRequest, next: SoundRequest) -> SoundRequest {
 
 /// Handle to the alert-sound playback thread. Sound is best-effort: `play`
 /// never blocks, and requests are dropped when no audio output exists
-/// (headless session, missing device, undecodable file).
+/// (headless session, missing device, undecodable file). Cloning shares the
+/// one playback thread.
+#[derive(Clone)]
 pub(crate) struct SoundPlayer {
     tx: mpsc::Sender<SoundRequest>,
     /// Set while a priority (critical-terminating) sound is playing; lets the
@@ -593,9 +595,44 @@ impl SoundPlayer {
     }
 }
 
+/// How long a sound may take beyond its own length before the output counts
+/// as stalled (see `audio_loop`).
+const SOUND_STALL_MARGIN: Duration = Duration::from_secs(5);
+
+/// Open the default audio output. `None` (logged once per failure streak via
+/// `warned`) when there is none yet: without a desktop session, or while the
+/// sound server has not started.
+fn open_audio(warned: &mut bool) -> Option<(OutputStream, Sink)> {
+    let opened = OutputStream::try_default()
+        .map_err(|e| format!("No audio output available: {e}"))
+        .and_then(|(stream, handle)| {
+            Sink::try_new(&handle)
+                .map(|sink| (stream, sink))
+                .map_err(|e| format!("Audio sink unavailable: {e}"))
+        });
+    match opened {
+        Ok(session) => {
+            if *warned {
+                println!("Audio output available again.");
+            }
+            *warned = false;
+            Some(session)
+        }
+        Err(e) => {
+            if !*warned {
+                eprintln!("{e}. Alert sounds are skipped until it is available.");
+                *warned = true;
+            }
+            None
+        }
+    }
+}
+
 fn audio_loop(rx: mpsc::Receiver<SoundRequest>, priority_playing: Arc<AtomicBool>) {
     // rodio stops playback when the output stream is dropped, so the session
     // lives for the whole thread; it is None until the first successful try.
+    // A missing output is retried on every request (the sound server can come
+    // up after the app, e.g. when it runs as a service started at login).
     let mut session: Option<(OutputStream, Sink)> = None;
     let mut init_warned = false;
 
@@ -608,30 +645,9 @@ fn audio_loop(rx: mpsc::Receiver<SoundRequest>, priority_playing: Arc<AtomicBool
         }
 
         if session.is_none() {
-            session = match OutputStream::try_default() {
-                Ok((stream, handle)) => match Sink::try_new(&handle) {
-                    Ok(sink) => Some((stream, sink)),
-                    Err(e) => {
-                        if !init_warned {
-                            eprintln!("Audio sink unavailable: {e}. Alert sounds disabled.");
-                            init_warned = true;
-                        }
-                        None
-                    }
-                },
-                Err(e) => {
-                    if !init_warned {
-                        eprintln!("No audio output available: {e}. Alert sounds disabled.");
-                        init_warned = true;
-                    }
-                    None
-                }
-            };
-            if session.is_none() {
-                continue;
-            }
+            session = open_audio(&mut init_warned);
         }
-
+        let mut stalled = false;
         if let Some((_, sink)) = &session {
             let source = match &request.sound {
                 // Embedded WAVs decode straight from the bytes in the binary.
@@ -647,21 +663,39 @@ fn audio_loop(rx: mpsc::Receiver<SoundRequest>, priority_playing: Arc<AtomicBool
                     }),
             };
             match source {
-                // Blocks until this sound finished, so only one plays at a
+                // Waits until this sound finished, so only one plays at a
                 // time; the next queued file is picked up by the loop above.
                 Ok(source) => {
+                    // A sound server that went away (restarted, session
+                    // ended) never drains the sink: give up on this output
+                    // after the sound's length plus a margin and open a new
+                    // one for the next request instead of hanging forever.
+                    let limit = source.total_duration().unwrap_or(Duration::from_secs(30))
+                        + SOUND_STALL_MARGIN;
                     let priority = request.priority;
                     if priority {
                         priority_playing.store(true, Ordering::SeqCst);
                     }
                     sink.append(source);
-                    sink.sleep_until_end();
+                    let started = Instant::now();
+                    while !sink.empty() {
+                        if started.elapsed() > limit {
+                            eprintln!("Audio output stalled; reopening it for the next sound.");
+                            sink.stop();
+                            stalled = true;
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(20));
+                    }
                     if priority {
                         priority_playing.store(false, Ordering::SeqCst);
                     }
                 }
                 Err(msg) => eprintln!("Cannot play alert sound: {msg}"),
             }
+        }
+        if stalled {
+            session = None;
         }
     }
 }
