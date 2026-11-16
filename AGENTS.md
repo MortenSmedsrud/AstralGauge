@@ -314,7 +314,8 @@ cables!") with an **Acknowledge** button that appears and disappears with it
 - **User-dismissal only:** power returning to normal never hides it; the
   desktop button and `POST /ack` are the only ways it clears, and the next
   red excursion shows it again.
-- Mirrored in the web JSON as `critical_alert`; the desktop blink animates
+- Mirrored in the web JSON as `critical_alert` (the sensor state as
+  `sensor_error` + `pins_age`, shown as the web page's `#sensor` banner); the desktop blink animates
   via `ALERT_BLINK_SECS` and forces 250 ms idle repaints while shown (the
   web page blinks with a CSS `step-end` keyframe).
 
@@ -383,27 +384,33 @@ Optional (`Settings::auto_min_power` = Off / On yellow / On red):
 
 ## Tests
 
-`cargo test` (26 tests, no GPU/display needed):
+`cargo test` (34 tests, no GPU/display needed):
 
 - `alerts::tests`: settings defaults; embedded WAVs decode; alert edge
   triggering; 15 s repeat-while-exceeded behavior; powering-down sound
   switch with auto power; auto-power lower/restore edges and bounds;
   kill-guard repeat-while-red behavior with the 5 s cooldown and kill-sound
   gating; critical-notification red-edge triggering; priority requests
-  outranking normal playback requests.
+  outranking normal playback requests; the sensor-fault sound (once, after
+  the grace period, re-armed by recovery); the pending-kill sound hold and
+  reply timeout.
 - `hardware::tests`: process ranking (utilization/memory/pid order,
-  truncation, own + zero pid exclusion), `/proc` name fallback, and the
-  privileged helper's `KILL` reply parsing.
+  truncation, own + zero pid exclusion), `/proc` name fallback, the
+  privileged helper's `KILL` reply parsing, the pin-reading plausibility
+  check, and the single-process pid guard in front of `kill()` (tested on
+  the pure conversion — never call `kill_process` with a bad pid in a test).
 - `persist::tests`: settings JSON round-trips (defaults, custom values,
   user sound paths with escapes), a real save()/load() file round-trip in a
   throwaway HOME, unknown/missing-key tolerance, clamping and yellow/red
   order repair, rejection of invalid values, and corrupt-document detection.
 - `ui::tests`: embedded license-text sanity (the generated `licenses.txt` is
   non-empty, lists one "Used by:" section per license, and has no template
-  leftovers or HTML escaping).
+  leftovers or HTML escaping); pin cells without readings; the sensor
+  fault / staleness warning.
 - `web::tests`: JSON field content (incl. process entries, name escaping and
-  the latching `critical_alert` flag), `record()` history append/prune/range
-  caching, query-param parsing, HTTP server serve/404/busy-port/restart and
+  the latching `critical_alert` flag, `sensor_error`, `pins_age`),
+  `record()` history append/prune/range caching and gaps (no zeros) for
+  samples without pins, the stale threshold, query-param parsing, HTTP server serve/404/busy-port/restart and
   the `POST /ack` dismissal.
 
 Tests that bind ports use `free_port()` (bind :0, drop, reuse).
